@@ -156,6 +156,28 @@ class _v4l2_buffer(ctypes.Structure):
     ]
 
 
+# ── UVC Extension Unit IOCTL (mirrors leopard_linux.py but reuses our
+#    streaming fd — see _xu_write_on_stream_fd). Avoids opening a second
+#    fd to /dev/video0 mid-stream, which the kernel UVC driver punishes
+#    with frame-rate throttling. ──
+_UVC_SET_CUR = 0x01
+
+class _UVCXUQuery(ctypes.Structure):
+    # Tegra L4T 35.6 layout matches mainline:
+    #   __u8 unit; __u8 selector; __u8 query;
+    #   __u16 size; __u8 *data;
+    # Natural alignment: 16 bytes on 64-bit (3xu8 + 1pad + u16 + 2pad + 8ptr)
+    _fields_ = [
+        ("unit",     ctypes.c_uint8),
+        ("selector", ctypes.c_uint8),
+        ("query",    ctypes.c_uint8),
+        ("size",     ctypes.c_uint16),
+        ("data",     ctypes.POINTER(ctypes.c_uint8)),
+    ]
+
+UVCIOC_CTRL_QUERY = _IOC(_IOC_READ | _IOC_WRITE, ord("u"), 0x21,
+                         ctypes.sizeof(_UVCXUQuery))
+
 VIDIOC_S_FMT     = _IOWR("V",  5, _v4l2_format)
 VIDIOC_REQBUFS   = _IOWR("V",  8, _v4l2_requestbuffers)
 VIDIOC_QUERYBUF  = _IOWR("V",  9, _v4l2_buffer)
@@ -201,6 +223,18 @@ class RawV4L2Backend:
 
     def isOpened(self) -> bool:  # noqa: N802
         return self._fd >= 0
+
+    def _xu_write_on_stream_fd(self, selector: int, data: bytes) -> None:
+        """Write a Leopard XU control on OUR streaming fd (no second
+        open). FX3 vendor extension unit is hardcoded to unit=3 on this
+        bridge per LeopardCamera.dll IL."""
+        if self._fd < 0:
+            return
+        size = len(data)
+        buf = (ctypes.c_uint8 * size).from_buffer_copy(data)
+        q = _UVCXUQuery(unit=3, selector=selector, query=_UVC_SET_CUR,
+                        size=size, data=buf)
+        fcntl.ioctl(self._fd, UVCIOC_CTRL_QUERY, q)
 
     @property
     def is_alive(self) -> bool:
@@ -287,13 +321,11 @@ class RawV4L2Backend:
             # interface is active. Earlier attempts to write XU from a
             # control-only fd silently failed.
             try:
-                from eo.leopard_linux import LeopardLinux as _LL, _SIZES as _LS
-                _LS[0x0b] = 2
-                _ll = _LL(self._dev)
-                try:
-                    _ll._xu_write(0x0b, bytes([0, 0]))
-                finally:
-                    _ll.close()
+                # Write XU on OUR streaming fd (not a fresh one). The UVC
+                # kernel driver throttles when multiple processes/fds
+                # share /dev/video0 — opening a second fd here was
+                # causing the EO frame rate to cliff to 1 Hz.
+                self._xu_write_on_stream_fd(0x0b, bytes([0, 0]))
             except Exception:
                 # Non-fatal: streaming might still work if firmware was
                 # already in free-running mode.
@@ -364,22 +396,16 @@ class RawV4L2Backend:
         so IMX568Capture._sdk_stream_mode can take the early-return
         path verbatim.
         """
-        # Periodically re-disable trigger mode. We do it every ~150 frames
-        # (~5-15 sec at 10-30 fps) so a transient FX3 re-arm doesn't
-        # silently freeze the stream forever. Cheap: one XU write.
+        # Periodically re-disable trigger mode in case the FX3 firmware
+        # re-arms it sporadically. CRITICAL: do the XU IOCTL on OUR
+        # streaming fd, not a fresh one. Opening a second fd to
+        # /dev/video0 mid-stream caused observable frame-rate cliffs
+        # (UVC kernel driver throttles when multiple fds are active).
         self._frames_since_trigger_check += 1
-        if self._frames_since_trigger_check >= 150:
+        if self._frames_since_trigger_check >= 300:
             self._frames_since_trigger_check = 0
             try:
-                from eo.leopard_linux import LeopardLinux as _LL, _SIZES as _LS
-                _LS[0x0b] = 2
-                _ll = _LL(self._dev)
-                try:
-                    cur = int.from_bytes(_ll._xu_read(0x0b), "little")
-                    if cur != 0:
-                        _ll._xu_write(0x0b, bytes([0, 0]))
-                finally:
-                    _ll.close()
+                self._xu_write_on_stream_fd(0x0b, bytes([0, 0]))
             except Exception:
                 pass
         ok, raw = self.read()
