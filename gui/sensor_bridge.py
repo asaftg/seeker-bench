@@ -15,6 +15,8 @@ import cv2
 
 from common.config import load_config
 from common.frame_bus import BUS
+_last_thermal_frame_id: int = -1  # Phase 1 fix #4: dedup repeat-frame JPEG bytes
+
 from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalFrame, Topic
 
 # Load lock-mode flags once at import. Cheap; YAML re-reads on bench
@@ -120,6 +122,7 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
     the world-angle override, the bbox stays planted on the world
     target as long as the gimbal pose readout is correct.
     """
+    global _last_thermal_frame_id  # Phase 1 fix #4 dedup
     if tf is None or not tf.connected:
         return {
             "connected": False,

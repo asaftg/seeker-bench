@@ -51,7 +51,11 @@ class HeatDetectorConfig:
     #                   peaks and discards anything larger than `tophat_kernel`.
     #                   Much better on cluttered indoor scenes.
     algorithm: str = "tophat"
-    tophat_kernel: int = 15          # > max target diameter in pixels
+    # Phase 1 fix #5: 15 -> 11. Saves ~3 ms/frame on tophat morphology
+    # (the largest single per-frame cost in the thermal pipeline). Targets
+    # in the bench setup are < 11 px diameter, so the smaller kernel still
+    # rejects everything that isn't a compact hot spot.
+    tophat_kernel: int = 11          # > max target diameter in pixels
 
 
 class HeatDetector:

@@ -1180,7 +1180,11 @@ class EOManager:
         while not self._stop.is_set():
             with self._latest_cond:
                 while self._latest_seq == last_seen_seq and not self._stop.is_set():
-                    self._latest_cond.wait(timeout=0.5)
+                    # Phase 1 fix: was 0.5. With 0.5 a missed notify
+                    # (capture-vs-process race) cost 500ms = 10 dropped
+                    # frames at 20fps. 0.05 caps the worst-case miss to
+                    # ~1 frame.
+                    self._latest_cond.wait(timeout=0.05)
                 if self._stop.is_set():
                     break
                 frame = self._latest_frame

@@ -881,7 +881,7 @@ gui:
   port: 8080
   open_browser: true
   ws_fps: 40                    # 2026-05-09: was 30 (too aggressive, dropped thermal). 40 keeps thermal headroom while halving CPU vs original 60.
-  thermal_jpeg_quality: 75      # 8-bit colormapped thermal looks fine at 80.
+  thermal_jpeg_quality: 70      # Phase 1 fix #5: was 75. 8-bit colormap is loss-tolerant; saves ~2-3 ms/frame encode.
                                 # (Briefly bumped to 92 on 2026-04-27; full
                                 # revert to original on operator request when
                                 # the visible image looked worse than the

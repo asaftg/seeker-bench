@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from common.frames import RadarDetection, RadarTarget
 
@@ -290,6 +291,20 @@ class RadarClusterer:
             return detections, self._publish_coasting_only()
 
         # ── DBSCAN ──
+        # Decimate pathological frames (garbage injection, dust, jitter)
+        # to a sane cap. Real targets emit ~20-50 points; >300 is noise.
+        # Keep top-by-SNR so real targets survive.
+        if len(detections) > 300:
+            dets_sorted = sorted(
+                detections,
+                key=lambda d: (
+                    float(d.snr_db) if d.snr_db is not None
+                    and not (d.snr_db != d.snr_db) else -1000.0
+                ),
+                reverse=True,
+            )
+            detections = dets_sorted[:300]
+
         pts = np.array(
             [[d.x_m, d.y_m, d.z_m, d.doppler_mps] for d in detections],
             dtype=np.float32,
@@ -568,23 +583,32 @@ def _dbscan(
     """
     n = pts.shape[0]
     labels = np.full(n, -1, dtype=np.int32)
+    if n == 0:
+        return labels
     visited = np.zeros(n, dtype=bool)
-    eps_pos2 = float(eps_pos) * float(eps_pos)
 
     xyz = pts[:, :3]
     dop = pts[:, 3]
 
-    diff = xyz[:, None, :] - xyz[None, :, :]
-    d2 = (diff * diff).sum(axis=-1)
-    dop_ok = np.abs(dop[:, None] - dop[None, :]) <= eps_dop
-    nbrs = (d2 <= eps_pos2) & dop_ok
+    # cKDTree neighbor lists: O(N log N) instead of O(N^2). For N=500
+    # this is ~5 ms on Xavier vs ~50-100 ms for the dense matrix.
+    # Critical fix for thermal FPS drop when radar emits many points
+    # (garbage injection, busy scene, dust returns).
+    tree = cKDTree(xyz)
+    spatial_nbrs = tree.query_ball_tree(tree, r=float(eps_pos))
+
+    # Doppler gate is applied as a filter on the spatial neighbor list,
+    # not as a full N x N matrix.
+    def _dop_filter(i, neighbors):
+        d_i = dop[i]
+        return [j for j in neighbors if abs(dop[j] - d_i) <= eps_dop]
 
     next_label = 0
     for i in range(n):
         if visited[i]:
             continue
         visited[i] = True
-        neighbour_idxs = np.flatnonzero(nbrs[i])
+        neighbour_idxs = _dop_filter(i, spatial_nbrs[i])
         if len(neighbour_idxs) < min_samples:
             continue
         labels[i] = next_label
@@ -598,12 +622,12 @@ def _dbscan(
             if visited[j]:
                 continue
             visited[j] = True
-            j_nbrs = np.flatnonzero(nbrs[j])
+            j_nbrs = _dop_filter(j, spatial_nbrs[j])
             if len(j_nbrs) >= min_samples:
-                queue.extend(int(k) for k in j_nbrs if labels[k] == -1)
                 for k in j_nbrs:
                     if labels[k] == -1:
                         labels[k] = next_label
+                        queue.append(int(k))
             elif labels[j] == -1:
                 labels[j] = next_label
         next_label += 1

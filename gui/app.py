@@ -642,7 +642,15 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 try:
                     _t_send0 = time.perf_counter()
                     await ws.send_text(text)
-                    _prof_send += (time.perf_counter() - _t_send0)
+                    _send_dt = time.perf_counter() - _t_send0
+                    _prof_send += _send_dt
+                    # Phase 1 fix #3: TCP backpressure spike (browser
+                    # slow to drain canvas redraws). Yield event loop
+                    # briefly so _eo_sender + other tasks can run while
+                    # the kernel TCP buffer drains. Threshold 80ms ~=
+                    # 2x our normal 40ms WS period at ws_fps=40.
+                    if _send_dt > 0.080:
+                        await asyncio.sleep(0.005)
                 except WebSocketDisconnect:
                     raise
                 except RuntimeError as e:
