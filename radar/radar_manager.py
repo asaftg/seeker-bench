@@ -26,10 +26,14 @@ Asaf. Class labels (vehicle / person) are a fusion-layer job.
 """
 from __future__ import annotations
 
+import glob as _glob
+import os as _os
+import subprocess as _subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import serial
 
@@ -95,14 +99,49 @@ class RadarManager:
         self._capture_thread: Optional[threading.Thread] = None
         self._process_thread: Optional[threading.Thread] = None
 
-        # Hand-off from capture → process: latest packet + seq number.
-        self._latest_cond = threading.Condition()
-        self._latest_pkt: Optional[RadarPacket] = None
-        self._latest_seq: int = 0
+        # Hand-off from capture → process: bounded packet queue.
+        #
+        # Was: single-slot `_latest_pkt` overwritten on every capture
+        # notify. That looked safe (latest-wins) but interacted badly
+        # with the data-port read pattern: read(4096) with timeout=0.2
+        # batches ~4 small TLV packets per call (cfar=0 frames are
+        # ~50 bytes each), capture emits 4 notify_all back-to-back, and
+        # the process loop's `while seq == last_seen_seq` only wakes
+        # ONCE per "no-update → update" transition — dropping 3 of
+        # every 4 packets. Net publish rate capped at 5 Hz even when
+        # the chip emits at 20 Hz. Confirmed by `tools/diag_tlv_rate.py`.
+        #
+        # Now: deque(maxlen=8) preserves the latest-wins overload
+        # behaviour (oldest auto-evicted when process lags) but
+        # operates at packet granularity. Process loop drains one
+        # packet per wake → publish rate matches chip rate when
+        # processing is fast (it is on cfar=0 frames).
+        self._pkt_cond = threading.Condition()
+        self._pkt_queue: "deque[RadarPacket]" = deque(maxlen=8)
 
         self._data_ser: Optional[serial.Serial] = None
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
+
+        # Optional hook fired AFTER a successful xds110reset chip recovery
+        # but BEFORE _push_profile pushes the cfg. Composite registers a
+        # callback here that re-arms the DCA1000 FPGA so LVDS resumes
+        # cleanly when the chip sensorStarts. Without it, A/A is dead
+        # after every Ctrl+C → relaunch cycle.
+        self._post_recovery_callback: Optional[Callable[[], None]] = None
+
+    def set_post_recovery_callback(
+        self, cb: Optional[Callable[[], None]]
+    ) -> None:
+        """Register a callback fired after xds110 chip recovery.
+
+        Composite uses this to re-arm the DCA1000 FPGA after the chip
+        is hard-reset out from under it. Called inside the recovery
+        path of _probe_and_recover, after the chip is confirmed alive
+        and BEFORE the cfg push restarts LVDS streaming. Any exception
+        the callback raises is logged but doesn't abort recovery.
+        """
+        self._post_recovery_callback = cb
 
     # ─────────────────────── live tuning ─────────────────────
     def set_tuning(
@@ -193,23 +232,20 @@ class RadarManager:
 
     def stop(self) -> None:
         self._stop.set()
-        with self._latest_cond:
-            self._latest_cond.notify_all()
+        with self._pkt_cond:
+            self._pkt_cond.notify_all()
         for t in (self._process_thread, self._capture_thread):
             if t is not None:
                 t.join(timeout=3.0)
         self._capture_thread = None
         self._process_thread = None
         self._close_data_port()
-        # Courtesy sensorStop — the chip keeps transmitting after we
-        # exit otherwise. Best-effort; a user yanking USB mid-shutdown
-        # is normal and shouldn't throw.
-        try:
-            with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
-                ser.write(b"sensorStop\n")
-                ser.flush()
-        except Exception as e:
-            log.debug("sensorStop on shutdown skipped: %s", e)
+        # ISSUE-2 FIX: NO sensorStop on this firmware — the patches
+        # removed the only poster of DPMstopSemHandle, so sensorStop
+        # makes MmwDemo_stopSensor pend WAIT_FOREVER and wedges the
+        # CLI parser. Leave the chip running; next start adopts it.
+        log.warning("[ISSUE2-STOP] Skipping sensorStop on shutdown "
+                    "(would wedge chip CLI on this firmware).")
 
     # ─────────────────────── connect helpers ─────────────────
     @staticmethod
@@ -266,6 +302,154 @@ class RadarManager:
                     return None
         return None
 
+    # ─────────────────── chip wedge recovery (issue 2) ───────────────
+    # When the host process exits via Ctrl+C, pyserial's port-close (and
+    # the next port-open) toggles DTR/RTS on the XDS110 virtual UART.
+    # Those modem-control lines route to chip-side GPIOs that
+    # mmw_demoDDM (SDK 4.7.2.1) uses for host handshake; the toggle
+    # deadlocks the CLI parser inside UART_writePolling and the chip
+    # stops acking ANY command until 12 V power-cycle. Verified by the
+    # 2026-05-06 research-agent and pyserial issues #124 / #488.
+    #
+    # Recovery design (per user-approved plan i-have-serious-issues-...):
+    #   1. After CLI port open: ser.send_break(0.25) — 250 ms break
+    #      resets the chip's UART RX state machine (TI E2E recommended,
+    #      same effect as "close+reopen TeraTerm" in TI's SDK guide).
+    #   2. Probe with queryDemoStatus at short timeout. If chip responds,
+    #      we're cold-booted or already recovered — proceed normally.
+    #   3. If probe times out: chip is wedged. Close the port, run
+    #      xds110reset.exe to pulse nRST via XDS110 JTAG (CCS ships it),
+    #      wait for chip re-enumeration, reopen, send_break, retry probe.
+    #   4. Single reset attempt per _push_profile call. If a second probe
+    #      also fails, surface the error and let the reconnect loop spin
+    #      — there's no third recovery layer in software.
+    _XDS110_RESET_CANDIDATES = (
+        r"C:\ti\ccs\ccs\ccs_base\common\uscif\xds110\xds110reset.exe",
+        r"C:\ti\ccs*\ccs\ccs_base\common\uscif\xds110\xds110reset.exe",
+        r"C:\ti\ccs1*\ccs\ccs_base\common\uscif\xds110\xds110reset.exe",
+        r"C:\ti\ccs2*\ccs\ccs_base\common\uscif\xds110\xds110reset.exe",
+    )
+
+    @classmethod
+    def _find_xds110_reset(cls) -> Optional[str]:
+        for pat in cls._XDS110_RESET_CANDIDATES:
+            if "*" in pat or "?" in pat:
+                hits = _glob.glob(pat)
+                if hits:
+                    return hits[0]
+            elif _os.path.isfile(pat):
+                return pat
+        return None
+
+    def _run_xds110_reset(self) -> bool:
+        """Pulse nRST on the AWR via XDS110 JTAG. Returns True on exit 0."""
+        exe = self._find_xds110_reset()
+        if exe is None:
+            log.error(
+                "[ISSUE2-RECOVERY] xds110reset.exe NOT FOUND. Install CCS "
+                "(it ships there). Tried: %s",
+                ", ".join(self._XDS110_RESET_CANDIDATES),
+            )
+            return False
+        log.warning("[ISSUE2-RECOVERY] Pulsing nRST via %s", exe)
+        try:
+            r = _subprocess.run(
+                [exe], capture_output=True, text=True, timeout=10.0,
+            )
+        except _subprocess.TimeoutExpired:
+            log.error("[ISSUE2-RECOVERY] xds110reset timed out (>10s)")
+            return False
+        except Exception as e:
+            log.error("[ISSUE2-RECOVERY] xds110reset failed to run: %s", e)
+            return False
+        log.info(
+            "[ISSUE2-RECOVERY] xds110reset rc=%s stdout=%r stderr=%r",
+            r.returncode, (r.stdout or "").strip()[:200],
+            (r.stderr or "").strip()[:200],
+        )
+        return r.returncode == 0
+
+    def _open_cli_with_break(self) -> Optional[serial.Serial]:
+        """Open CLI port and issue a 250 ms break to reset chip-side UART RX."""
+        try:
+            ser = serial.Serial(self.cli_port, self.cli_baud, timeout=0.5)
+        except serial.SerialException as e:
+            log.warning("Could not open CLI port %s: %s", self.cli_port, e)
+            return None
+        try:
+            ser.send_break(0.25)
+        except Exception as e:
+            log.debug("send_break failed (driver may not support): %s", e)
+        # Drain any garbage the break may have produced.
+        time.sleep(0.05)
+        try:
+            n = ser.in_waiting
+            if n:
+                ser.read(n)
+        except Exception:
+            pass
+        return ser
+
+    def _probe_and_recover(self) -> Optional[serial.Serial]:
+        """Open the CLI port and confirm the chip is responsive.
+
+        Returns an OPEN ``serial.Serial`` ready for cfg push, or None if
+        even after one xds110reset attempt the chip stays silent.
+        Caller is responsible for closing the returned Serial.
+        """
+        ser = self._open_cli_with_break()
+        if ser is None:
+            return None
+        # Probe with the same 1.0 s the legacy _query_sensor_state used —
+        # cold-boot chips need ~1 s for the CLI task to come up after the
+        # BSS calibration banner. A 0.5 s probe would time out on a
+        # healthy fresh boot and trigger an unnecessary xds110reset.
+        probe = self._cli_send(ser, "queryDemoStatus", wait_s=1.0)
+        if probe.strip():
+            log.info("Radar CLI alive on first probe (resp=%r)",
+                     probe.strip()[:80])
+            return ser
+        # Wedged. Close, reset, retry once.
+        log.warning("[ISSUE2-RECOVERY] CLI gave no response — assuming "
+                    "post-Ctrl+C wedge, attempting xds110 nRST")
+        try:
+            ser.close()
+        except Exception:
+            pass
+        if not self._run_xds110_reset():
+            return None
+        # Wait for chip + USB CDC to re-enumerate after reset.
+        time.sleep(1.5)
+        ser2 = self._open_cli_with_break()
+        if ser2 is None:
+            log.error("[ISSUE2-RECOVERY] CLI port did not reopen after reset")
+            return None
+        probe2 = self._cli_send(ser2, "queryDemoStatus", wait_s=2.0)
+        if probe2.strip():
+            log.info("[ISSUE2-RECOVERY] Chip recovered (resp=%r)",
+                     probe2.strip()[:80])
+            # Fire the post-recovery hook BEFORE returning. Composite
+            # uses this to re-arm the DCA1000 FPGA so LVDS resumes
+            # cleanly when the cfg push (next step in _push_profile)
+            # sensorStarts the chip. Best-effort — don't abort recovery
+            # if the callback explodes.
+            if self._post_recovery_callback is not None:
+                try:
+                    self._post_recovery_callback()
+                except Exception:
+                    log.exception(
+                        "[ISSUE2-RECOVERY] post-recovery callback raised; "
+                        "continuing with chip recovery anyway"
+                    )
+            return ser2
+        log.error("[ISSUE2-RECOVERY] Chip still silent after xds110 reset; "
+                  "giving up this _push_profile cycle")
+        try:
+            ser2.close()
+        except Exception:
+            pass
+        return None
+
     def _push_profile(self) -> bool:
         """Open CLI UART, bring sensor to STARTED, close. True on success.
 
@@ -294,21 +478,66 @@ class RadarManager:
         proved works continuously. We never use plain ``sensorStart``
         from INIT — that's the path that emits a few frames and dies.
         """
+        # Probe + auto-recover from post-Ctrl+C wedge before we push any
+        # cfg. Returns an OPEN Serial we own — close it ourselves.
+        ser = self._probe_and_recover()
+        if ser is None:
+            return False
         try:
-            with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
+            with ser:
                 state = self._query_sensor_state(ser)
                 log.info("Radar CLI reports sensor state=%s", state)
 
                 if state in (0, None):
                     # Fresh boot or unknown state — push the full
-                    # profile so the chip has our cfg loaded. The
-                    # final `sensorStart` line in the cfg WILL be
-                    # rejected (chip is no longer in INIT after the
-                    # cfg's own sensorStop+flushCfg moved it through
-                    # the state machine). That rejection is expected;
-                    # we recover with sensorStart 0 below.
+                    # profile so the chip has our cfg loaded.
+                    #
+                    # The cfg's last line is ``sensorStart``. On THIS
+                    # firmware build the cfg's sensorStart from INIT
+                    # actually succeeds (chip moves INIT → STARTED).
+                    # If we then send our own ``sensorStart 0`` below
+                    # the chip rejects it ("Invalid Sensor Start" —
+                    # it's already STARTED) and V1.0's downstream
+                    # check returned False → reconnect cycle, which
+                    # broke streaming. Detect cfg-started-chip via
+                    # "Done" / "Init Calibration Status" in the cfg's
+                    # last-line response and return True directly,
+                    # skipping the redundant sensorStart 0.
                     responses = send_cfg(ser, self.cfg_path)
                     tail = responses[-1] if responses else ""
+                    # Count rejected lines in the cfg push. The chip's
+                    # state machine sometimes rejects critical lines
+                    # (profileCfg, chirpCfg, frameCfg) with "Error:
+                    # Configuration is valid only if DFE Output Mode
+                    # is X" — a chip-side state-machine race we don't
+                    # fully understand. When that happens the chip's
+                    # cfg is incomplete; sensorStart will still emit
+                    # a partial calibration status (0x11e instead of
+                    # the full 0xffe) but no useful frames stream.
+                    # Don't fool ourselves — if any critical line was
+                    # rejected, treat the push as failed and let the
+                    # reconnect loop retry (next attempt often works
+                    # because the chip happens to be in a clean
+                    # state).
+                    n_rejected = sum(
+                        1 for r in responses
+                        if ("Error" in r or "error" in r)
+                    )
+                    full_cal = ("0xffe" in tail or "Done" in tail)
+                    if n_rejected == 0 and full_cal:
+                        log.info("Chip started by cfg's own sensorStart "
+                                 "(tail=%r, rejected=0) — skipping "
+                                 "redundant sensorStart 0",
+                                 tail.strip()[:80])
+                        return True
+                    if n_rejected > 0:
+                        log.warning("cfg push had %d rejected line(s); "
+                                    "chip cfg is incomplete — will retry",
+                                    n_rejected)
+                        return False
+                    log.warning("cfg push tail=%r unrecognized as success; "
+                                "will retry", tail.strip()[:120])
+                    return False
 
                 # Final step on every path: sensorStart 0. This is the
                 # ONLY sensorStart variant we trust on this firmware
@@ -342,40 +571,78 @@ class RadarManager:
         responses so the caller can see whether the chip ack'd.
         """
         out: dict = {"sensorStop": None, "sensorStart_0": None}
+        # First try the cheap path: just sensorStop + sensorStart 0.
+        # If chip is in STARTED but DMA stalled, this resets it.
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
-                # sensorStop is idempotent from any state; clears the
-                # chip's LVDS DMA and frame counters.
                 resp_stop = self._cli_send(ser, "sensorStop", wait_s=1.0)
                 out["sensorStop"] = resp_stop.strip()
                 time.sleep(0.1)
-                # sensorStart 0 resumes the previously-loaded profile
-                # (the unified.cfg we pushed at boot, including the
-                # lvdsStreamCfg line). Same call that brings the chip
-                # up cleanly at startup — see _push_profile docstring.
                 resp_start = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
                 out["sensorStart_0"] = resp_start.strip()
-                if "Done" not in resp_start:
-                    out["ok"] = False
-                    log.warning("kick_lvds: sensorStart 0 did not ack: %r",
-                                resp_start.strip())
+                if "Done" in resp_start:
+                    log.info("kick_lvds: chip kicked (sensorStop + sensorStart 0)")
                     return out
-            log.info("kick_lvds: chip kicked (sensorStop + sensorStart 0)")
-            return out
+                # Empty response or Invalid Sensor Start → chip in a
+                # state where sensorStart 0 doesn't help (likely the
+                # DMA halt state where Stop+Start 0 isn't enough on
+                # this firmware build). Fall through to a full cfg
+                # re-push, which forces the chip through INIT.
+                log.warning("kick_lvds: sensorStart 0 didn't recover "
+                            "(resp=%r); will re-push full cfg",
+                            resp_start.strip()[:80])
         except serial.SerialException as e:
             log.warning("kick_lvds: could not open CLI port %s: %s",
                         self.cli_port, e)
             out["error"] = str(e)
             return out
 
+        # Heavy path: full cfg re-push. The cfg starts with sensorStop
+        # + flushCfg, which forces the chip back through its state
+        # machine. The cfg's final sensorStart should then bring the
+        # chip back into STARTED with LVDS DMA reset.
+        log.info("kick_lvds: heavy path — re-pushing full cfg")
+        try:
+            with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
+                responses = send_cfg(ser, self.cfg_path)
+                tail = responses[-1] if responses else ""
+                n_rejected = sum(
+                    1 for r in responses if ("Error" in r or "error" in r)
+                )
+                ok = (n_rejected == 0
+                      and ("0xffe" in tail or "Done" in tail))
+                if ok:
+                    out["cfg_repush"] = "ok"
+                    log.info("kick_lvds: cfg re-push succeeded "
+                             "(0 rejected, tail had 0xffe/Done)")
+                else:
+                    out["cfg_repush"] = f"failed (rejected={n_rejected})"
+                    log.warning("kick_lvds: cfg re-push failed: "
+                                "%d rejected, tail=%r",
+                                n_rejected, tail.strip()[:80])
+            return out
+        except serial.SerialException as e:
+            log.warning("kick_lvds: cfg re-push could not open CLI: %s", e)
+            out["error"] = str(e)
+            return out
+
     def _open_data_port(self) -> bool:
         try:
-            # Short read timeout so the capture loop can stay responsive
-            # to self._stop while waiting for UART bytes.
+            # Read timeout matches the chip's frame period (50 ms = 20 Hz).
+            # With timeout=0.2, on cfar=0 frames the buffer accumulates
+            # ~4 small TLV packets per timeout window before read returns;
+            # the capture loop then notifies the process queue 4 times
+            # in microseconds, which the deque drains in microseconds,
+            # producing a 20 Hz publish rate that's BURSTY (4 frames
+            # back-to-back, then 200 ms of nothing). Average is correct
+            # but visually it looks like ~5 Hz with motion blur. With
+            # timeout matched to the chip's frame period, each read
+            # returns with ~1 packet — steady 20 Hz, no bursts. Also
+            # 4× faster shutdown responsiveness for free.
             self._data_ser = serial.Serial(
                 self.data_port,
                 self.data_baud,
-                timeout=0.2,
+                timeout=0.05,
             )
             return True
         except serial.SerialException as e:
@@ -425,16 +692,38 @@ class RadarManager:
             now = time.monotonic()
             if chunk:
                 for pkt in stream.feed(chunk):
-                    with self._latest_cond:
-                        self._latest_pkt = pkt
-                        self._latest_seq += 1
-                        self._latest_cond.notify_all()
+                    with self._pkt_cond:
+                        # deque(maxlen=8) auto-evicts oldest on overflow
+                        # — that's the back-pressure behaviour we want
+                        # if process_and_publish ever lags chip rate.
+                        self._pkt_queue.append(pkt)
+                        self._pkt_cond.notify()
                     last_pkt_time = now
 
-            # Stream-timeout disconnect: if we've been connected but
-            # haven't seen a valid packet in stream_timeout_s, assume
-            # the chip died / USB glitch and reconnect.
-            if ever_connected and (now - last_pkt_time) > self.stream_timeout_s:
+            # Stream-timeout disconnect (LEGACY): if we've been
+            # connected but haven't seen a valid packet in
+            # stream_timeout_s, V1.0 reconnected — which re-pushed
+            # the cfg, which started with `sensorStop`, which killed
+            # any active LVDS streaming to the DCA1000.
+            #
+            # On the unified Phase-3 cfg this reconnect is HARMFUL:
+            # `lvdsStreamCfg -1 0 1 0` enables LVDS but appears to
+            # disable UART TLV output on this firmware build, so the
+            # 3 s timeout fires every cycle. The reconnect's
+            # sensorStop then breaks the LVDS stream that A/A
+            # depends on. Field log 2026-04-30 19:21 showed the
+            # chip cycling cfg pushes every 3 s and LVDS stalling
+            # right after each one (76,556 packets received then
+            # halted, repeat).
+            #
+            # Fix: when stream_timeout_s is 0 or negative, skip the
+            # reconnect entirely. The chip stays running, LVDS
+            # streams continuously into the DCA pipeline. If the
+            # operator needs A/A only, they set stream_timeout_s=0
+            # and the manager becomes a one-shot cfg pusher.
+            if (self.stream_timeout_s > 0
+                    and ever_connected
+                    and (now - last_pkt_time) > self.stream_timeout_s):
                 log.warning("No radar packets for %.1fs — reconnecting",
                             now - last_pkt_time)
                 self._close_data_port()
@@ -446,17 +735,15 @@ class RadarManager:
 
     # ─────────────────────── process loop ────────────────────
     def _process_loop(self) -> None:
-        last_seen_seq = 0
+        # Drain the packet queue one packet per wake. This is the fix
+        # for the 5 Hz cap — see `_pkt_queue` doc in __init__.
         while not self._stop.is_set():
-            with self._latest_cond:
-                while self._latest_seq == last_seen_seq and not self._stop.is_set():
-                    self._latest_cond.wait(timeout=0.5)
+            with self._pkt_cond:
+                while not self._pkt_queue and not self._stop.is_set():
+                    self._pkt_cond.wait(timeout=0.5)
                 if self._stop.is_set():
                     break
-                pkt = self._latest_pkt
-                last_seen_seq = self._latest_seq
-            if pkt is None:
-                continue
+                pkt = self._pkt_queue.popleft()
             try:
                 self._process_and_publish(pkt)
             except Exception as e:

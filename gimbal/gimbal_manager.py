@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from algorithms import track_predictor
 from common.config import load_config
@@ -33,6 +33,8 @@ from gimbal.gimbal_controller import (
     GimbalLimits,
     ServoCalibration,
 )
+from gimbal.bus_servo_calibration import BusServoCalibration
+from gimbal.bus_servo_driver import BusServoDriver
 from gimbal.maestro_driver import MaestroDriver
 from gimbal.optical_residual import OpticalResidualTracker
 
@@ -61,6 +63,26 @@ def _clip(v: float, lim: float) -> float:
     if v >  lim: return  lim
     if v < -lim: return -lim
     return v
+
+
+def _bbox_iou(a: Tuple[int, int, int, int],
+              b: Tuple[int, int, int, int]) -> float:
+    """Intersection-over-union of two (x, y, w, h) bboxes.
+    Used by the lock-mode auto-reseed gate to decide whether a fresh
+    fused observation matches the current lock bbox closely enough
+    to refresh the appearance template."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1 = max(ax, bx); iy1 = max(ay, by)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return float(inter) / float(union)
 
 
 def _deadband(az: float, el: float, band_deg: float) -> tuple[float, float]:
@@ -202,32 +224,61 @@ class GimbalManager:
         cfg = load_config()
         gcfg = cfg.get("gimbal", {}) or {}
 
-        # ── Calibration (per-servo linear map angle→µs) ──────
-        pcal_cfg = (gcfg.get("pan_calibration")  or {})
-        tcal_cfg = (gcfg.get("tilt_calibration") or {})
-        self._pan_cal = ServoCalibration(
-            channel=int(pcal_cfg.get("channel", 0)),
-            min_deg=float(pcal_cfg.get("min_deg", -90.0)),
-            max_deg=float(pcal_cfg.get("max_deg",  90.0)),
-            us_at_min_deg=float(pcal_cfg.get("us_at_min_deg", 500.0)),
-            us_at_max_deg=float(pcal_cfg.get("us_at_max_deg", 2500.0)),
-            invert=bool(pcal_cfg.get("invert", False)),
-        )
-        self._tilt_cal = ServoCalibration(
-            channel=int(tcal_cfg.get("channel", 1)),
-            min_deg=float(tcal_cfg.get("min_deg",  0.0)),
-            max_deg=float(tcal_cfg.get("max_deg", 22.0)),
-            us_at_min_deg=float(tcal_cfg.get("us_at_min_deg", 1500.0)),
-            us_at_max_deg=float(tcal_cfg.get("us_at_max_deg", 2000.0)),
-            invert=bool(tcal_cfg.get("invert", False)),
-        )
+        # ── Driver selection ────────────────────────────────
+        #   maestro            — V1 Pololu Maestro + hobby servos (PWM µs)
+        #   waveshare_st3025   — V2 Waveshare bus-servo adapter + ST3025
+        self._driver_kind = str(gcfg.get("driver", "maestro")).lower()
+        self._is_v2 = (self._driver_kind == "waveshare_st3025")
+
+        # ── Calibration (per-servo) ─────────────────────────
+        if self._is_v2:
+            ws_cfg = (gcfg.get("waveshare") or {})
+            pcal_cfg = (ws_cfg.get("pan")  or {})
+            tcal_cfg = (ws_cfg.get("tilt") or {})
+            self._pan_cal = BusServoCalibration(
+                servo_id=int(pcal_cfg.get("servo_id", 2)),
+                zero_raw=int(pcal_cfg.get("zero_raw", 2048)),
+                invert=bool(pcal_cfg.get("invert", False)),
+                raw_min=int(pcal_cfg.get("raw_min", 1365)),
+                raw_max=int(pcal_cfg.get("raw_max", 2731)),
+            )
+            self._tilt_cal = BusServoCalibration(
+                servo_id=int(tcal_cfg.get("servo_id", 1)),
+                zero_raw=int(tcal_cfg.get("zero_raw", 1024)),
+                invert=bool(tcal_cfg.get("invert", False)),
+                raw_min=int(tcal_cfg.get("raw_min", 853)),
+                raw_max=int(tcal_cfg.get("raw_max", 2048)),
+            )
+            lim_pan_lo, lim_pan_hi = -60.0,  60.0
+            lim_tilt_lo, lim_tilt_hi = -15.0, 90.0
+        else:
+            pcal_cfg = (gcfg.get("pan_calibration")  or {})
+            tcal_cfg = (gcfg.get("tilt_calibration") or {})
+            self._pan_cal = ServoCalibration(
+                channel=int(pcal_cfg.get("channel", 0)),
+                min_deg=float(pcal_cfg.get("min_deg", -90.0)),
+                max_deg=float(pcal_cfg.get("max_deg",  90.0)),
+                us_at_min_deg=float(pcal_cfg.get("us_at_min_deg", 500.0)),
+                us_at_max_deg=float(pcal_cfg.get("us_at_max_deg", 2500.0)),
+                invert=bool(pcal_cfg.get("invert", False)),
+            )
+            self._tilt_cal = ServoCalibration(
+                channel=int(tcal_cfg.get("channel", 1)),
+                min_deg=float(tcal_cfg.get("min_deg",  0.0)),
+                max_deg=float(tcal_cfg.get("max_deg", 22.0)),
+                us_at_min_deg=float(tcal_cfg.get("us_at_min_deg", 1500.0)),
+                us_at_max_deg=float(tcal_cfg.get("us_at_max_deg", 2000.0)),
+                invert=bool(tcal_cfg.get("invert", False)),
+            )
+            lim_pan_lo, lim_pan_hi = self._pan_cal.min_deg, self._pan_cal.max_deg
+            lim_tilt_lo, lim_tilt_hi = self._tilt_cal.min_deg, self._tilt_cal.max_deg
 
         lims_cfg = (gcfg.get("limits") or {})
         limits = GimbalLimits(
-            pan_min_deg=float(lims_cfg.get("pan_min_deg",  self._pan_cal.min_deg)),
-            pan_max_deg=float(lims_cfg.get("pan_max_deg",  self._pan_cal.max_deg)),
-            tilt_min_deg=float(lims_cfg.get("tilt_min_deg", self._tilt_cal.min_deg)),
-            tilt_max_deg=float(lims_cfg.get("tilt_max_deg", self._tilt_cal.max_deg)),
+            pan_min_deg=float(lims_cfg.get("pan_min_deg",  lim_pan_lo)),
+            pan_max_deg=float(lims_cfg.get("pan_max_deg",  lim_pan_hi)),
+            tilt_min_deg=float(lims_cfg.get("tilt_min_deg", lim_tilt_lo)),
+            tilt_max_deg=float(lims_cfg.get("tilt_max_deg", lim_tilt_hi)),
             pan_slew_deg_per_s=float(lims_cfg.get("pan_slew_deg_per_s", 120.0)),
             tilt_slew_deg_per_s=float(lims_cfg.get("tilt_slew_deg_per_s", 60.0)),
         )
@@ -237,9 +288,11 @@ class GimbalManager:
         home_tilt = float(gcfg.get("home_tilt_deg",
                                    (limits.tilt_min_deg + limits.tilt_max_deg) / 2.0))
 
+        # V1 needs pan_cal/tilt_cal for `angles_to_us`; V2 doesn't call
+        # that helper but passing them through is harmless.
         self._controller = GimbalController(
-            pan_cal=self._pan_cal,
-            tilt_cal=self._tilt_cal,
+            pan_cal=self._pan_cal if not self._is_v2 else None,
+            tilt_cal=self._tilt_cal if not self._is_v2 else None,
             limits=limits,
             home_pan_deg=home_pan,
             home_tilt_deg=home_tilt,
@@ -320,6 +373,37 @@ class GimbalManager:
         self._kp_track       = float(gcfg.get("kp_track", 0.15))
         self._deadband_deg   = float(gcfg.get("deadband_deg", 2.5))
         self._max_step_deg   = float(gcfg.get("max_step_deg", 2.0))
+        # D term on measurement (encoder velocity). Subtracts kd × dpose/dt
+        # from d_pan_cl / d_tilt_cl in the closed-loop, which acts as a
+        # brake when the gimbal is moving fast toward target → smooth
+        # deceleration, no overshoot. Operates on MEASUREMENT (encoder
+        # velocity) rather than ERROR derivative so setpoint changes
+        # don't kick the controller. 0.0 = pure-P (legacy). Sensible
+        # range: 0.01 – 0.05 with V2 encoder; bigger values can fight
+        # the P term and slow convergence.
+        # `tracking 532026 try3.jsonl` track #1 transit showed 0.6° peak
+        # overshoot + reverse — the canonical use case for this knob.
+        self._kd_track       = float(gcfg.get("kd_track", 0.02))
+        # World-target smoothing alpha for the absolute-target
+        # closed-loop. Each fresh fused observation contributes this
+        # weight to the running target; previous value gets (1−alpha).
+        # Lower = smoother (less obs-jitter passes through to gimbal),
+        # higher = snappier response to actual target motion.
+        # Try-4 transit analysis showed YOLO obs jumping by 2.5° in
+        # one fresh-obs interval (cluster centroid hopping between
+        # detections); 0.30 attenuates that to ~0.75° per smoothed
+        # update, then the controller's slew rate handles the rest
+        # smoothly. For fast-moving targets the lookahead term
+        # (lead_time × world_az_dot) compensates for the ~3-tick
+        # smoothing lag.
+        self._track_target_lp_alpha = float(
+            gcfg.get("track_target_lp_alpha", 0.30))
+        # Switch: legacy proportional closed-loop vs new absolute-target
+        # closed-loop. Default to the new path for V2 (encoder feedback
+        # makes the absolute path safe). Set false to fall back to
+        # cur_pan + d_pan_cl + ff if the absolute path needs more tuning.
+        self._track_use_absolute_target = bool(
+            gcfg.get("track_use_absolute_target", True))
 
         # Error-signal low-pass: hot targets like vehicles don't have a
         # single crisp centroid. Headlights, grille, engine bay, wheel
@@ -502,6 +586,27 @@ class GimbalManager:
         # genuinely fresh track.
         self._track_no_obs_lead_zero_after_s: float = float(
             gcfg.get("track_no_obs_lead_zero_after_s", 0.30))
+        # Hysteresis ratio for the predictor's settled gate. See
+        # PredictorParams.settled_hysteresis_ratio in
+        # algorithms/track_predictor.py and YAML
+        # gimbal.track_settled_hysteresis_ratio for the rationale.
+        self._track_settled_hysteresis_ratio: float = float(
+            gcfg.get("track_settled_hysteresis_ratio", 0.6))
+        # Tracking-mode slew cap. When the manager is ENGAGED on a
+        # fused track, the controller's per-tick step is clamped to
+        # this dps regardless of how big d_pan_cl + ff_az_deg is. The
+        # default 18 dps lands EO motion blur at ~0.7° per 40 ms
+        # exposure (~80 px on the 1236-wide display), which YOLO
+        # comfortably recovers from. Without this cap the V2 servo's
+        # native ~35-40 dps mechanical max produces ~1.4° / 160 px
+        # of EO blur per frame and YOLO loses the bbox mid-slew —
+        # operator-reported in `gimbal moves too fast loses bbs.jsonl`.
+        # 0 or negative disables (legacy behaviour: only the broader
+        # `gimbal.controller.pan_slew_deg_per_s` limit applies).
+        # Manual dpad / HOME slews are NOT capped — they don't run
+        # through this branch.
+        self._track_slew_cap_dps: float = float(
+            gcfg.get("track_slew_cap_dps", 18.0))
 
         # Phase 3 — confidence gate for the velocity feed-forward in
         # the closed-loop fused-track tick branch. Only apply
@@ -685,17 +790,85 @@ class GimbalManager:
         self._tilt_saturated_logged = False
 
         # Driver — may or may not actually open.
-        # PWM-gating: skip Maestro writes when |new_us - last_sent_us| <
-        # min_us_step. Turns a stream of tiny per-tick PWM updates into
-        # discrete steps the servo can act on. See MaestroDriver init
-        # docstring for details. 5 µs ≈ 0.5° at our calibration; matches
-        # the Yahboom internal servo deadband. Set 0 to disable.
-        min_us_step = float(gcfg.get("maestro_min_us_step", 5.0))
-        self._driver = MaestroDriver(port=port or gcfg.get("port"),
-                                      min_us_step=min_us_step)
+        if self._is_v2:
+            ws_cfg = (gcfg.get("waveshare") or {})
+            # NOTE: do NOT fall back to gcfg["port"] — that's the legacy
+            # Maestro Command Port pin (COM4) which is a different device
+            # entirely. If ws_cfg.port is null, let BusServoDriver auto-
+            # detect the CH343 by VID/PID instead.
+            self._driver = BusServoDriver(
+                port=port or ws_cfg.get("port"),
+                baud=int(ws_cfg.get("baud", 1_000_000)),
+            )
+        else:
+            # PWM-gating: skip Maestro writes when |new_us - last_sent_us|
+            # < min_us_step. See MaestroDriver init docstring.
+            min_us_step = float(gcfg.get("maestro_min_us_step", 5.0))
+            self._driver = MaestroDriver(
+                port=port or gcfg.get("port"),
+                min_us_step=min_us_step,
+            )
         self._connected = False
         # Counter for consecutive write failures (auto-reconnect logic).
         self._consec_write_fail = 0
+        # Reconnect cooldown. _command_now runs at 60 Hz; without this,
+        # every disconnected tick called driver.open() which produced a
+        # warning log on systems with no Waveshare adapter — at 60 Hz the
+        # log queue contention dragged thermal/EO publish rates from
+        # 19-22 Hz down to ~6-9 Hz. Retry at most once every 5 s.
+        self._next_reconnect_ts: float = 0.0
+        # V2 only: last successful measured pose. Used as the published
+        # pan/tilt and as the fallback when an encoder read times out so
+        # the bus doesn't flap between measured and stale-commanded on a
+        # single dropped reply.
+        self._last_measured_pan: Optional[float] = None
+        self._last_measured_tilt: Optional[float] = None
+        # Previous-tick measured pose + timestamp for the closed-loop's
+        # D-term-on-measurement. dpose/dt computed here is the encoder's
+        # measured angular velocity; multiplied by kd_track and
+        # subtracted from d_pan_cl / d_tilt_cl in the closed-loop to
+        # damp overshoot.
+        self._prev_pose_pan: Optional[float] = None
+        self._prev_pose_tilt: Optional[float] = None
+        self._prev_pose_t: Optional[float] = None
+        # Smoothed world-frame target. Maintained across fresh
+        # observations to absorb YOLO bbox jitter before commanding
+        # the gimbal. EMA: new value contributes _target_lp_alpha,
+        # previous (1 − _target_lp_alpha). Reset to None on a new
+        # track-engagement so the first obs anchors the smoother.
+        self._smooth_target_az: Optional[float] = None
+        self._smooth_target_el: Optional[float] = None
+
+        # ── Lock mode (vision/lock_tracker.py) ──────────────────────
+        # Kill switch: gimbal.lock_mode.enabled in YAML. When False,
+        # lock-mode code paths are no-ops and behaviour is byte-
+        # equivalent to the good-baseline-v1 tag.
+        from vision.lock_tracker import LockTracker, LockTrackerConfig
+        lm_cfg = (gcfg.get("lock_mode") or {})
+        self._lock_mode_enabled: bool = bool(lm_cfg.get("enabled", True))
+        lt_cfg = LockTrackerConfig(
+            psr_lost=float(lm_cfg.get("psr_lost", 5.0)),
+            lost_frames=int(lm_cfg.get("lost_frames", 5)),
+            coast_window_s=float(lm_cfg.get("coast_window_s", 3.0)),
+            learning_rate=float(lm_cfg.get("learning_rate", 0.125)),
+            sigma=float(lm_cfg.get("sigma", 2.0)),
+            max_patch_dim=int(lm_cfg.get("max_patch_dim", 96)),
+        )
+        self._lock_eo = LockTracker(lt_cfg)
+        self._lock_thermal = LockTracker(lt_cfg)
+        # Engagement metadata captured at seed time. v2 uses ONLY
+        # `_lock_target_id` for the reseed gate; class is no longer
+        # checked (an ID match implies same physical target).
+        self._lock_target_id: Optional[int] = None
+        self._lock_target_class: Optional[str] = None
+        self._lock_seed_pending: bool = False
+        self._lock_reseed_min_period_s: float = float(
+            lm_cfg.get("reseed_min_period_s", 0.30))
+        # State-transition tracker for the JSONL recorder. We emit
+        # one event per real transition (not per tick) so a future
+        # replay can reconstruct the lock-state machine from the
+        # event stream alone.
+        self._lock_last_state_str: str = "off"
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -724,6 +897,13 @@ class GimbalManager:
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
 
+    def _axis_addrs(self) -> list:
+        """Per-axis addressing list the active driver expects:
+        Maestro channels for V1, bus-servo IDs for V2."""
+        if self._is_v2:
+            return [self._pan_cal.servo_id, self._tilt_cal.servo_id]
+        return [self._pan_cal.channel, self._tilt_cal.channel]
+
     # ── lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
@@ -731,8 +911,32 @@ class GimbalManager:
             return
         self._connected = self._driver.open()
         if self._connected:
+            # V2: write Acceleration register on each servo so per-tick
+            # goal-position writes ramp instead of snapping. Default 0
+            # is "max instant acceleration" which feels jerky at 60 Hz
+            # update rates. ~50 is a noticeable smoothing without
+            # killing responsiveness.
+            if self._is_v2:
+                ws_cfg = (load_config().get("gimbal", {}) or {}).get("waveshare", {}) or {}
+                pan_cfg = ws_cfg.get("pan") or {}
+                tilt_cfg = ws_cfg.get("tilt") or {}
+                # Acceleration ramp on the motor commutation (0..255).
+                self._driver.set_acceleration(self._pan_cal.servo_id,
+                                               int(pan_cfg.get("acceleration", 50)))
+                self._driver.set_acceleration(self._tilt_cal.servo_id,
+                                               int(tilt_cfg.get("acceleration", 50)))
+                # Position-Integral gain (0..255). Default firmware ships
+                # this at 0, which leaves a steady-state error against
+                # any constant load (gravity on the tilted-up gimbal
+                # sits the axis a couple degrees below commanded). A
+                # small I drives that residual to zero. Too large will
+                # hunt. 2..3 is a conservative starting point.
+                self._driver.set_position_i_gain(self._pan_cal.servo_id,
+                                                  int(pan_cfg.get("ki", 2)))
+                self._driver.set_position_i_gain(self._tilt_cal.servo_id,
+                                                  int(tilt_cfg.get("ki", 3)))
             # Move gently to home instead of snapping — avoids a
-            # startup slam when the servos wake up at a random µs.
+            # startup slam when the servos wake up at a random pose.
             self._controller.reset_to(self._home_pan, self._home_tilt)
             self._command_now(self._home_pan, self._home_tilt)
         self._stop_evt.clear()
@@ -751,7 +955,7 @@ class GimbalManager:
         if self._connected:
             # Release servos on shutdown so they don't keep holding
             # torque and overheat.
-            self._driver.release_all([self._pan_cal.channel, self._tilt_cal.channel])
+            self._driver.release_all(self._axis_addrs())
         self._driver.close()
         log.info("GimbalManager stopped")
 
@@ -780,8 +984,8 @@ class GimbalManager:
                 self._tracked_heat_id = None
             new_pan  = self._manual_pan  + float(d_pan_deg)
             new_tilt = self._manual_tilt + float(d_tilt_deg)
-            pan_lo  = float(self._pan_cal.min_deg)
-            pan_hi  = float(self._pan_cal.max_deg)
+            pan_lo  = float(self._pan_floor)
+            pan_hi  = float(self._pan_ceil)
             tilt_lo = float(self._tilt_floor)
             tilt_hi = float(self._tilt_ceil)
             self._manual_pan  = max(pan_lo,  min(pan_hi,  new_pan))
@@ -799,17 +1003,67 @@ class GimbalManager:
 
     def set_track_target(self, track_id: Optional[int]) -> None:
         with self._lock:
+            prev_id = self._tracked_id
             if track_id is None:
                 self._tracked_id = None
                 log.info("Fused track lock cleared → manual")
-            else:
-                try:
-                    self._tracked_id = int(track_id)
-                    # Fused lock takes priority over any heat lock.
-                    self._tracked_heat_id = None
-                    log.info("Fused track lock engaged on #%d", self._tracked_id)
-                except (TypeError, ValueError):
-                    log.warning("Bad track_id: %r", track_id)
+                return
+            try:
+                new_id = int(track_id)
+            except (TypeError, ValueError):
+                log.warning("Bad track_id: %r", track_id)
+                return
+            # Switching from one target to another (or engaging while
+            # a previous lock was still alive with tracked_id never
+            # passing through None) must reset ALL predictor and
+            # closed-loop state. Without this, the prior track's
+            # world_az_dot leaks into the new engagement and the
+            # predictor's lookahead computes
+            #     shift_az = lead_time × world_az_dot_inherited
+            # at the very first tick — producing a 2°+ initial
+            # setpoint error and the visible "aggressive at engage"
+            # burst plus the bb-flicker on switch documented in
+            # `still too aggresive i guess.jsonl` track #7 (entered
+            # the predictor stream with world_az_dot=-6.93 dps before
+            # ANY obs of #7 had been processed).
+            #
+            # The legacy reset path in _tick fires only when the else
+            # branch (tracked_id is None) runs — i.e. between two
+            # engagements that go through release. A direct switch
+            # never hits that branch, so the reset never fired.
+            if new_id != prev_id:
+                self._track_world_az = None
+                self._track_world_el = None
+                self._track_world_az_dot = 0.0
+                self._track_world_el_dot = 0.0
+                self._track_world_last_t = None
+                self._track_obs_count = 0
+                self._cur_pan_prev = None
+                self._cur_tilt_prev = None
+                self._cur_pose_prev_t = None
+                self._predictor_state.reset()
+                self._last_settled_state = None
+                self._smooth_target_az = None
+                self._smooth_target_el = None
+                self._last_sp_pan = None
+                self._last_sp_tilt = None
+                self._last_track_ts = None
+                self._last_fused_track_hits = None
+                # Lock mode: clear previous lock state and arm a
+                # seed-pending flag. The actual seed happens on the
+                # NEXT _tick once we have fresh EO + thermal frames
+                # plus the fused track's bbox_eo / bbox_thermal
+                # projections to anchor the MOSSE patches on.
+                if self._lock_mode_enabled:
+                    self._lock_eo.release()
+                    self._lock_thermal.release()
+                    self._lock_target_id = new_id
+                    self._lock_target_class = None  # filled when seeding
+                    self._lock_seed_pending = True
+            self._tracked_id = new_id
+            # Fused lock takes priority over any heat lock.
+            self._tracked_heat_id = None
+            log.info("Fused track lock engaged on #%d", self._tracked_id)
 
     def set_track_heat(self, heat_id: Optional[int]) -> None:
         """Lock the gimbal onto a raw heat-blob tracker ID (dev-mode path).
@@ -884,6 +1138,66 @@ class GimbalManager:
         sp_pan, sp_tilt = manual_pan, manual_tilt
         err: Optional[str] = None
 
+        # ── Pose source for the predictor + closed-loop ──────────────
+        # V2 (waveshare_st3025) has a 12-bit absolute encoder per servo.
+        # Reading it here at the top of the tick gives us the SERVO'S
+        # ACTUAL angular position (not the controller's commanded
+        # rate-limited setpoint, which leads the encoder during slews).
+        # Critical for two reasons:
+        #   1. world_az = obs_az + cur_pan_at_capture_time. Using the
+        #      commanded pose (which leads measured by 1-3°) injects
+        #      that gap as observation noise, which the velocity filter
+        #      then turns into phantom motion → noisy lookahead → jitter.
+        #      `tracker 532026.jsonl` track #11: cam_az per-tick max
+        #      delta 6.92° while world_az delta only 1.4° — the cam-frame
+        #      jitter was almost entirely from pose-source mismatch.
+        #   2. `gimbal_dps` (used by the predictor's settled gate)
+        #      computed from MEASURED pose differences reflects real
+        #      angular velocity. Computed from commanded pose, it
+        #      flapped: 138 settled-flips in 451 ticks because the
+        #      controller's commanded-pose jumps every tick when sp
+        #      moves, even though the gimbal physically isn't moving
+        #      at that rate.
+        # V1 (Maestro PWM, no feedback): keep the historical commanded
+        # path — `actual_pan/actual_tilt` is recovered from
+        # get_last_written_us downstream of _command_now.
+        pose_pan: Optional[float] = None
+        pose_tilt: Optional[float] = None
+        if self._is_v2 and self._connected:
+            try:
+                raw_p = self._driver.read_position(self._pan_cal.servo_id)
+                raw_t = self._driver.read_position(self._tilt_cal.servo_id)
+                if raw_p is not None:
+                    self._last_measured_pan = self._pan_cal.units_to_angle(raw_p)
+                if raw_t is not None:
+                    self._last_measured_tilt = self._tilt_cal.units_to_angle(raw_t)
+            except Exception as e:
+                log.debug("V2 read_position at tick top failed: %r", e)
+            pose_pan = self._last_measured_pan
+            pose_tilt = self._last_measured_tilt
+        if pose_pan is None or pose_tilt is None:
+            pose_pan, pose_tilt = self._controller.current
+
+        # Encoder-measured angular velocity for the closed-loop D term.
+        # D-on-MEASUREMENT (not on error) so setpoint changes don't kick
+        # the controller. Brakes proportional to how fast the gimbal is
+        # physically moving — when approaching target fast, command
+        # shrinks → smooth deceleration → no overshoot.
+        import time as _t_dt
+        _now_dt = _t_dt.time()
+        meas_dpan_dps = 0.0
+        meas_dtilt_dps = 0.0
+        if (self._prev_pose_pan is not None
+                and self._prev_pose_tilt is not None
+                and self._prev_pose_t is not None):
+            _dt = max(1e-3, _now_dt - self._prev_pose_t)
+            if _dt < 0.5:   # ignore stale-prev (e.g. after a long pause)
+                meas_dpan_dps  = (pose_pan  - self._prev_pose_pan)  / _dt
+                meas_dtilt_dps = (pose_tilt - self._prev_pose_tilt) / _dt
+        self._prev_pose_pan  = pose_pan
+        self._prev_pose_tilt = pose_tilt
+        self._prev_pose_t    = _now_dt
+
         # Visual feedback freshness gate. The camera supplies error
         # samples at ~30 Hz; the control loop ticks at 60 Hz. Commanding
         # a fresh P correction on every tick would fire 2 corrections
@@ -907,7 +1221,9 @@ class GimbalManager:
 
         if tracked_heat_id is not None and tracked_id is None:
             if heat_obs is not None:
-                cur_pan, cur_tilt = self._controller.current
+                # Same rationale as fused-track path: use measured pose
+                # (V2 encoder) for the predictor + closed-loop reference.
+                cur_pan, cur_tilt = pose_pan, pose_tilt
                 # Centroid-move gate. The OF tracker that propagates
                 # synthetic targets advances cx/cy only every few
                 # thermal frames. If we recompute the setpoint on
@@ -1128,7 +1444,12 @@ class GimbalManager:
                         trk = t
                         break
             if trk is not None:
-                cur_pan, cur_tilt = self._controller.current
+                # Use measured pose (encoder) on V2 instead of the
+                # controller's commanded pose. See pose_pan/pose_tilt
+                # docstring at the top of _tick — leads to clean
+                # gimbal_dps, stable settled gate, and correct
+                # world_az = obs_az + cur_pan_at_capture conversion.
+                cur_pan, cur_tilt = pose_pan, pose_tilt
                 # Fused-track freshness gate. Only feed the predictor
                 # a "fresh" observation when the FUSED track has
                 # actually been refreshed (id+hits tuple changed) --
@@ -1194,6 +1515,7 @@ class GimbalManager:
                     vel_clip_dps=self._track_vel_clip_dps,
                     vel_decay_halflife_s=self._track_vel_decay_halflife_s,
                     no_obs_lead_zero_after_s=self._track_no_obs_lead_zero_after_s,
+                    settled_hysteresis_ratio=self._track_settled_hysteresis_ratio,
                     tilt_saturated=tilt_sat_now,
                 )
                 # Prefer world-frame angles published directly by fusion
@@ -1253,6 +1575,31 @@ class GimbalManager:
                             el_in, kp_eff,
                             self._track_zero_band_deg,
                             self._track_full_band_deg)
+                        # D term on encoder velocity (kd * dpose/dt
+                        # subtracted from the proportional output).
+                        # Brakes the controller when the gimbal is
+                        # already moving fast in the same direction as
+                        # the commanded delta — kills the overshoot
+                        # seen in `tracking 532026 try3.jsonl` track #1
+                        # (transit at 36 dps, then bounce-back at 0.6°
+                        # amplitude before settling). kd=0 (legacy
+                        # pure-P) is still selectable via YAML.
+                        # Per-axis "centered" gate: the brake is only
+                        # meaningful during APPROACH. When |err| <
+                        # zero_band the kp output is already zero
+                        # (deadband), so subtracting kd×velocity
+                        # would make the brake the dominant force on
+                        # sp inside the deadband — driving the
+                        # arrival-bounce documented in the absolute-
+                        # target branch above. Same semantics here.
+                        kd_brake_az_legacy = self._kd_track * meas_dpan_dps
+                        kd_brake_el_legacy = self._kd_track * meas_dtilt_dps
+                        if abs(az_in) < self._track_zero_band_deg:
+                            kd_brake_az_legacy = 0.0
+                        if abs(el_in) < self._track_zero_band_deg:
+                            kd_brake_el_legacy = 0.0
+                        d_pan_cl  -= kd_brake_az_legacy
+                        d_tilt_cl -= kd_brake_el_legacy
                         if abs(d_pan_cl)  < self._track_min_step_deg:
                             d_pan_cl  = 0.0
                         if abs(d_tilt_cl) < self._track_min_step_deg:
@@ -1297,8 +1644,103 @@ class GimbalManager:
                             cap = self._track_predict_cap_deg
                             ff_az_deg = max(-cap, min(cap, ff_az_deg))
                             ff_el_deg = max(-cap, min(cap, ff_el_deg))
-                        sp_pan_pred  = cur_pan  + d_pan_cl  + ff_az_deg
-                        sp_tilt_pred = cur_tilt + d_tilt_cl + ff_el_deg
+                        # Per-axis "centered" gate on the lookahead.
+                        # When the proportional output is already zero
+                        # (|err| < zero_band), the closed-loop is saying
+                        # "this axis is on target." Adding ff here just
+                        # feeds the predictor's velocity-estimate noise
+                        # into the setpoint: ~1-4 dps of jitter from
+                        # observation noise on a stationary target × 0.3 s
+                        # lead = 0.3-1.2° of unwanted setpoint motion
+                        # every tick. The controller chases that, the
+                        # settled gate flips ~4 Hz, the operator sees it
+                        # as "aggressive when centered" hunting (see
+                        # `night tracking a bit flickery.jsonl` track #6).
+                        # Per-axis decision so a target moving fast in
+                        # pan but centered in tilt still gets pan
+                        # lookahead. The lookahead re-engages cleanly
+                        # the moment |err| crosses zero_band — i.e.
+                        # when chasing actually pays off.
+                        if abs(az_in) < self._track_zero_band_deg:
+                            ff_az_deg = 0.0
+                        if abs(el_in) < self._track_zero_band_deg:
+                            ff_el_deg = 0.0
+                        # Per-axis "centered" gate on the kd brake. The
+                        # absolute-target setpoint below subtracts
+                        # kd × encoder_velocity from the commanded
+                        # position so the gimbal decelerates while
+                        # APPROACHING the target. That intent is sound
+                        # during chase but pathological inside the
+                        # deadband: when |err| < zero_band the kp
+                        # output is already zero, so the kd term
+                        # becomes the dominant force on sp. With
+                        # kd=0.02 and slew-cap-bound velocities of
+                        # ~18 dps, the brake shifts sp by ~0.36°
+                        # against motion — comparable to zero_band
+                        # (0.5°). The gimbal arrives near target with
+                        # velocity, the brake pushes sp PAST target
+                        # in the opposite direction, gimbal reverses,
+                        # brake flips, gimbal reverses again. Visible
+                        # in `gimbal too aggresive 2.jsonl` track #137
+                        # at t=6.59-6.97s as a +17 → -8.6 dps velocity
+                        # reversal within 100 ms. Per-axis gate so a
+                        # target moving fast in one axis but centered
+                        # in the other gets the brake on the chasing
+                        # axis only.
+                        kd_brake_az = self._kd_track * meas_dpan_dps
+                        kd_brake_el = self._kd_track * meas_dtilt_dps
+                        if abs(az_in) < self._track_zero_band_deg:
+                            kd_brake_az = 0.0
+                        if abs(el_in) < self._track_zero_band_deg:
+                            kd_brake_el = 0.0
+                        if (self._track_use_absolute_target
+                                and trk_world_az is not None
+                                and trk_world_el is not None):
+                            # ABSOLUTE-TARGET path. Treat the
+                            # smoothed world-frame target as the
+                            # setpoint directly — exactly like the
+                            # Home button. Controller's slew rate
+                            # limit handles smooth approach; servo
+                            # arrives once and stays. No more
+                            # cur_pan + d_pan_cl Zeno asymptote that
+                            # caused the visible "stuck on the way"
+                            # stutter in `tracker 532026 try 4`.
+                            a = self._track_target_lp_alpha
+                            if self._smooth_target_az is None:
+                                self._smooth_target_az = float(trk_world_az)
+                                self._smooth_target_el = float(trk_world_el)
+                            else:
+                                self._smooth_target_az = (
+                                    (1.0 - a) * self._smooth_target_az
+                                    + a * float(trk_world_az))
+                                self._smooth_target_el = (
+                                    (1.0 - a) * self._smooth_target_el
+                                    + a * float(trk_world_el))
+                            # D-on-encoder-velocity brake. The absolute-
+                            # target setpoint above hands the controller a
+                            # static target which it slews to at full slew
+                            # rate (120 dps) — servo momentum then carries
+                            # it past on arrival. Subtracting kd × actual
+                            # angular velocity from the setpoint pulls the
+                            # commanded position BEHIND the true target by
+                            # an amount proportional to how fast the gimbal
+                            # is currently moving. As the gimbal decelerates
+                            # near target (encoder velocity drops), the brake
+                            # shrinks and the commanded position converges
+                            # to the true target. Result: smooth approach,
+                            # no overshoot.
+                            sp_pan_pred  = (self._smooth_target_az
+                                             + ff_az_deg
+                                             - kd_brake_az)
+                            sp_tilt_pred = (self._smooth_target_el
+                                             + ff_el_deg
+                                             - kd_brake_el)
+                        else:
+                            # Legacy delta-from-current closed-loop.
+                            # Kept as a fallback when world coords
+                            # aren't available or operator wants A/B.
+                            sp_pan_pred  = cur_pan  + d_pan_cl  + ff_az_deg
+                            sp_tilt_pred = cur_tilt + d_tilt_cl + ff_el_deg
                     else:
                         # Stale tick — hold the previous setpoint so
                         # the gimbal finishes its in-flight motion
@@ -1431,6 +1873,15 @@ class GimbalManager:
                 sp_pan, sp_tilt = self._controller.current
         else:
             self._track_miss = 0
+            # Lock mode: operator dropped the lock OR grace expired.
+            # Release the per-sensor lock trackers so the GUI stops
+            # rendering the lock bbox.
+            if self._lock_mode_enabled:
+                self._lock_eo.release()
+                self._lock_thermal.release()
+                self._lock_target_id = None
+                self._lock_target_class = None
+                self._lock_seed_pending = False
             # Not tracking — flush cached setpoints so next engage
             # starts fresh against whatever the new target's error is.
             self._last_track_ts = None
@@ -1477,6 +1928,10 @@ class GimbalManager:
             self._in_deadband   = False
             self._reset_track_filter()
             self._tilt_saturated_logged = False
+            # Drop the smoothed-target memory too — the next engage
+            # will anchor on its first fresh observation.
+            self._smooth_target_az = None
+            self._smooth_target_el = None
 
         # Pan-saturation detection (symmetric with the tilt-saturated
         # logic above). Detect when the desired sp_pan would push the
@@ -1506,8 +1961,19 @@ class GimbalManager:
                     pass
                 self._pan_saturated_logged = False
 
-        # Slew + clamp
-        cmd_pan, cmd_tilt = self._controller.step(sp_pan, sp_tilt)
+        # Slew + clamp.
+        # When ENGAGED on a fused track, cap the per-tick slew at
+        # _track_slew_cap_dps so EO motion blur stays within YOLO's
+        # recoverability envelope. Manual dpad / HOME / synth-target
+        # paths fall through with slew_cap_dps=None (no extra cap).
+        # tracked_id is held under self._lock; read it once.
+        with self._lock:
+            _engaged = (self._tracked_id is not None)
+        slew_cap = self._track_slew_cap_dps if _engaged else None
+        if slew_cap is not None and slew_cap <= 0:
+            slew_cap = None
+        cmd_pan, cmd_tilt = self._controller.step(
+            sp_pan, sp_tilt, slew_cap_dps=slew_cap)
         self._command_now(cmd_pan, cmd_tilt)
 
         # Recover the SERVO'S ACTUAL-LAST-WRITTEN pose from the Maestro
@@ -1524,12 +1990,38 @@ class GimbalManager:
         # — the servo wasn't moving, but published tilt advanced
         # 0.5°/tick.)
         # Falls back to cmd_pan/tilt when nothing has been written yet.
-        last_us_pan  = self._driver.get_last_written_us(self._pan_cal.channel)
-        last_us_tilt = self._driver.get_last_written_us(self._tilt_cal.channel)
-        actual_pan  = (self._pan_cal.us_to_angle(last_us_pan)
-                        if last_us_pan is not None else cmd_pan)
-        actual_tilt = (self._tilt_cal.us_to_angle(last_us_tilt)
-                        if last_us_tilt is not None else cmd_tilt)
+        if self._is_v2:
+            # V2: encoder was already read at the top of _tick (and the
+            # measured pose cached in self._last_measured_*). Reuse the
+            # cached value here — avoids a second pair of bus reads per
+            # tick (saves ~3-6 ms of bus time) and ensures the published
+            # GimbalState matches the pose the predictor + closed-loop
+            # actually used this tick.
+            actual_pan  = (self._last_measured_pan
+                           if self._last_measured_pan is not None else cmd_pan)
+            actual_tilt = (self._last_measured_tilt
+                           if self._last_measured_tilt is not None else cmd_tilt)
+        else:
+            last_us_pan  = self._driver.get_last_written_us(self._pan_cal.channel)
+            last_us_tilt = self._driver.get_last_written_us(self._tilt_cal.channel)
+            actual_pan  = (self._pan_cal.us_to_angle(last_us_pan)
+                            if last_us_pan is not None else cmd_pan)
+            actual_tilt = (self._tilt_cal.us_to_angle(last_us_tilt)
+                            if last_us_tilt is not None else cmd_tilt)
+
+        # Lock-mode tick: seed-on-pending, per-frame MOSSE update,
+        # auto-reseed from matching fused observations. No-op when
+        # gimbal.lock_mode.enabled=false in YAML, or when no track
+        # is engaged.
+        try:
+            lock_bbox_eo, lock_bbox_thermal, lock_state_str = self._lock_mode_tick()
+        except Exception:
+            log.exception("lock_mode_tick failed; emitting empty lock state")
+            lock_bbox_eo, lock_bbox_thermal, lock_state_str = None, None, "off"
+        # Snapshot the current lock target id under the lock so the
+        # GUI knows which fused-track green box to suppress.
+        with self._lock:
+            lock_target_id_pub = self._lock_target_id
 
         # Publish state. `tracked_target_id` carries whichever lock is
         # live — fused id if that's set, else the heat id. The GUI only
@@ -1550,8 +2042,254 @@ class GimbalManager:
             synth_world_el_deg=self._synth_world_el_deg,
             target_resid_az_deg=self._latest_target_resid_az,
             target_resid_el_deg=self._latest_target_resid_el,
+            lock_state=lock_state_str,
+            lock_bbox_eo=lock_bbox_eo,
+            lock_bbox_thermal=lock_bbox_thermal,
+            lock_target_id=lock_target_id_pub,
         )
         BUS.publish(Topic.GIMBAL, state)
+
+    def _lock_mode_tick(self) -> Tuple[Optional["BBox"], Optional["BBox"], str]:
+        """Run one lock-mode tick: seed-on-pending, per-frame update,
+        auto-reseed from a matching fused observation. Returns
+        ``(lock_bbox_eo, lock_bbox_thermal, lock_state)`` for publish
+        on GimbalState. When lock mode is disabled OR not engaged,
+        returns ``(None, None, "off")``.
+
+        The two sensor locks have independent state machines —
+        thermal can be COASTING while EO is ACTIVE, or vice versa.
+        The published lock_state is the WORST of the two (most
+        conservative for the GUI's amber/green decision).
+        """
+        from common.frames import BBox
+        if not self._lock_mode_enabled or self._tracked_id is None:
+            return None, None, "off"
+
+        now = time.time()
+        ef = BUS.get_latest(Topic.EO)
+        tf = BUS.get_latest(Topic.THERMAL)
+        ef_ok = (isinstance(ef, EOFrame) and ef.connected
+                  and ef.bgr is not None)
+        tf_ok = (isinstance(tf, ThermalFrame) and tf.connected
+                  and tf.agc8 is not None)
+
+        # ── Seed-pending: latch the engagement bbox from the fused
+        # track on the first tick after operator engagement.
+        if self._lock_seed_pending:
+            fused = BUS.get_latest(Topic.FUSED) or []
+            target = next((t for t in fused
+                            if getattr(t, "id", None) == self._lock_target_id),
+                           None)
+            if target is None:
+                # Fused track gone (race between engage and tick) —
+                # leave seed pending, retry next tick within grace.
+                pass
+            else:
+                self._lock_target_class = getattr(
+                    getattr(target, "target_class", None), "value", None)
+                # Compute per-sensor bboxes from the fused track's
+                # world angles + each frame's pose-at-capture, same
+                # as gui.sensor_bridge.fused_to_wire does.
+                seeded_any = False
+                if ef_ok:
+                    bbox_eo = self._fused_to_eo_bbox(target, ef)
+                    if bbox_eo is not None:
+                        if self._lock_eo.seed(ef.bgr, bbox_eo, now=now):
+                            seeded_any = True
+                if tf_ok:
+                    bbox_th = self._fused_to_thermal_bbox(target, tf)
+                    if bbox_th is not None:
+                        if self._lock_thermal.seed(tf.agc8, bbox_th, now=now):
+                            seeded_any = True
+                if seeded_any:
+                    self._lock_seed_pending = False
+
+        # ── Per-frame lock updates.
+        eo_upd = (self._lock_eo.update(ef.bgr, now=now)
+                   if (ef_ok and self._lock_eo.is_active) else None)
+        th_upd = (self._lock_thermal.update(tf.agc8, now=now)
+                   if (tf_ok and self._lock_thermal.is_active) else None)
+
+        # ── Auto-reseed (v2): STRICT ID-MATCH ONLY.
+        #
+        # v1 used (class match + IoU >= 0.20) to find a "matching"
+        # fused track and reseed onto it. In dense same-class scenes
+        # (5+ vehicles in `recordings/lock poorly.jsonl` at t≈9.6s)
+        # that gate fired on a different vehicle that briefly
+        # overlapped the lock bbox, swapping the lock identity to a
+        # passing target. Operator: "additional locked bbs that were
+        # mixing and confusing between targets on the yolo side."
+        #
+        # v2: only reseed when the fused-track stream contains a
+        # track with id == self._lock_target_id. The original ID
+        # assigned by fusion at engagement is the only thing that
+        # ever refreshes the appearance template. Drift onto a
+        # different physical target becomes structurally impossible
+        # because the only path to overwrite the template requires
+        # ID-equality with the engaged track. If fusion drops the
+        # engaged ID permanently (max_misses), the lock keeps
+        # COASTING on appearance MOSSE alone, then HARD_RELEASED at
+        # the coast window — operator clicks TRACK on a new ID for
+        # a fresh lock. Trade-off accepted per 2026-05-05 retro.
+        fused = BUS.get_latest(Topic.FUSED) or []
+        target = None
+        for trk in fused:
+            if getattr(trk, "id", None) == self._lock_target_id:
+                target = trk
+                break
+        if target is not None:
+            if (ef_ok and self._lock_eo.is_active
+                    and self._lock_eo.time_since_reseed(now=now)
+                        >= self._lock_reseed_min_period_s):
+                bbox_eo = self._fused_to_eo_bbox(target, ef)
+                if bbox_eo is not None:
+                    self._lock_eo.reseed(ef.bgr, bbox_eo, now=now)
+            if (tf_ok and self._lock_thermal.is_active
+                    and self._lock_thermal.time_since_reseed(now=now)
+                        >= self._lock_reseed_min_period_s):
+                bbox_th = self._fused_to_thermal_bbox(target, tf)
+                if bbox_th is not None:
+                    self._lock_thermal.reseed(tf.agc8, bbox_th, now=now)
+
+        # ── Compose published values.
+        def to_bbox(upd):
+            if upd is None or upd.bbox_xywh is None:
+                return None
+            x, y, w, h = upd.bbox_xywh
+            return BBox(x=int(x), y=int(y), w=int(w), h=int(h))
+
+        bbox_eo_pub = to_bbox(eo_upd)
+        bbox_th_pub = to_bbox(th_upd)
+
+        # State priority: HARD_RELEASED > COASTING > ACTIVE > OFF.
+        # We want the GUI to see "coasting" if EITHER sensor is
+        # coasting (so it goes amber), and "active" only when both
+        # are healthy.
+        from vision.lock_tracker import LockState
+        states = []
+        if eo_upd is not None: states.append(eo_upd.state)
+        if th_upd is not None: states.append(th_upd.state)
+        if not states:
+            lock_state = "off"
+        elif LockState.HARD_RELEASED in states:
+            lock_state = "released"
+        elif LockState.COASTING in states:
+            lock_state = "coasting"
+        elif LockState.ACTIVE in states:
+            lock_state = "active"
+        else:
+            lock_state = "off"
+
+        # ── Emit per-transition events for replay-debug. One event
+        # per real edge in the state machine, never per-tick.
+        if lock_state != self._lock_last_state_str:
+            ev_payload = {
+                "tracked_id": self._lock_target_id,
+                "from_state": self._lock_last_state_str,
+                "to_state": lock_state,
+                "psr_eo": (round(float(eo_upd.psr), 2)
+                            if eo_upd is not None else None),
+                "psr_thermal": (round(float(th_upd.psr), 2)
+                                  if th_upd is not None else None),
+            }
+            event_name = {
+                ("off", "active"):       "lock_seeded",
+                ("active", "coasting"):  "lock_coasting_enter",
+                ("coasting", "active"):  "lock_active_resume",
+                ("coasting", "released"):"lock_hard_released",
+                ("active", "released"):  "lock_hard_released",
+            }.get((self._lock_last_state_str, lock_state),
+                  "lock_state_change")
+            try:
+                emit_event(event_name, ev_payload)
+            except Exception:
+                pass
+            self._lock_last_state_str = lock_state
+
+        # ── HARD_RELEASED side effects: drop engagement so gimbal
+        # returns to manual. Done after event emission so the
+        # transition is recorded.
+        if lock_state == "released":
+            with self._lock:
+                if self._tracked_id == self._lock_target_id:
+                    self._tracked_id = None
+            self._lock_eo.release()
+            self._lock_thermal.release()
+            self._lock_target_id = None
+            self._lock_target_class = None
+            self._lock_seed_pending = False
+            return None, None, "released"
+        return bbox_eo_pub, bbox_th_pub, lock_state
+
+    def _fused_to_eo_bbox(self, trk: Any,
+                           ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
+        """Project a fused track onto the EO image's pose-at-capture.
+        Mirrors gui.sensor_bridge.fused_to_wire's per-panel
+        re-projection so the lock seed lands on the same pixel
+        position the operator clicked on."""
+        from fusion.angular import angular_bbox_visible, angular_to_bbox
+        wa = getattr(trk, "world_az_deg", None)
+        we = getattr(trk, "world_el_deg", None)
+        e_pan = getattr(ef, "gimbal_pan_at_capture", None)
+        e_tilt = getattr(ef, "gimbal_tilt_at_capture", None)
+        if (wa is not None and we is not None
+                and e_pan is not None and e_tilt is not None):
+            az = wa - float(e_pan)
+            el = we - float(e_tilt)
+        else:
+            az = float(getattr(trk, "az_deg", 0.0))
+            el = float(getattr(trk, "el_deg", 0.0))
+        ang_w = float(getattr(trk, "ang_w_deg", 0.0))
+        ang_h = float(getattr(trk, "ang_h_deg", 0.0))
+        if ang_w <= 0 or ang_h <= 0:
+            return None
+        if ef.bgr is None:
+            return None
+        h, w = ef.bgr.shape[:2]
+        hfov = float(getattr(ef, "hfov_deg", 11.05))
+        vfov = float(getattr(ef, "vfov_deg", 9.23))
+        if not angular_bbox_visible(az, el, ang_w, ang_h, hfov, vfov):
+            return None
+        x, y, bw, bh = angular_to_bbox(az, el, ang_w, ang_h,
+                                         w, h, hfov, vfov)
+        if bw <= 0 or bh <= 0:
+            return None
+        return (int(x), int(y), int(bw), int(bh))
+
+    def _fused_to_thermal_bbox(self, trk: Any,
+                                 tf: "ThermalFrame") -> Optional[Tuple[int, int, int, int]]:
+        """Same as _fused_to_eo_bbox but for the thermal panel,
+        accounting for the thermal extrinsic bias."""
+        from fusion.angular import angular_bbox_visible, angular_to_bbox
+        wa = getattr(trk, "world_az_deg", None)
+        we = getattr(trk, "world_el_deg", None)
+        t_pan = getattr(tf, "gimbal_pan_at_capture", None)
+        t_tilt = getattr(tf, "gimbal_tilt_at_capture", None)
+        bias_az = float(getattr(self, "_thermal_az_bias_deg", 0.0))
+        bias_el = float(getattr(self, "_thermal_el_bias_deg", 0.0))
+        if (wa is not None and we is not None
+                and t_pan is not None and t_tilt is not None):
+            az = wa - float(t_pan) - bias_az
+            el = we - float(t_tilt) - bias_el
+        else:
+            az = float(getattr(trk, "az_deg", 0.0)) - bias_az
+            el = float(getattr(trk, "el_deg", 0.0)) - bias_el
+        ang_w = float(getattr(trk, "ang_w_deg", 0.0))
+        ang_h = float(getattr(trk, "ang_h_deg", 0.0))
+        if ang_w <= 0 or ang_h <= 0:
+            return None
+        if tf.agc8 is None:
+            return None
+        h, w = tf.agc8.shape[:2]
+        hfov = float(getattr(tf, "hfov_deg", 37.0))
+        vfov = float(getattr(tf, "vfov_deg", 30.0))
+        if not angular_bbox_visible(az, el, ang_w, ang_h, hfov, vfov):
+            return None
+        x, y, bw, bh = angular_to_bbox(az, el, ang_w, ang_h,
+                                         w, h, hfov, vfov)
+        if bw <= 0 or bh <= 0:
+            return None
+        return (int(x), int(y), int(bw), int(bh))
 
     def _resolve_heat_track(self, heat_id: int) -> Optional[_HeatObs]:
         """Look up the current az/el of a heat-blob tracker ID.
@@ -1709,8 +2447,7 @@ class GimbalManager:
         except Exception:
             pass
         try:
-            self._driver.release_all([self._pan_cal.channel,
-                                       self._tilt_cal.channel])
+            self._driver.release_all(self._axis_addrs())
         except Exception as e:
             log.warning("release_all failed: %s", e)
         # Clear synth lock so subsequent ticks don't re-engage.
@@ -1970,16 +2707,28 @@ class GimbalManager:
         # commanded pan moved -15 -> -27.6, but thermal LK reported
         # zero scene shift.
         if not self._connected:
-            # Try to re-open the port. Cheap when there's no Maestro
-            # plugged in (returns False fast).
+            # Throttle reconnect attempts. Without the gate this fires
+            # at the 60 Hz tick rate, and driver.open() logs a warning
+            # each time it can't find the adapter — tens of writes/sec
+            # on the global logger queue stalls thermal/EO publishers.
+            now = time.time()
+            if now < self._next_reconnect_ts:
+                return
+            self._next_reconnect_ts = now + 5.0  # try again in 5 s
             self._connected = self._driver.open()
             if not self._connected:
                 return
             log.info("Maestro re-connected after transient failure")
             self._consec_write_fail = 0
-        us_p, us_t = self._controller.angles_to_us(pan_deg, tilt_deg)
-        ok1 = self._driver.set_target_us(self._pan_cal.channel,  us_p)
-        ok2 = self._driver.set_target_us(self._tilt_cal.channel, us_t)
+        if self._is_v2:
+            raw_p = self._pan_cal.angle_to_units(pan_deg)
+            raw_t = self._tilt_cal.angle_to_units(tilt_deg)
+            ok1 = self._driver.set_target_units(self._pan_cal.servo_id, raw_p)
+            ok2 = self._driver.set_target_units(self._tilt_cal.servo_id, raw_t)
+        else:
+            us_p, us_t = self._controller.angles_to_us(pan_deg, tilt_deg)
+            ok1 = self._driver.set_target_us(self._pan_cal.channel,  us_p)
+            ok2 = self._driver.set_target_us(self._tilt_cal.channel, us_t)
         if not (ok1 and ok2):
             self._consec_write_fail += 1
             if self._consec_write_fail >= 3:

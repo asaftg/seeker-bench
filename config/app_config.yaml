@@ -98,7 +98,7 @@ classifier:
   # (COCO person/car/truck/bus classes) — still useful, just less accurate on
   # thermal imagery than a fine-tuned model.
   classifier_hv_enabled: true
-  classifier_hv_model: models/seeker_thermal_hv.pt
+  classifier_hv_model: models/seeker_thermal_hv.engine
   classifier_hv_conf: 0.55           # higher = fewer FPs on warm chips/ceiling lights
   classifier_hv_classes: [person, vehicle]
   # Reject tiny h/v detections — a real person/car at bench range is
@@ -404,8 +404,8 @@ radar:
   # only; targets are clustered client-side by radar.radar_manager (TI's
   # Group Tracker is NOT compiled into this build of mmw_demoDDM).
   enabled: true
-  cli_port: COM11               # CLI UART (115200), pushes .cfg here
-  data_port: COM10              # data UART (3_125_000), TLV stream comes in here
+  cli_port: /dev/seeker_radar_cli               # CLI UART (115200), pushes .cfg here
+  data_port: /dev/seeker_radar_data              # data UART (3_125_000), TLV stream comes in here
   cli_baud: 115200
   data_baud: 3125000            # verified by brute-forcing bauds until magic word aligned
   # Phase 3 (validated 2026-04-29): unified cfg pushed once at boot.
@@ -579,7 +579,7 @@ gimbal:
   # 13). COM4 was verified as the Command Port via `scripts/gimbal_probe
   # --sweep`. Leave this pinned; run the probe again if ports shuffle.
   enabled: true
-  port: COM4                    # Command Port (COM5 on this box is TTL)
+  port: /dev/seeker_maestro                    # Command Port (COM5 on this box is TTL)
   rate_hz: 60                   # command/publish loop rate
 
   # Home / rest pose. tilt convention: 0 = horizon, higher = more up.
@@ -819,7 +819,7 @@ gimbal:
     invert: false
 
 gui:
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 8080
   open_browser: true
   ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)

@@ -24,6 +24,17 @@ from common.logging_setup import get_logger
 log = get_logger(__name__)
 
 
+
+import sys as _sys
+# Backend selector — picks V4L2 on Linux, DirectShow on Windows. Falls back
+# to ANY (cv2.CAP_ANY) on macOS / unknown.
+def _pick_capture_backend():
+    if _sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    if _sys.platform.startswith("win"):
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+_PREFERRED_BACKEND = _pick_capture_backend()
 class BosonCapture:
     """Thin wrapper over cv2.VideoCapture with Boson-friendly defaults."""
 
@@ -63,7 +74,7 @@ class BosonCapture:
                 # IMX568 on the EO side). Probing it would disrupt the
                 # active stream — skip silently.
                 continue
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(idx, _PREFERRED_BACKEND)
             if not cap.isOpened():
                 cap.release()
                 last_err = f"index {idx} failed to open"

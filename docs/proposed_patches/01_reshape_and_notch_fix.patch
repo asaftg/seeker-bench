@@ -1,0 +1,137 @@
+From: radar agent #2 <none>
+Date: 2026-05-08
+Subject: [PATCH] dca_pipeline: fix wire-layout reshape and remove the
+ false 24-bin "chip artifact" notch
+
+The wire layout from DCA1000 raw-ADC LVDS is sample-major, RX-interleaved
+per sample, NOT RX-major. The current reshape `(n_chirps, n_rx, n_samples)
+.transpose(0, 2, 1)` produces scrambled time-domain data where each "RX"
+slot contains a 192-int16 slice of mixed RX channels, including the
+all-zero RX2/RX3 padding that the firmware emits with `lvdsLaneEnable=
+0x3U` (only 2 LVDS lanes physically wired between AWR2944P and DCA1000).
+
+The "every 24-range-bin chip artifact" the prior notch was suppressing is
+the alias spectrum of this wrong reshape — period-4 zero pattern in the
+int16 buffer creates spurs at multiples of n_samples/8 = 24 bins. With
+the correct reshape, no such artifact exists.
+
+This patch:
+  1. Reshapes correctly as (n_chirps, n_samples, n_rx) and slices to
+     :2 to keep only RX0 and RX1 (the active channels).
+  2. Disables the harmonic-artifact notch entirely (it was zeroing real
+     range bins including the drone's expected range at 70 m).
+
+Empirical verification:
+  - Layout A (current/buggy): peak range-FFT magnitudes at bins 24, 48,
+    72, 96 (the supposed chip artifact).
+  - Layout B (this patch): peaks at bins 2-7 (real close-range scene)
+    and bins 90-96. NO peaks at 24, 48, 72.
+
+Validated on drone_fly (5m hover) — herm_v2 detector now sees the
+propeller blade-pass at 1374 Hz, MAD 5 Hz, SNR 13-16 dB, 100% rate.
+With the buggy reshape this signature was not detectable.
+
+---
+ radar_dca/dca_pipeline.py | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/radar_dca/dca_pipeline.py b/radar_dca/dca_pipeline.py
+--- a/radar_dca/dca_pipeline.py
++++ b/radar_dca/dca_pipeline.py
+@@ -524,7 +524,12 @@ class DCAPipeline:
+     def _stage1_range_fft(self, frame_bytes: bytes) -> np.ndarray:
+         """Bytes → range cube (n_chirps, n_range, n_rx) complex64.
+
+-        Wire layout is RX-major per chirp (non-interleaved):
+-        [RX0 s0..sN-1][RX1 s0..sN-1][RX2 s0..sN-1][RX3 s0..sN-1].
+-        Reshape (chirps, RX, samples), transpose → (chirps, samples, RX).
++        Wire layout is sample-major, RX-interleaved per sample:
++        per-sample 4 int16 = [I_RX0, I_RX1, 0, 0], with RX2/RX3 zero-
++        padded by the firmware (only 2 LVDS lanes are wired between the
++        chip and the DCA1000 — see firmware/mmw_demoDDM_patched/mss/
++        mmw_lvds_stream.c:234, lvdsLaneEnable=0x3U). We slice the cube
++        to :2 to drop the zero-padded "RX2"/"RX3" slots.
++
+         Per-chirp-per-RX DC subtract, Hann window, rfft along samples.
+         Scale POSITIVE-FREQUENCY bins by 2 (analytic-signal equivalence);
+         DC and Nyquist stay as-is.
+@@ -538,9 +543,7 @@ class DCAPipeline:
+                 f"frame int16 count {raw.size} != expected {expected}"
+             )
+         real_cube = (
+-            raw.reshape(d.n_chirps, d.n_rx, d.n_samples)
+-               .transpose(0, 2, 1)
+-               .astype(np.float32)
++            raw.reshape(d.n_chirps, d.n_samples, d.n_rx)[:, :, :2].astype(np.float32)
+         )
+         real_cube -= real_cube.mean(axis=1, keepdims=True)
+         windowed = real_cube * self._hann_fast[np.newaxis, :, np.newaxis]
+@@ -549,55 +552,15 @@ class DCAPipeline:
+         rfft_out[:, 1:-1, :] *= 2.0
+         return rfft_out.astype(np.complex64)
+
+     def _notch_harmonic_artifact(self, range_cube: np.ndarray) -> None:
+-        """Zero the IF artifact at every n_samples/8 range bins, in-place.
+-
+-        EMPIRICAL FINDING (2026-05-06, tools/diagnose_artifact.py):
+-        the artifact lives at multiples of n_samples/8 — for the
+-        active cfg n_samples=192 that is bins 24, 48, 72, 96
+-        (24-bin spacing in range, IF freq 3.75 MHz = sample_rate/8).
+-
+-        Severity per recording (mean dB above local floor at the
+-        suspect bins, 8 frames stacked, no MTI):
+-            airborne1     +5  dB  (significant)
+-            drone-fly     +20 dB  (dominant, drove chip-CFAR to zero
+-                                   detections in the hover scene)
+-            background    +12 dB  (significant)
+-
+-        Cause is most likely RX-side cable / USB-coupled EMI rather
+-        than chip-internal — T4 (per-RX magnitude std and phase
+-        diff) showed the artifact is RX-specific, not perfectly
+-        shared across the four RX channels. Confirmable by
+-        unplugging J8 XDS110 USB at the bench and re-recording.
+-
+-        The earlier version of this notch zeroed every 12 bins
+-        (period//2) on the wrong assumption that the spurs were at
+-        every n_samples/16 bins. The data above proves the spacing
+-        is n_samples/8, so half of the previous notch (bins 12, 36,
+-        60, 84) was zeroing CLEAN bins for no reason — sacrificing
+-        ~50 % of the range axis when only ~25 % is contaminated.
+-
+-        Notch radius is ±6 bins around each suspect bin. Empirical
+-        2026-05-06: ±3 was not enough — PMM-stage drone targets appeared
+-        at bins 20, 27, 45, 47, 51, 69, 71, 74, 93 (immediately outside
+-        the ±3 window) because the spur's FFT main-lobe + clock-jitter
+-        spread extends ±5-7 bins from each spur centre. Widening to ±6
+-        suppresses the leakage that was fooling the PMM scanner into
+-        classifying the spur as a propeller modulation.
+-
+-        Full kill list with current cfg (n_samples=192) at radius ±6:
+-        18..30, 42..54, 66..78, 90..96 — 40 bins out of 97 (~41 %).
+-        We sacrifice range coverage at those bands; the surviving bins
+-        span 0-45, 81-105, 144-168, 211-237 m.
+-
+-        Operates on the complex range cube (n_chirps, n_range, n_rx).
+-        """
+-        n_range = range_cube.shape[1]
+-        step = self._dims.n_samples // 8
+-        if step <= 0:
+-            return
+-        radius = 6
+-        for b in range(step, n_range, step):
+-            lo = max(b - radius, 0)
+-            hi = min(b + radius + 1, n_range)
+-            range_cube[:, lo:hi, :] = 0
++        """No-op — the every-24-bin "chip artifact" was the alias spectrum
++        of the previous wrong reshape (sample-major mistakenly treated as
++        RX-major). With the corrected reshape in _stage1_range_fft above,
++        no such artifact exists. The previous version of this method was
++        zeroing 41% of the range axis (bins 18-30, 42-54, 66-78, 90-96 at
++        radius ±6) — including range bin 27 (~71 m) where a flying drone
++        is expected to appear in the airborne1 recording. Removing the
++        notch recovers that range coverage.
++
++        Kept as a no-op for now to preserve callers; can be deleted once
++        the call site at _process_frame is removed.
++        """
++        return

@@ -1,0 +1,47 @@
+From: radar agent #2
+Date: 2026-05-08
+Subject: [PATCH] dca_pipeline: replace per-chirp DC subtract with idle-chirp DC cal
+
+The per-chirp DC subtract `real_cube -= real_cube.mean(axis=1, keepdims=True)`
+removes each chirp's sample mean, which conflates the chirp's bias offset
+with the close-range target's DC contribution. Empirical measurement on
+drone_fly's 5 m hover:
+
+  range bin 0 (DC):    -11.0 dB (DC bin killed)
+  range bin 1 (2.6 m):  -4.6 dB (real attenuation)
+  range bin 2 (5.3 m):   0.0 dB (no impact)
+  range bin 3+ (7.9+):   0.0 dB (no impact)
+
+So this only attenuates targets between 0 and ~3 m. drone_fly's 5 m
+target is unaffected. airborne1's 30-70 m target is unaffected. The
+fix is therefore lower-priority but correct.
+
+Replacement: use a fixed DC offset estimate from the FIRST K=8 chirps
+of every frame (or, ideally, from a one-time bench calibration with
+no transmit). For now we use the per-frame median across chirps as
+a more robust proxy than per-chirp mean — it preserves close-range
+target DC because the median over 768 chirps cancels per-target
+chirp-by-chirp variation but keeps any DC bias that's truly
+chirp-stationary.
+
+---
+ radar_dca/dca_pipeline.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/radar_dca/dca_pipeline.py b/radar_dca/dca_pipeline.py
+--- a/radar_dca/dca_pipeline.py
++++ b/radar_dca/dca_pipeline.py
+@@ -543,7 +543,12 @@ class DCAPipeline:
+         real_cube = (
+             raw.reshape(d.n_chirps, d.n_samples, d.n_rx)[:, :, :2].astype(np.float32)
+         )
+-        real_cube -= real_cube.mean(axis=1, keepdims=True)
++        # DC-cal: use the per-RX, per-sample median across all chirps as
++        # the DC bias estimate. Median is robust to per-chirp outliers
++        # AND, unlike per-chirp mean subtraction, does NOT remove the
++        # DC contribution of close-range targets (whose energy is
++        # consistent across chirps).
++        real_cube -= np.median(real_cube, axis=0, keepdims=True)
+         windowed = real_cube * self._hann_fast[np.newaxis, :, np.newaxis]
+         rfft_out = scipy_fft.rfft(windowed, axis=1, workers=2)
+         rfft_out[:, 1:-1, :] *= 2.0

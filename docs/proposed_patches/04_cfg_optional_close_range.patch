@@ -1,0 +1,45 @@
+From: radar agent #2
+Date: 2026-05-08
+Subject: [PATCH] cfg: optional adjustments for close-range / saturation
+
+Two OPTIONAL cfg-level tweaks. NOT on the critical path for airborne1
+(which is at 30-70 m where these don't matter). Only relevant if the
+operator cares about close-range sensitivity or sees frequent ADC
+saturation.
+
+A. profileCfg HPF cutoff. Currently `hpfCornerFreq1=0, hpfCornerFreq2=0`.
+   On AWR2944P this is the enum-index for "350 kHz active corner",
+   NOT "disabled". For our slope (8.883 MHz/μs):
+     2.6 m → IF=154 kHz → ~7 dB attenuation
+     5.3 m → IF=314 kHz → 0.9 dB attenuation
+     ≥8 m  → IF≥468 kHz → 0 dB
+   Lowering to a smaller HPF corner (if the chip supports it) would
+   recover close-range sensitivity. AWR2944P enum values: 0=350 kHz,
+   1=175 kHz, 2=87.5 kHz, 3=43.75 kHz (per TI mmwave_dfp). Set
+   hpfCornerFreq1=1 hpfCornerFreq2=1 to relax to 175 kHz.
+
+B. profileCfg rxGain=164 = 36 dB IF + 36 dB RF = 72 dB total. We saw
+   27 int16 ADC saturations in airborne1's first frame (close clutter
+   at the operator). Reducing to 162 (34 dB IF + 36 dB RF = 70 dB)
+   removes saturation at the cost of −2 dB SNR at far range.
+
+NOT on the critical path. Apply only if operator specifically wants
+to optimize close-range or saturation behavior. For airborne1 30-70 m
+detection, neither of these matters.
+
+---
+ radar/cfg/awr2944P_unified.cfg | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/radar/cfg/awr2944P_unified.cfg b/radar/cfg/awr2944P_unified.cfg
+--- a/radar/cfg/awr2944P_unified.cfg
++++ b/radar/cfg/awr2944P_unified.cfg
+@@ -34,7 +34,7 @@ adcCfg 2 0
+ % adcbufCfg <subFrame=-1 (all)> <adcOutputFmt=1 complex 1x> ...
+ adcbufCfg -1 1 0 0 1
+ lowPower 0 0
+-profileCfg 0 77 12 7 20.81 0 0 8.883 0 192 30000 0 0 164
++profileCfg 0 77 12 7 20.81 0 0 8.883 0 192 30000 1 1 162
+ % chirpCfg start end profile freqVar slopeVar idleVar adcVar txMask
+ % 6 chirp slots, all 4 TX active each slot (DDMA via phase code)
+ chirpCfg 0 5 0 0 0 0 0 15

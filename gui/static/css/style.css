@@ -1336,6 +1336,106 @@ select {
   border-radius: 6px;
 }
 
+/* Replay control bar — fixed bottom strip, only shown during replay.
+   Drives pause/play + seek + speed over the same /ws/sensors WebSocket
+   the replay server already streams envelopes on. */
+#replay-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  background: rgba(8, 12, 20, 0.92);
+  border-top: 1px solid var(--text-3);
+  z-index: 50;
+  backdrop-filter: blur(4px);
+}
+#replay-bar[hidden] { display: none; }
+#replay-bar .rb-btn {
+  width: 32px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--text-3);
+  background: rgba(0, 212, 255, 0.08);
+  color: var(--cyan);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  transition: background 0.15s, border-color 0.15s;
+}
+#replay-bar .rb-btn:hover {
+  background: var(--cyan-dim);
+  border-color: var(--cyan);
+}
+#replay-bar #replay-seek {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(90, 100, 128, 0.4);
+  border-radius: 2px;
+  outline: none;
+}
+#replay-bar #replay-seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: var(--cyan);
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.2);
+}
+#replay-bar #replay-seek::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: var(--cyan);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.2);
+}
+#replay-bar #replay-time {
+  color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  min-width: 86px;
+  text-align: right;
+}
+#replay-bar #replay-speed {
+  /* Override the global `select { width: 100% }` rule (used by the
+     radar-profile picker) — without these, the dropdown stretches to
+     consume the rest of the bar and squashes the seek slider. */
+  width: 56px;
+  flex: 0 0 auto;
+  height: 28px;
+  border: 1px solid var(--text-3);
+  background: rgba(0, 212, 255, 0.08);
+  color: var(--cyan);
+  border-radius: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  outline: none;
+}
+#replay-bar #replay-speed:hover,
+#replay-bar #replay-speed:focus {
+  border-color: var(--cyan);
+}
+#replay-bar #replay-speed option {
+  background: #0c1220;
+  color: var(--text);
+}
+
 
 /* ─────────── STATUS BAR ─────────── */
 .statusbar {

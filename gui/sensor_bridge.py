@@ -13,8 +13,16 @@ from typing import Any, Dict, Optional
 
 import cv2
 
+from common.config import load_config
 from common.frame_bus import BUS
 from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalFrame, Topic
+
+# Load lock-mode flags once at import. Cheap; YAML re-reads on bench
+# restart only. The flags travel on the gimbal payload to the GUI so
+# the JS can decide whether to apply solo-rendering.
+_LM_CFG = (load_config().get("gimbal", {}) or {}).get("lock_mode", {}) or {}
+_LOCK_ENABLED: bool = bool(_LM_CFG.get("enabled", False))
+_LOCK_SOLO_MODE: bool = bool(_LM_CFG.get("solo_mode", True))
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
@@ -127,15 +135,25 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
             "heat_tracks": [],
         }
 
-    # JPEG-encode the AGC display image
+    # JPEG-encode the AGC display image. Fast path: ThermalManager
+    # already encoded the JPEG on its process thread (see
+    # thermal/thermal_manager.py:_process_and_publish, mirrors EO). Reuse
+    # those bytes when the cache's quality matches the requested one;
+    # falls back to inline encode for legacy ThermalFrames (replay,
+    # disconnect-reconnect race) that don't carry bytes.
     jpeg_b64 = None
     w, h = 0, 0
     if tf.agc8 is not None:
         img = tf.agc8
         h, w = img.shape[:2]
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
-        if ok:
-            jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        cached = getattr(tf, "jpeg_bytes", None)
+        cached_q = int(getattr(tf, "jpeg_quality", -1))
+        if cached and cached_q == int(jpeg_quality):
+            jpeg_b64 = base64.b64encode(cached).decode("ascii")
+        else:
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+            if ok:
+                jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
     # Detections
     det_list = []
@@ -368,6 +386,25 @@ def radar_to_wire(
                     "misses": int(t.misses),
                     "class": "drone" if t.source == "pmm" else "radar_detection",
                 })
+            # ALSO forward A/G CFAR detections (range/azimuth points)
+            # so the operator sees the raw radar picture, not just
+            # clustered drone targets. Previously this branch ignored
+            # ``radar_aa_frame.detections`` and the GUI was empty even
+            # when the pipeline was producing 15+ valid CFAR hits per
+            # frame — fixed 2026-05-04.
+            aa_points = []
+            for d in radar_aa_frame.detections[:max_points]:
+                aa_points.append({
+                    "x": round(d.x_m, 3),
+                    "y": round(d.y_m, 3),
+                    "z": round(d.z_m, 3),
+                    "v": round(d.doppler_mps, 2),
+                    "snr": round(float(d.snr_db), 1),
+                    "r": round(d.range_m, 2),
+                    "az": round(d.az_deg, 1),
+                    "el": round(d.el_deg, 1),
+                    "tid": int(d.target_id),
+                })
             return {
                 "connected": True,    # raw-ADC IS connected
                 "frame_id": radar_aa_frame.frame_id,
@@ -375,9 +412,9 @@ def radar_to_wire(
                 "profile": radar_aa_frame.profile or "awr2944p_unified",
                 "max_range_m": radar_aa_frame.max_range_m,
                 "fov_half_deg": radar_aa_frame.fov_half_deg,
-                "num_points": 0,
+                "num_points": len(aa_points),
                 "num_targets": len(aa_targets),
-                "points": [],
+                "points": aa_points,
                 "targets": aa_targets,
                 "detections": [],
             }
@@ -601,7 +638,8 @@ def eo_to_wire_split(
 
 def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
                fused_id_by_eo: Optional[dict] = None,
-               fused_wire: Optional[list] = None) -> Dict[str, Any]:
+               fused_wire: Optional[list] = None,
+               skip_jpeg: bool = False) -> Dict[str, Any]:
     """Serialize an EOFrame for the WebSocket.
 
     Wire format matches ThermalFrame as closely as possible so the GUI
@@ -613,6 +651,12 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
     Each detection is shaped like a thermal detection (bbox + classification)
     so ``overlays.js::drawDetectionBox`` can render EO boxes with zero
     case-specific code.
+
+    ``skip_jpeg=True`` makes the function return ``jpeg_b64=None`` without
+    paying the base64 cost. The shared GUI WS sender uses this because
+    EO bytes ride the binary _eo_sender fast path — the redundant
+    base64 of a 460 KB JPEG every shared-tick is what dragged all three
+    sensor panels to 7-9 Hz.
     """
     if ef is None or not ef.connected:
         return {
@@ -631,21 +675,23 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
 
     jpeg_b64 = None
     w, h = 0, 0
-    # Fast path: EOManager already encoded the JPEG on its process
-    # thread (see eo/eo_manager.py:_process_and_publish). Reuse those
-    # bytes if the requested quality matches — this is the whole point
-    # of the EOFrame.jpeg_bytes cache. Falls back to inline encode for
-    # legacy EOFrames (fake source, replay) that don't carry bytes.
-    cached = getattr(ef, "jpeg_bytes", None)
-    cached_q = int(getattr(ef, "jpeg_quality", -1))
     if ef.bgr is not None:
         h, w = ef.bgr.shape[:2]
-    if cached and cached_q == int(jpeg_quality):
-        jpeg_b64 = base64.b64encode(cached).decode("ascii")
-    elif ef.bgr is not None:
-        ok, buf = cv2.imencode(".jpg", ef.bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
-        if ok:
-            jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    if not skip_jpeg:
+        # Fast path: EOManager already encoded the JPEG on its process
+        # thread (see eo/eo_manager.py:_process_and_publish). Reuse those
+        # bytes if the requested quality matches — this is the whole
+        # point of the EOFrame.jpeg_bytes cache. Falls back to inline
+        # encode for legacy EOFrames (fake source, replay) that don't
+        # carry bytes.
+        cached = getattr(ef, "jpeg_bytes", None)
+        cached_q = int(getattr(ef, "jpeg_quality", -1))
+        if cached and cached_q == int(jpeg_quality):
+            jpeg_b64 = base64.b64encode(cached).decode("ascii")
+        elif ef.bgr is not None:
+            ok, buf = cv2.imencode(".jpg", ef.bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+            if ok:
+                jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
     det_list = []
     eo_map = fused_id_by_eo or {}
@@ -726,13 +772,39 @@ def fused_to_wire(
     e_hfov = ef.hfov_deg if ef is not None else 11.05
     e_vfov = ef.vfov_deg if ef is not None else 9.23
 
+    # Per-panel pose-at-capture, for re-projecting world-frame tracks into
+    # each frame's actual viewing angle. Without this the fused bbox lags
+    # the image during a fast slew: fusion stamps trk.az_deg using
+    # `cur_pan` at fusion-publish time (15 Hz tick), but the EO frame
+    # being drawn was captured at an OLDER pose, and the thermal frame
+    # at yet a third pose. At a 50 °/s slew the per-tick lag works out
+    # to ~3° on EO (HFOV 11°) → ~170 px offset on the 1236-wide canvas,
+    # which the operator perceives as "losing the target." When the
+    # track carries world_az_deg / world_el_deg AND the panel frame
+    # carries gimbal_*_at_capture, we project off (world − pose_at_capture)
+    # so the bbox lands on the image's actual viewing angle.
+    e_pan_cap = getattr(ef, "gimbal_pan_at_capture", None) if ef is not None else None
+    e_tilt_cap = getattr(ef, "gimbal_tilt_at_capture", None) if ef is not None else None
+    t_pan_cap = getattr(tf, "gimbal_pan_at_capture", None) if tf is not None else None
+    t_tilt_cap = getattr(tf, "gimbal_tilt_at_capture", None) if tf is not None else None
+
     out: list[Dict[str, Any]] = []
     for trk in tracks:
         if not isinstance(trk, FusedTrack):
             continue
-        # Thermal projection — subtract bias to land in thermal's raw frame
-        thr_az = trk.az_deg - float(thermal_az_bias_deg)
-        thr_el = trk.el_deg - float(thermal_el_bias_deg)
+        wa = getattr(trk, "world_az_deg", None)
+        we = getattr(trk, "world_el_deg", None)
+        # Thermal projection — pose-sync to the thermal frame's
+        # capture pose if both world angles + thermal pose-at-capture
+        # are available; fall back to the legacy (camera-frame az_deg
+        # at fusion-publish-pose) path when world fusion is off or
+        # the thermal frame predates the pose stamp.
+        if wa is not None and we is not None and t_pan_cap is not None and t_tilt_cap is not None:
+            thr_az = wa - float(t_pan_cap) - float(thermal_az_bias_deg)
+            thr_el = we - float(t_tilt_cap) - float(thermal_el_bias_deg)
+        else:
+            thr_az = trk.az_deg - float(thermal_az_bias_deg)
+            thr_el = trk.el_deg - float(thermal_el_bias_deg)
         bt = None
         if t_w and t_h and angular_bbox_visible(
             thr_az, thr_el, trk.ang_w_deg, trk.ang_h_deg, t_hfov, t_vfov
@@ -743,13 +815,20 @@ def fused_to_wire(
             )
             if w > 0 and h > 0:
                 bt = {"x": x, "y": y, "w": w, "h": h}
-        # EO projection — EO is ground truth, no bias correction
+        # EO projection — EO is ground truth, no bias correction.
+        # Same pose-sync pattern as thermal above.
+        if wa is not None and we is not None and e_pan_cap is not None and e_tilt_cap is not None:
+            eo_az = wa - float(e_pan_cap)
+            eo_el = we - float(e_tilt_cap)
+        else:
+            eo_az = trk.az_deg
+            eo_el = trk.el_deg
         be = None
         if e_w and e_h and angular_bbox_visible(
-            trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg, e_hfov, e_vfov
+            eo_az, eo_el, trk.ang_w_deg, trk.ang_h_deg, e_hfov, e_vfov
         ):
             x, y, w, h = angular_to_bbox(
-                trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg,
+                eo_az, eo_el, trk.ang_w_deg, trk.ang_h_deg,
                 e_w, e_h, e_hfov, e_vfov,
             )
             if w > 0 and h > 0:
@@ -846,6 +925,12 @@ def build_ws_message(
     # Gimbal state — prefer the real GimbalManager state published on
     # the bus. Fall back to a disconnected stub so the GUI never sees
     # missing fields.
+    def _bbox_to_dict(bb):
+        if bb is None:
+            return None
+        return {"x": int(bb.x), "y": int(bb.y),
+                "w": int(bb.w), "h": int(bb.h)}
+
     if isinstance(gstate, GimbalState):
         gimbal_payload = {
             "pan": round(float(gstate.pan_deg), 2),
@@ -856,6 +941,19 @@ def build_ws_message(
             "target_pan":  round(float(gstate.target_pan_deg), 2),
             "target_tilt": round(float(gstate.target_tilt_deg), 2),
             "error": gstate.error,
+            # Lock-mode fields (gimbal.lock_mode in YAML). The GUI
+            # uses lock_state to decide GREEN (active) vs AMBER
+            # (coasting) and lock_bbox_{eo,thermal} as the bbox to
+            # draw. None when lock mode is disabled or no engagement.
+            "lock_state": getattr(gstate, "lock_state", "off"),
+            "lock_bbox_eo": _bbox_to_dict(getattr(gstate, "lock_bbox_eo", None)),
+            "lock_bbox_thermal": _bbox_to_dict(getattr(gstate, "lock_bbox_thermal", None)),
+            "lock_target_id": getattr(gstate, "lock_target_id", None),
+            # Solo render flag (gimbal.lock_mode.solo_mode in YAML).
+            # When true AND tracked_target_id is set, the GUI hides
+            # all non-engaged red detection boxes + non-engaged
+            # fused-track boxes — only the engaged target shows.
+            "lock_solo_mode": _LOCK_SOLO_MODE,
         }
     else:
         gimbal_payload = {
@@ -867,6 +965,11 @@ def build_ws_message(
             "target_pan": 0.0,
             "target_tilt": 0.0,
             "error": None,
+            "lock_state": "off",
+            "lock_bbox_eo": None,
+            "lock_bbox_thermal": None,
+            "lock_target_id": None,
+            "lock_solo_mode": _LOCK_SOLO_MODE,
         }
 
     # EO gets its own JPEG quality knob — a 2K mono sensor with a real
@@ -880,9 +983,16 @@ def build_ws_message(
                                    gstate=gstate,
                                    fused_id_by_thermal=thermal_to_fused,
                                    fused_wire=fused_wire),
+        # skip_jpeg=True: the binary _eo_sender fast path in gui/app.py
+        # delivers EO JPEG bytes at sensor-arrival cadence; the shared
+        # WS message only needs metadata (size, fov, detections) for
+        # fused-track bbox_eo projection. Re-base64-ing the same 460 KB
+        # JPEG on every shared-tick costs ~10 ms and was the dominant
+        # bottleneck dragging all panels to ~7-9 Hz.
         "eo": eo_to_wire(ef, jpeg_quality=eo_q,
                           fused_id_by_eo=eo_to_fused,
-                          fused_wire=fused_wire),
+                          fused_wire=fused_wire,
+                          skip_jpeg=True),
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
             radar_az_bias_deg=radar_az_bias_deg,

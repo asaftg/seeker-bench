@@ -1,0 +1,509 @@
+Bin: seeker_2026-05-05_21-14-35_radar.bin
+Size: 606,683,168 bytes  |  Frames: 514
+PRF=30478.5 Hz  range_res=2.638 m
+Config: slow_time_win=512  band=20-3000Hz  thr=10dB
+FFT bin_hz at slow_time_win=512: 14.88 Hz/bin  (HANN_GUARD floor = 119.1 Hz)
+
+========== FRAME 5 ==========
+  pre-filter: median_pwr=4.36e+09, 12/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.69e+10    10.76   YES
+      2     5.3    2.09e+10     4.79   YES
+      3     7.9    4.62e+09     1.06    no
+      4    10.6    4.42e+09     1.01    no
+      5    13.2    4.39e+09     1.01    no
+      6    15.8    4.28e+09     0.98    no
+  PROD scan(grid_already512, win=None, thr=10dB): 9 hits  rb1=15.6dB@2545Hz, rb23=22.9dB@2545Hz, rb24=26.4dB@2530Hz, rb25=22.4dB@2530Hz, rb48=22.0dB@2545Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 9 hits  rb1=15.6dB@2545Hz, rb23=22.9dB@2545Hz, rb24=26.4dB@2530Hz, rb25=22.4dB@2530Hz, rb48=22.0dB@2545Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     38.4     15.6    2544.8   31.1   15.6    15.6 PASSED
+      2     31.5      3.0    2485.3   19.7    3.0    16.7 SYMM_THRESHOLD (score 3.0 dB < 10.0 req)
+      3     13.6      2.1    2619.2    2.7    2.1     0.6 SYMM_THRESHOLD (score 2.1 dB < 10.0 req)
+      4     11.4      1.4    2321.6    1.4    1.4     0.0 GLOBAL_FLOOR (body 11.4 dB < 12 req)
+      5     11.7      1.5     803.6    1.5    1.8     0.2 GLOBAL_FLOOR (body 11.7 dB < 12 req)
+      6      6.6      2.1    2604.4    2.1    2.3     0.2 GLOBAL_FLOOR (body 6.6 dB < 12 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     38.4     15.6    2544.8   31.1   15.6    15.6 PASSED
+      2     31.5      3.0    2485.3   19.7    3.0    16.7 SYMM_THRESHOLD (score 3.0 dB < 5.0 req)
+      3     13.6      2.1    2619.2    2.7    2.1     0.6 SYMM_THRESHOLD (score 2.1 dB < 5.0 req)
+      4     11.4      1.4    2321.6    1.4    1.4     0.0 GLOBAL_FLOOR (body 11.4 dB < 12 req)
+      5     11.7      1.5     803.6    1.5    1.8     0.2 GLOBAL_FLOOR (body 11.7 dB < 12 req)
+      6      6.6      2.1    2604.4    2.1    2.3     0.2 GLOBAL_FLOOR (body 6.6 dB < 12 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     38.4     15.6    2544.8   31.1   15.6    15.6 PASSED
+      2     31.5      3.0    2485.3   19.7    3.0    16.7 PASSED
+      3     13.6      2.1    2619.2    2.7    2.1     0.6 PASSED
+      4     11.4      1.4    2321.6    1.4    1.4     0.0 GLOBAL_FLOOR (body 11.4 dB < 12 req)
+      5     11.7      1.5     803.6    1.5    1.8     0.2 GLOBAL_FLOOR (body 11.7 dB < 12 req)
+      6      6.6      2.1    2604.4    2.1    2.3     0.2 GLOBAL_FLOOR (body 6.6 dB < 12 req)
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 31.1dB  +2530.0Hz/ 30.9dB  +2559.7Hz/ 30.6dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 25.5dB  +2530.0Hz/ 25.2dB  +2559.7Hz/ 25.1dB
+    rb=3: body_bin=172 (dop +2559.7Hz)  +2500.2Hz/ 11.6dB  +2515.1Hz/ 11.3dB  +2485.3Hz/ 11.2dB
+
+========== FRAME 30 ==========
+  pre-filter: median_pwr=1.12e+08, 22/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.51e+10   403.37   YES
+      2     5.3    1.77e+10   158.54   YES
+      3     7.9    6.26e+08     5.61   YES
+      4    10.6    3.47e+08     3.11    no
+      5    13.2    3.37e+08     3.02    no
+      6    15.8    1.41e+08     1.27    no
+  PROD scan(grid_already512, win=None, thr=10dB): 16 hits  rb0=39.6dB@2545Hz, rb1=24.8dB@2545Hz, rb2=13.6dB@149Hz, rb23=37.0dB@2545Hz, rb24=42.1dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 16 hits  rb0=39.6dB@2545Hz, rb1=24.8dB@2545Hz, rb2=13.6dB@149Hz, rb23=37.0dB@2545Hz, rb24=42.1dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.5     24.8    2544.8   41.9   24.8    17.1 PASSED
+      2     44.8     13.6     148.8   13.6   15.7     2.1 PASSED
+      3     27.8      6.1    2544.8   25.5    6.1    19.4 SYMM_THRESHOLD (score 6.1 dB < 10.0 req)
+      4     27.3      7.0     699.5    7.0    7.3     0.3 SYMM_THRESHOLD (score 7.0 dB < 10.0 req)
+      5     28.6      6.8    2663.9    7.5    6.8     0.7 SYMM_THRESHOLD (score 6.8 dB < 10.0 req)
+      6     21.2      5.3    2485.3   11.6    5.3     6.4 SYMM_THRESHOLD (score 5.3 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.5     24.8    2544.8   41.9   24.8    17.1 PASSED
+      2     44.8     13.6     148.8   13.6   15.7     2.1 PASSED
+      3     27.8      6.1    2544.8   25.5    6.1    19.4 PASSED
+      4     27.3      7.0     699.5    7.0    7.3     0.3 PASSED
+      5     28.6      6.8    2663.9    7.5    6.8     0.7 PASSED
+      6     21.2      5.3    2485.3   11.6    5.3     6.4 PASSED
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.5     24.8    2544.8   41.9   24.8    17.1 PASSED
+      2     44.8     13.6     148.8   13.6   15.7     2.1 PASSED
+      3     27.8      6.1    2544.8   25.5    6.1    19.4 PASSED
+      4     27.3      7.0     699.5    7.0    7.3     0.3 PASSED
+      5     28.6      6.8    2663.9    7.5    6.8     0.7 PASSED
+      6     21.2      5.3    2485.3   11.6    5.3     6.4 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 41.9dB  +2530.0Hz/ 41.8dB  +2559.7Hz/ 41.4dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 38.9dB  +2530.0Hz/ 38.8dB  +2559.7Hz/ 38.4dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 25.5dB  +2530.0Hz/ 25.4dB  +2559.7Hz/ 25.0dB
+
+========== FRAME 60 ==========
+  pre-filter: median_pwr=1.10e+08, 23/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.71e+10   428.25   YES
+      2     5.3    1.91e+10   173.53   YES
+      3     7.9    7.41e+08     6.74   YES
+      4    10.6    3.25e+08     2.96    no
+      5    13.2    2.83e+08     2.58    no
+      6    15.8    1.30e+08     1.18    no
+  PROD scan(grid_already512, win=None, thr=10dB): 16 hits  rb0=40.8dB@2545Hz, rb1=26.3dB@2545Hz, rb2=13.6dB@149Hz, rb23=36.0dB@2545Hz, rb24=41.9dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 16 hits  rb0=40.8dB@2545Hz, rb1=26.3dB@2545Hz, rb2=13.6dB@149Hz, rb23=36.0dB@2545Hz, rb24=41.9dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     50.5     26.3    2544.8   43.2   26.3    16.9 PASSED
+      2     45.8     13.6     148.8   13.6   13.8     0.2 PASSED
+      3     31.1      7.0    2083.5    7.1    7.0     0.1 SYMM_THRESHOLD (score 7.0 dB < 10.0 req)
+      4     28.7      4.9    1324.5    4.9    4.9     0.0 SYMM_THRESHOLD (score 4.9 dB < 10.0 req)
+      5     28.1      4.6    1443.6    5.7    4.6     1.0 SYMM_THRESHOLD (score 4.6 dB < 10.0 req)
+      6     19.7      2.9    1101.3    3.0    2.9     0.1 SYMM_THRESHOLD (score 2.9 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     50.5     26.3    2544.8   43.2   26.3    16.9 PASSED
+      2     45.8     13.6     148.8   13.6   13.8     0.2 PASSED
+      3     31.1      7.0    2083.5    7.1    7.0     0.1 PASSED
+      4     28.7      4.9    1324.5    4.9    4.9     0.0 SYMM_THRESHOLD (score 4.9 dB < 5.0 req)
+      5     28.1      4.6    1443.6    5.7    4.6     1.0 SYMM_THRESHOLD (score 4.6 dB < 5.0 req)
+      6     19.7      2.9    1101.3    3.0    2.9     0.1 SYMM_THRESHOLD (score 2.9 dB < 5.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     50.5     26.3    2544.8   43.2   26.3    16.9 PASSED
+      2     45.8     13.6     148.8   13.6   13.8     0.2 PASSED
+      3     31.1      7.0    2083.5    7.1    7.0     0.1 PASSED
+      4     28.7      4.9    1324.5    4.9    4.9     0.0 PASSED
+      5     28.1      4.6    1443.6    5.7    4.6     1.0 PASSED
+      6     19.7      2.9    1101.3    3.0    2.9     0.1 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 43.2dB  +2530.0Hz/ 43.0dB  +2559.7Hz/ 42.6dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 39.4dB  +2530.0Hz/ 39.3dB  +2559.7Hz/ 38.8dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  +2530.0Hz/ 25.6dB  +2544.8Hz/ 25.5dB  +2515.1Hz/ 24.9dB
+
+========== FRAME 100 ==========
+  pre-filter: median_pwr=1.13e+08, 22/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.68e+10   413.62   YES
+      2     5.3    1.83e+10   161.67   YES
+      3     7.9    4.56e+08     4.04   YES
+      4    10.6    3.87e+08     3.43    no
+      5    13.2    3.94e+08     3.48    no
+      6    15.8    1.38e+08     1.22    no
+  PROD scan(grid_already512, win=None, thr=10dB): 17 hits  rb0=40.1dB@2545Hz, rb1=25.0dB@2545Hz, rb2=12.3dB@149Hz, rb23=36.2dB@2545Hz, rb24=41.3dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 17 hits  rb0=40.1dB@2545Hz, rb1=25.0dB@2545Hz, rb2=12.3dB@149Hz, rb23=36.2dB@2545Hz, rb24=41.3dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.7     25.0    2544.8   42.3   25.0    17.3 PASSED
+      2     44.9     12.3     148.8   13.5   12.3     1.2 PASSED
+      3     25.9      6.8    2544.8   22.9    6.8    16.0 SYMM_THRESHOLD (score 6.8 dB < 10.0 req)
+      4     28.6      3.9    2500.2   19.1    3.9    15.2 SYMM_THRESHOLD (score 3.9 dB < 10.0 req)
+      5     28.8      5.6    2455.5   10.8    5.6     5.2 SYMM_THRESHOLD (score 5.6 dB < 10.0 req)
+      6     19.4      5.3    2619.2    6.3    5.3     1.1 SYMM_THRESHOLD (score 5.3 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.7     25.0    2544.8   42.3   25.0    17.3 PASSED
+      2     44.9     12.3     148.8   13.5   12.3     1.2 PASSED
+      3     25.9      6.8    2544.8   22.9    6.8    16.0 PASSED
+      4     28.6      3.9    2500.2   19.1    3.9    15.2 SYMM_THRESHOLD (score 3.9 dB < 5.0 req)
+      5     28.8      5.6    2455.5   10.8    5.6     5.2 PASSED
+      6     19.4      5.3    2619.2    6.3    5.3     1.1 PASSED
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.7     25.0    2544.8   42.3   25.0    17.3 PASSED
+      2     44.9     12.3     148.8   13.5   12.3     1.2 PASSED
+      3     25.9      6.8    2544.8   22.9    6.8    16.0 PASSED
+      4     28.6      3.9    2500.2   19.1    3.9    15.2 PASSED
+      5     28.8      5.6    2455.5   10.8    5.6     5.2 PASSED
+      6     19.4      5.3    2619.2    6.3    5.3     1.1 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 42.3dB  +2530.0Hz/ 42.2dB  +2559.7Hz/ 41.7dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 38.9dB  +2530.0Hz/ 38.8dB  +2559.7Hz/ 38.3dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 22.9dB  +2530.0Hz/ 22.7dB  +2559.7Hz/ 22.3dB
+
+========== FRAME 150 ==========
+  pre-filter: median_pwr=1.14e+08, 21/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.76e+10   415.80   YES
+      2     5.3    1.84e+10   160.86   YES
+      3     7.9    4.18e+08     3.66    no
+      4    10.6    3.32e+08     2.90    no
+      5    13.2    3.73e+08     3.26    no
+      6    15.8    1.54e+08     1.34    no
+  PROD scan(grid_already512, win=None, thr=10dB): 16 hits  rb0=39.9dB@2545Hz, rb1=25.1dB@2545Hz, rb2=13.5dB@149Hz, rb23=36.5dB@2545Hz, rb24=40.9dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 16 hits  rb0=39.9dB@2545Hz, rb1=25.1dB@2545Hz, rb2=13.5dB@149Hz, rb23=36.5dB@2545Hz, rb24=40.9dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.9     25.1    2544.8   42.2   25.1    17.1 PASSED
+      2     44.6     13.5     148.8   13.5   14.3     0.8 PASSED
+      3     25.8     15.2    2530.0   15.2   24.2     9.1 PASSED
+      4     29.6      4.9    1771.0    4.9    5.4     0.5 SYMM_THRESHOLD (score 4.9 dB < 10.0 req)
+      5     29.5      4.3    2113.3    6.4    4.3     2.1 SYMM_THRESHOLD (score 4.3 dB < 10.0 req)
+      6     21.7      3.1    2202.5    3.2    3.1     0.1 SYMM_THRESHOLD (score 3.1 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.9     25.1    2544.8   42.2   25.1    17.1 PASSED
+      2     44.6     13.5     148.8   13.5   14.3     0.8 PASSED
+      3     25.8     15.2    2530.0   15.2   24.2     9.1 PASSED
+      4     29.6      4.9    1771.0    4.9    5.4     0.5 SYMM_THRESHOLD (score 4.9 dB < 5.0 req)
+      5     29.5      4.3    2113.3    6.4    4.3     2.1 SYMM_THRESHOLD (score 4.3 dB < 5.0 req)
+      6     21.7      3.1    2202.5    3.2    3.1     0.1 SYMM_THRESHOLD (score 3.1 dB < 5.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.9     25.1    2544.8   42.2   25.1    17.1 PASSED
+      2     44.6     13.5     148.8   13.5   14.3     0.8 PASSED
+      3     25.8     15.2    2530.0   15.2   24.2     9.1 PASSED
+      4     29.6      4.9    1771.0    4.9    5.4     0.5 PASSED
+      5     29.5      4.3    2113.3    6.4    4.3     2.1 PASSED
+      6     21.7      3.1    2202.5    3.2    3.1     0.1 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 42.2dB  +2530.0Hz/ 42.1dB  +2559.7Hz/ 41.6dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 38.7dB  +2530.0Hz/ 38.6dB  +2559.7Hz/ 38.2dB
+    rb=3: body_bin=1195 (dop +17784.1Hz)  -2544.8Hz/ 24.5dB  -2530.0Hz/ 24.2dB  -2559.7Hz/ 24.0dB
+
+========== FRAME 200 ==========
+  pre-filter: median_pwr=1.23e+08, 22/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.60e+10   374.66   YES
+      2     5.3    1.84e+10   150.23   YES
+      3     7.9    7.56e+08     6.16   YES
+      4    10.6    4.72e+08     3.85    no
+      5    13.2    3.97e+08     3.23    no
+      6    15.8    1.55e+08     1.26    no
+  PROD scan(grid_already512, win=None, thr=10dB): 16 hits  rb0=40.6dB@2545Hz, rb1=24.6dB@2545Hz, rb2=11.2dB@149Hz, rb23=35.9dB@2545Hz, rb24=40.6dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 16 hits  rb0=40.6dB@2545Hz, rb1=24.6dB@2545Hz, rb2=11.2dB@149Hz, rb23=35.9dB@2545Hz, rb24=40.6dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.1     24.6    2544.8   41.5   24.6    17.0 PASSED
+      2     44.6     11.2     148.8   12.9   11.2     1.7 PASSED
+      3     29.9      3.3    2544.8   25.3    3.3    22.0 SYMM_THRESHOLD (score 3.3 dB < 10.0 req)
+      4     29.5      3.1     297.6    3.8    3.1     0.7 SYMM_THRESHOLD (score 3.1 dB < 10.0 req)
+      5     28.6      5.4    2470.4   12.2    5.4     6.8 SYMM_THRESHOLD (score 5.4 dB < 10.0 req)
+      6     20.5      4.9    2455.5    5.4    4.9     0.4 SYMM_THRESHOLD (score 4.9 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.1     24.6    2544.8   41.5   24.6    17.0 PASSED
+      2     44.6     11.2     148.8   12.9   11.2     1.7 PASSED
+      3     29.9      3.3    2544.8   25.3    3.3    22.0 SYMM_THRESHOLD (score 3.3 dB < 5.0 req)
+      4     29.5      3.1     297.6    3.8    3.1     0.7 SYMM_THRESHOLD (score 3.1 dB < 5.0 req)
+      5     28.6      5.4    2470.4   12.2    5.4     6.8 PASSED
+      6     20.5      4.9    2455.5    5.4    4.9     0.4 SYMM_THRESHOLD (score 4.9 dB < 5.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.1     24.6    2544.8   41.5   24.6    17.0 PASSED
+      2     44.6     11.2     148.8   12.9   11.2     1.7 PASSED
+      3     29.9      3.3    2544.8   25.3    3.3    22.0 PASSED
+      4     29.5      3.1     297.6    3.8    3.1     0.7 PASSED
+      5     28.6      5.4    2470.4   12.2    5.4     6.8 PASSED
+      6     20.5      4.9    2455.5    5.4    4.9     0.4 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 41.5dB  +2530.0Hz/ 41.4dB  +2559.7Hz/ 41.0dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 38.0dB  +2530.0Hz/ 37.9dB  +2559.7Hz/ 37.4dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 25.3dB  +2530.0Hz/ 25.2dB  +2559.7Hz/ 24.7dB
+
+========== FRAME 250 ==========
+  pre-filter: median_pwr=1.21e+08, 21/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.63e+10   382.79   YES
+      2     5.3    1.76e+10   145.36   YES
+      3     7.9    4.55e+08     3.76    no
+      4    10.6    3.97e+08     3.28    no
+      5    13.2    3.50e+08     2.89    no
+      6    15.8    1.42e+08     1.18    no
+  PROD scan(grid_already512, win=None, thr=10dB): 15 hits  rb0=39.0dB@2545Hz, rb1=25.2dB@2530Hz, rb2=13.2dB@134Hz, rb23=35.8dB@2530Hz, rb24=40.6dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 15 hits  rb0=39.0dB@2545Hz, rb1=25.2dB@2530Hz, rb2=13.2dB@134Hz, rb23=35.8dB@2530Hz, rb24=40.6dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.5     25.2    2530.0   41.6   25.2    16.4 PASSED
+      2     44.9     13.2     133.9   14.1   13.2     0.9 PASSED
+      3     26.0      6.0    2470.4   11.0    6.0     5.0 SYMM_THRESHOLD (score 6.0 dB < 10.0 req)
+      4     28.4      5.7    2455.5    7.9    5.7     2.2 SYMM_THRESHOLD (score 5.7 dB < 10.0 req)
+      5     28.9      5.2    2589.5   15.3    5.2    10.1 SYMM_THRESHOLD (score 5.2 dB < 10.0 req)
+      6     18.8      9.5    2574.6   12.4    9.5     2.9 SYMM_THRESHOLD (score 9.5 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.5     25.2    2530.0   41.6   25.2    16.4 PASSED
+      2     44.9     13.2     133.9   14.1   13.2     0.9 PASSED
+      3     26.0      6.0    2470.4   11.0    6.0     5.0 PASSED
+      4     28.4      5.7    2455.5    7.9    5.7     2.2 PASSED
+      5     28.9      5.2    2589.5   15.3    5.2    10.1 PASSED
+      6     18.8      9.5    2574.6   12.4    9.5     2.9 PASSED
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.5     25.2    2530.0   41.6   25.2    16.4 PASSED
+      2     44.9     13.2     133.9   14.1   13.2     0.9 PASSED
+      3     26.0      6.0    2470.4   11.0    6.0     5.0 PASSED
+      4     28.4      5.7    2455.5    7.9    5.7     2.2 PASSED
+      5     28.9      5.2    2589.5   15.3    5.2    10.1 PASSED
+      6     18.8      9.5    2574.6   12.4    9.5     2.9 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 41.7dB  +2530.0Hz/ 41.6dB  +2559.7Hz/ 41.1dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 38.5dB  +2530.0Hz/ 38.4dB  +2559.7Hz/ 37.9dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 21.4dB  +2530.0Hz/ 21.1dB  +2559.7Hz/ 20.9dB
+
+========== FRAME 300 ==========
+  pre-filter: median_pwr=1.17e+08, 22/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.63e+10   394.36   YES
+      2     5.3    1.83e+10   155.86   YES
+      3     7.9    5.94e+08     5.06   YES
+      4    10.6    3.65e+08     3.11    no
+      5    13.2    3.40e+08     2.90    no
+      6    15.8    1.44e+08     1.22    no
+  PROD scan(grid_already512, win=None, thr=10dB): 16 hits  rb0=39.3dB@2545Hz, rb1=25.0dB@2545Hz, rb2=11.1dB@149Hz, rb3=23.7dB@2530Hz, rb23=35.8dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 16 hits  rb0=39.3dB@2545Hz, rb1=25.0dB@2545Hz, rb2=11.1dB@149Hz, rb3=23.7dB@2530Hz, rb23=35.8dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.7     25.0    2544.8   42.1   25.0    17.1 PASSED
+      2     44.8     11.1     148.8   11.7   11.1     0.6 PASSED
+      3     26.9     23.7    2530.0   23.7   25.5     1.9 PASSED
+      4     26.7      5.3    2589.5   11.2    5.3     6.0 SYMM_THRESHOLD (score 5.3 dB < 10.0 req)
+      5     27.9      4.0    2619.2    7.4    4.0     3.4 SYMM_THRESHOLD (score 4.0 dB < 10.0 req)
+      6     20.6      3.6    1354.3    3.8    3.6     0.2 SYMM_THRESHOLD (score 3.6 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.7     25.0    2544.8   42.1   25.0    17.1 PASSED
+      2     44.8     11.1     148.8   11.7   11.1     0.6 PASSED
+      3     26.9     23.7    2530.0   23.7   25.5     1.9 PASSED
+      4     26.7      5.3    2589.5   11.2    5.3     6.0 PASSED
+      5     27.9      4.0    2619.2    7.4    4.0     3.4 SYMM_THRESHOLD (score 4.0 dB < 5.0 req)
+      6     20.6      3.6    1354.3    3.8    3.6     0.2 SYMM_THRESHOLD (score 3.6 dB < 5.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.7     25.0    2544.8   42.1   25.0    17.1 PASSED
+      2     44.8     11.1     148.8   11.7   11.1     0.6 PASSED
+      3     26.9     23.7    2530.0   23.7   25.5     1.9 PASSED
+      4     26.7      5.3    2589.5   11.2    5.3     6.0 PASSED
+      5     27.9      4.0    2619.2    7.4    4.0     3.4 PASSED
+      6     20.6      3.6    1354.3    3.8    3.6     0.2 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 42.1dB  +2530.0Hz/ 42.0dB  +2559.7Hz/ 41.5dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 38.9dB  +2530.0Hz/ 38.7dB  +2559.7Hz/ 38.3dB
+    rb=3: body_bin=1195 (dop +17784.1Hz)  -2544.8Hz/ 25.9dB  -2559.7Hz/ 25.6dB  -2530.0Hz/ 25.5dB
+
+========== FRAME 350 ==========
+  pre-filter: median_pwr=1.22e+08, 22/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.71e+10   386.30   YES
+      2     5.3    1.87e+10   153.38   YES
+      3     7.9    6.25e+08     5.13   YES
+      4    10.6    3.86e+08     3.16    no
+      5    13.2    3.67e+08     3.01    no
+      6    15.8    1.46e+08     1.20    no
+  PROD scan(grid_already512, win=None, thr=10dB): 16 hits  rb0=40.8dB@2545Hz, rb1=25.5dB@2545Hz, rb2=12.0dB@149Hz, rb23=35.7dB@2545Hz, rb24=41.1dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 16 hits  rb0=40.8dB@2545Hz, rb1=25.5dB@2545Hz, rb2=12.0dB@149Hz, rb23=35.7dB@2545Hz, rb24=41.1dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.8     25.5    2544.8   42.6   25.5    17.1 PASSED
+      2     45.8     12.0     148.8   12.0   14.7     2.7 PASSED
+      3     29.7      4.8    1815.6    5.9    4.8     1.1 SYMM_THRESHOLD (score 4.8 dB < 10.0 req)
+      4     28.2      8.0    2574.6   20.6    8.0    12.6 SYMM_THRESHOLD (score 8.0 dB < 10.0 req)
+      5     28.3      8.1    2619.2   10.5    8.1     2.4 SYMM_THRESHOLD (score 8.1 dB < 10.0 req)
+      6     20.7      6.2    1815.6    7.1    6.2     0.9 SYMM_THRESHOLD (score 6.2 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.8     25.5    2544.8   42.6   25.5    17.1 PASSED
+      2     45.8     12.0     148.8   12.0   14.7     2.7 PASSED
+      3     29.7      4.8    1815.6    5.9    4.8     1.1 SYMM_THRESHOLD (score 4.8 dB < 5.0 req)
+      4     28.2      8.0    2574.6   20.6    8.0    12.6 PASSED
+      5     28.3      8.1    2619.2   10.5    8.1     2.4 PASSED
+      6     20.7      6.2    1815.6    7.1    6.2     0.9 PASSED
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.8     25.5    2544.8   42.6   25.5    17.1 PASSED
+      2     45.8     12.0     148.8   12.0   14.7     2.7 PASSED
+      3     29.7      4.8    1815.6    5.9    4.8     1.1 PASSED
+      4     28.2      8.0    2574.6   20.6    8.0    12.6 PASSED
+      5     28.3      8.1    2619.2   10.5    8.1     2.4 PASSED
+      6     20.7      6.2    1815.6    7.1    6.2     0.9 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 42.6dB  +2530.0Hz/ 42.4dB  +2559.7Hz/ 42.0dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 39.4dB  +2530.0Hz/ 39.3dB  +2559.7Hz/ 38.8dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  +2530.0Hz/ 20.0dB  +2544.8Hz/ 19.9dB  +2515.1Hz/ 19.2dB
+
+========== FRAME 400 ==========
+  pre-filter: median_pwr=3.20e+09, 13/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.78e+10    14.96   YES
+      2     5.3    2.05e+10     6.41   YES
+      3     7.9    3.53e+09     1.10    no
+      4    10.6    3.51e+09     1.10    no
+      5    13.2    3.41e+09     1.07    no
+      6    15.8    3.15e+09     0.99    no
+  PROD scan(grid_already512, win=None, thr=10dB): 10 hits  rb1=12.0dB@2530Hz, rb23=17.3dB@2545Hz, rb24=21.0dB@2530Hz, rb25=19.3dB@2530Hz, rb48=18.3dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 10 hits  rb1=12.0dB@2530Hz, rb23=17.3dB@2545Hz, rb24=21.0dB@2530Hz, rb25=19.3dB@2530Hz, rb48=18.3dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     33.1     12.0    2530.0   25.8   12.0    13.8 PASSED
+      2     27.0      1.0    2544.8   19.8    1.0    18.8 SYMM_THRESHOLD (score 1.0 dB < 10.0 req)
+      3     11.4      1.2    2351.4    1.4    1.2     0.1 GLOBAL_FLOOR (body 11.4 dB < 12 req)
+      4     12.0      1.9     253.0    1.9    2.3     0.4 SYMM_THRESHOLD (score 1.9 dB < 10.0 req)
+      5     11.1      1.2     267.9    2.0    1.2     0.8 GLOBAL_FLOOR (body 11.1 dB < 12 req)
+      6      4.7      2.1    2530.0    2.4    2.1     0.3 GLOBAL_FLOOR (body 4.7 dB < 12 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     33.1     12.0    2530.0   25.8   12.0    13.8 PASSED
+      2     27.0      1.0    2544.8   19.8    1.0    18.8 SYMM_THRESHOLD (score 1.0 dB < 5.0 req)
+      3     11.4      1.2    2351.4    1.4    1.2     0.1 GLOBAL_FLOOR (body 11.4 dB < 12 req)
+      4     12.0      1.9     253.0    1.9    2.3     0.4 SYMM_THRESHOLD (score 1.9 dB < 5.0 req)
+      5     11.1      1.2     267.9    2.0    1.2     0.8 GLOBAL_FLOOR (body 11.1 dB < 12 req)
+      6      4.7      2.1    2530.0    2.4    2.1     0.3 GLOBAL_FLOOR (body 4.7 dB < 12 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     33.1     12.0    2530.0   25.8   12.0    13.8 PASSED
+      2     27.0      1.0    2544.8   19.8    1.0    18.8 PASSED
+      3     11.4      1.2    2351.4    1.4    1.2     0.1 GLOBAL_FLOOR (body 11.4 dB < 12 req)
+      4     12.0      1.9     253.0    1.9    2.3     0.4 PASSED
+      5     11.1      1.2     267.9    2.0    1.2     0.8 GLOBAL_FLOOR (body 11.1 dB < 12 req)
+      6      4.7      2.1    2530.0    2.4    2.1     0.3 GLOBAL_FLOOR (body 4.7 dB < 12 req)
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 25.8dB  +2530.0Hz/ 25.8dB  +2559.7Hz/ 25.1dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 19.8dB  +2530.0Hz/ 19.8dB  +2515.1Hz/ 19.1dB
+    rb=3: body_bin=1024 (dop +15239.3Hz)  -1012.0Hz/  1.6dB  -1681.7Hz/  1.6dB  -2708.5Hz/  1.6dB
+
+========== FRAME 450 ==========
+  pre-filter: median_pwr=1.08e+08, 22/97 bins pass >4x-median gate
+  bin power for inspect-bins (1..6) and pre-filter status:
+     rb range_m         pwr  pwr/med   pre
+      1     2.6    4.76e+10   442.32   YES
+      2     5.3    1.85e+10   171.81   YES
+      3     7.9    4.90e+08     4.55   YES
+      4    10.6    3.65e+08     3.39    no
+      5    13.2    3.33e+08     3.09    no
+      6    15.8    1.38e+08     1.28    no
+  PROD scan(grid_already512, win=None, thr=10dB): 15 hits  rb0=39.8dB@2545Hz, rb1=25.8dB@2545Hz, rb2=12.7dB@134Hz, rb23=34.9dB@2545Hz, rb24=41.7dB@2530Hz
+  PROD scan(full_grid_768, win=512, thr=10dB): 15 hits  rb0=39.8dB@2545Hz, rb1=25.8dB@2545Hz, rb2=12.7dB@134Hz, rb23=34.9dB@2545Hz, rb24=41.7dB@2530Hz
+
+  -- per-bin replay @ band [20-3000] Hz, thr=10 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.4     25.8    2544.8   42.7   25.8    16.9 PASSED
+      2     44.9     12.7     133.9   12.7   14.6     2.0 PASSED
+      3     25.2      6.2    2902.0    6.2    6.4     0.3 SYMM_THRESHOLD (score 6.2 dB < 10.0 req)
+      4     27.0      6.6    2604.4   12.0    6.6     5.4 SYMM_THRESHOLD (score 6.6 dB < 10.0 req)
+      5     28.5      7.6    2500.2   15.3    7.6     7.8 SYMM_THRESHOLD (score 7.6 dB < 10.0 req)
+      6     21.9      5.7    2485.3   10.9    5.7     5.2 SYMM_THRESHOLD (score 5.7 dB < 10.0 req)
+
+  -- per-bin replay @ band [20-3000] Hz, thr=5 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.4     25.8    2544.8   42.7   25.8    16.9 PASSED
+      2     44.9     12.7     133.9   12.7   14.6     2.0 PASSED
+      3     25.2      6.2    2902.0    6.2    6.4     0.3 PASSED
+      4     27.0      6.6    2604.4   12.0    6.6     5.4 PASSED
+      5     28.5      7.6    2500.2   15.3    7.6     7.8 PASSED
+      6     21.9      5.7    2485.3   10.9    5.7     5.2 PASSED
+
+  -- per-bin replay @ band [20-3000] Hz, thr=0 dB --
+     rb  body_db  best_dB  blade_Hz    +dB    -dB  symRes gate
+      1     49.4     25.8    2544.8   42.7   25.8    16.9 PASSED
+      2     44.9     12.7     133.9   12.7   14.6     2.0 PASSED
+      3     25.2      6.2    2902.0    6.2    6.4     0.3 PASSED
+      4     27.0      6.6    2604.4   12.0    6.6     5.4 PASSED
+      5     28.5      7.6    2500.2   15.3    7.6     7.8 PASSED
+      6     21.9      5.7    2485.3   10.9    5.7     5.2 PASSED
+
+  -- top-3 inband peaks (any symmetry) at bins 1..3 --
+    rb=1: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 42.7dB  +2530.0Hz/ 42.6dB  +2559.7Hz/ 42.1dB
+    rb=2: body_bin=1024 (dop +15239.3Hz)  +2544.8Hz/ 39.0dB  +2530.0Hz/ 38.9dB  +2559.7Hz/ 38.4dB
+    rb=3: body_bin=512 (dop +7619.6Hz)  -2827.6Hz/ 10.5dB  -2812.7Hz/ 10.4dB  -2842.5Hz/ 10.2dB
+
+========== COMPARISON: frame 5 (early) vs frame 250 (mid) ==========
+   rb range_m | early body_dB early best_dB early blade_Hz | mid body_dB mid best_dB mid blade_Hz
+    1     2.6 |          38.4          15.6         2544.8 |        49.5        25.2       2530.0
+    2     5.3 |          31.5           3.0         2485.3 |        44.9        13.2        133.9
+    3     7.9 |          13.6           2.1         2619.2 |        26.0         6.0       2470.4
+    4    10.6 |          11.4           1.4         2321.6 |        28.4         5.7       2455.5
+    5    13.2 |          11.7           1.5          803.6 |        28.9         5.2       2589.5
+    6    15.8 |           6.6           2.1         2604.4 |        18.8         9.5       2574.6

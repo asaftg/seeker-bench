@@ -1,0 +1,1175 @@
+# ───────────────────────────────────────────────────────────
+# Seeker-01 Bench Test — Application Config
+# ───────────────────────────────────────────────────────────
+# Every tunable lives here. Code modules should never hardcode
+# thresholds or paths; they read from this file via common.config.
+# Changing a value here and restarting the app should be enough.
+
+thermal:
+  # Software extrinsic calibration vs. EO (ground truth). Applied to
+  # thermal detections' angular pose inside FusionManager before cross-
+  # sensor association so the fused/projected thermal bbox lines up on
+  # the EO panel. Live-tunable from the DEV-tab EXTRINSIC CALIBRATION
+  # sliders. Zero = thermal boresight perfectly co-aligned with EO.
+  extrinsic:
+    az_bias_deg: 0.0
+    el_bias_deg: 0.0
+
+  # Camera
+  device_index: auto            # auto | 0 | 1 | 2 | 3
+  resolution: [640, 512]        # FLIR Boson 640
+  mode: RAW16                   # RAW16 (Y16) | AGC8 (YUY2)
+  target_fps: 60
+
+  # FOV (FLIR ADK 40640U075 is 75°H × ~60°V)
+  hfov_deg: 75.0
+  vfov_deg: 60.0
+
+  # AGC
+  #
+  # Reverted to chat-start state 2026-04-28 after side-by-side at 37°
+  # outdoor showed the CLAHE-Y16 win was marginal vs the camera's
+  # onboard AGC8 and came at the cost of slight processing artifacts.
+  # The advanced primitives (roi, gates, clahe_y16, dead-pixel median,
+  # gamma, bilateral, unsharp) remain in thermal/thermal_processor.py
+  # and are YAML-reachable via `mode:` + sub-blocks; defaults below
+  # produce legacy behaviour bit-for-bit.
+  agc:
+    low_percentile: 2
+    high_percentile: 98
+    colormap: WHITE_HOT          # operator's actual chat-start view was grayscale, not INFERNO
+
+  # Digital zoom presets (emulated narrow FOV)
+  digital_zoom:
+    enabled: true
+    preset: wide                # full | wide | mid | narrow | tight — wide=37.5° matches operator baseline (2026-04-27)
+    presets:
+      full:   { hfov_deg: 75.0 }
+      wide:   { hfov_deg: 37.5 }
+      mid:    { hfov_deg: 18.75 }
+      narrow: { hfov_deg: 12.5 }
+
+  # MOSSE per-track correlation tracker for thermal HV (ByteTrack)
+  # IDs. Same architecture as eo.correlation_tracker, mirrored on
+  # thermal frames. See vision/COMPUTE_BUDGET.md for sizing.
+  #
+  # Defaults differ from EO:
+  #   psr_lost: 5.0 (vs 7.0 EO) — thermal targets often have lower
+  #     internal texture (hot blobs without sharp edges); the
+  #     correlation response peaks aren't as sharp, so the Bolme
+  #     paper's 7.0 threshold prunes valid tracks. 5.0 is a
+  #     conservative starting value; tighten to 7 if false-track
+  #     drift becomes a problem.
+  correlation_tracker:
+    enabled: true
+    psr_lost: 5.0               # looser than EO; thermal has weaker peaks
+    # 2026-05-04: 5 → 15 after the night recording showed engaged
+    # tracks dropping during fast slews. Mechanism: motion blur kills
+    # YOLO confidence so HV ByteTrack stops emitting fresh detections
+    # for ~0.5-1 s. With lost_frames=5 (~83 ms at 60 Hz capture) the
+    # MOSSE pool prunes the per-target tracker before YOLO recovers,
+    # and the fused track loses its last observation source from
+    # thermal. lost_frames=15 (~250 ms) lets MOSSE keep the bbox
+    # alive across a typical slew, so when YOLO recovers on the
+    # other side the same ByteTrack ID gets reseeded — the lock
+    # survives. 15 is conservative; bump to 30 if a particular scene
+    # still drops bboxes mid-slew.
+    lost_frames: 15
+    learning_rate: 0.125
+    sigma: 2.0
+    # Cap the FFT working size per axis. Pure-numpy FFT cost scales
+    # ~O(W*H*log(W*H)). A close-range vehicle bbox in EO/thermal can
+    # be 300x200 pixels; without this cap each tracker eats 30+ ms
+    # per update and the publisher loop falls below 10 Hz when a
+    # close target locks. The bbox returned to fusion is still in
+    # frame coords. 96 keeps both sensors at frame rate; raise to
+    # 128 if patch-coarseness causes identity drift.
+    max_patch_dim: 96
+
+heat_detector:
+  # residual = frame - spatial_mean(frame)
+  # threshold = median(residual) + k * 1.4826 * MAD(residual)
+  # Defaults tuned for an INDOOR 8-bit AGC'd scene — raise threshold_k
+  # or lower min_blob_area_px once you're pointing at sky backgrounds.
+  threshold_k: 20.0             # lower = more sensitive (x MAD). Default = minimum sensitivity; tune up via the DEV tab.
+  background_kernel: 31         # spatial background kernel (odd)
+  min_blob_area_px: 500         # very conservative; slider in DEV tab drops it to ~3 for max sensitivity
+  max_blob_area_px: 30000       # allow large targets (hot cup at narrow zoom)
+  max_detections_per_frame: 6
+  algorithm: tophat
+  tophat_kernel: 31             # max target diameter in pixels (odd; bigger = catches larger objects)
+
+  # Temporal tracker — suppresses flicker, smooths bboxes.
+  # A blob must survive `min_hits` frames before a box is drawn;
+  # a confirmed blob survives up to `max_misses` frames of missing
+  # detections before being dropped.
+  tracker:
+    # This is the *heat-blob* tracker (classical CV), not the H/V one —
+    # the H/V classifier runs its own ByteTrack now. Heat blobs still
+    # use hand-rolled greedy IoU because they're small, noisy, and
+    # appear/disappear rapidly (not a good fit for Kalman priors).
+    enabled: true
+    max_dist_px: 40             # max centroid distance (px) to match across frames
+    min_hits: 5                 # consecutive frames before a box is shown
+    max_misses: 5               # grace frames after a track stops matching
+    ema: 0.5                    # bbox smoothing: 0 = raw, 1 = frozen
+
+classifier:
+  enabled: true
+  model_path: models/yolov8n.pt
+  trained_model_path: models/seeker_thermal.pt   # preferred if exists
+  conf_threshold: 0.40          # higher = fewer false DRONE labels; lower = catches faint drones
+  # YOLO inference cadence. Thermal capture is 60 Hz. Running YOLO on
+  # every frame consumed ~half the per-tick budget AND contended for
+  # GPU with the EO YOLO, dragging thermal publish rate to ~14 Hz.
+  # MOSSE (vision/correlation_tracker_set.py) keeps bboxes alive at
+  # frame rate between YOLO ticks, so we can throttle YOLO to every
+  # 3rd captured frame (= 20 Hz YOLO) without losing per-frame target
+  # persistence. This matches vision/COMPUTE_BUDGET.md's recommended
+  # design point: "throttling YOLO 30 Hz → 10 Hz is the biggest lever
+  # in this whole picture."
+  classify_interval_frames: 3   # auto | int. 3 → 20 Hz YOLO at 60 Hz capture.
+  roi_padding_px: 16
+  # Model class-index → TargetClass mapping.
+  # For the fine-tuned seeker_thermal.pt trained on thermal drone
+  # data: class 0 = drone. Stock COCO weights are not loaded.
+  class_to_target:
+    0: drone
+
+  # ── Phase B — Human + Vehicle classifier (Ticket 1) ─────────────────────
+  # Set classifier_hv_enabled: true after running:
+  #   python scripts/train_yolo_hv.py --auto
+  # to produce models/seeker_thermal_hv.pt.
+  # Until that model exists the h/v classifier falls back to stock yolov8n.pt
+  # (COCO person/car/truck/bus classes) — still useful, just less accurate on
+  # thermal imagery than a fine-tuned model.
+  classifier_hv_enabled: true
+  classifier_hv_model: models/seeker_thermal_hv.pt
+  # 2026-05-03: lowered 0.55 → 0.45 to catch flickering marginal-distance
+  # targets. Operator complaint: bboxes flicker when target is at the
+  # edge of detectability (conf hovering around threshold). Lower floor
+  # accepts more low-conf detections; ByteTrack persistence and fusion
+  # cross-sensor matching filter out the noise downstream. Bump back to
+  # 0.55 if false positives on warm chips / ceiling lights become an issue.
+  classifier_hv_conf: 0.45
+  classifier_hv_classes: [person, vehicle]
+  # Reject tiny h/v detections — a real person/car at bench range is
+  # much bigger than a hand-sized warm patch. Tune up if too conservative.
+  classifier_hv_min_bbox_px: 2500    # ~50x50 minimum area
+  # Temporal persistence: a h/v box must survive this many classifier
+  # runs at IoU >= 0.3 before it's drawn. Kills single-frame flicker FPs.
+  # ByteTrack owns persistence now, so these knobs are mostly defanged;
+  # the merge code still reads min_hits but ByteTrack-confirmed tracks
+  # arrive pre-confirmed so min_hits=1 is effectively the operative value.
+  classifier_hv_min_hits: 2
+  classifier_hv_max_misses: 8        # unused with ByteTrack; kept for config compat
+  classifier_hv_bbox_ema: 0.15       # bbox smoothing: 0 = raw YOLO, 0.5 = heavy lag. Low = snappy.
+  # Inference image size. auto = 960 on GPU (boosts detection range for
+  # distant/small targets), 640 on CPU. Int override allowed.
+  classifier_hv_imgsz: auto
+
+eo:
+  # Electro-optical pipeline — Leopard LI-USB30-IMX568-GMSL2 (mono, global
+  # shutter, 2472×2064 @ 2.74µm → 6.77×5.65mm sensor) + Commonlands
+  # CIL350-F2.4-M12ANIR (35mm EFL, F/2.4, NIR). Yields ~11.05° HFOV,
+  # ~9.23° VFOV — narrow telephoto, ~7x finer per-pixel IFOV than thermal.
+  enabled: true
+  # Capture backend:
+  #   imx568 — real hardware via DirectShow at 2472×2064 (mono, AGC'd in sw)
+  #   webcam — generic UVC webcam fallback for dev on laptops without the kit
+  sensor: imx568                # imx568 | webcam
+  device_index: auto            # auto | 0 | 1 | 2 ...
+  skip_builtin_webcam: false    # webcam-mode only: skip index 0 if it's a built-in
+  target_fps: 25                # IMX568 over USB3 sustains ~19 fps at full res
+  # SDK stream cadence (only used in sensor=imx568 mode). The SDK helper
+  # actively throttles delivered frames to this rate. 10 was the historical
+  # default (chosen for power); 20 doubles motion smoothness on moving
+  # vehicles with no measured downside. Cap at 25 — beyond that we start
+  # competing with the FX3 USB3 bus saturation under RAW12. Bumped from
+  # 20 → 25 once the WS-side encode/serialize bottleneck was lifted (EO
+  # JPEG now encoded on the process thread + dedicated _eo_sender task).
+  stream_fps: 25.0
+  # Resolution is ignored when sensor=imx568 (native 2472×2064 is forced).
+  resolution: [1920, 1080]      # webcam mode: will negotiate closest supported
+
+  # Downscale the 2472×2064 native capture to this width BEFORE AGC, YOLO,
+  # and JPEG encoding. Height is auto-scaled to preserve aspect.
+  #
+  # Trade-off: bigger = sharper EO panel + more YOLO recall on small
+  # targets, but QUADRATIC cost in AGC / encode / WS bandwidth.
+  # Don't bump this above 1236 without checking fps — going to 1854 was
+  # tried 2026-04-24 and dropped the EO publish rate from 14 → 6 Hz on
+  # this laptop, which felt much worse than the marginal sharpness win.
+  # The browser canvas is ~640 px wide on the MAIN tab anyway, so almost
+  # all the extra source pixels get thrown away by the client. The real
+  # leverage for sharpness is JPEG quality (gui.eo_jpeg_quality), not
+  # source resolution. Set to 0 to disable downscaling entirely.
+  display_max_width: 1236
+
+  # Exposure profiles — auto-selected from scene brightness, hysteretic.
+  # SAVgood 850nm VCSEL illuminator is manually controlled by the operator
+  # (always-on, switched at the device). Night profile assumes illuminator
+  # fill, so gain+exposure are pushed harder than an unilluminated scene
+  # could tolerate without motion smear.
+  profiles:
+    # Bright outdoor / lit room — short exposure, low gain.
+    # 0.5ms is aggressive: on a 30fps / 33ms frame budget this is still
+    # sky-safe and keeps high-contrast scenes (roof edge against bright
+    # sky) from clipping. If the bridge rejects sub-ms exposures we'll
+    # see in the log and bump this back up.
+    day:
+      exposure_ms: 0.5
+      gain: 1.0
+      # Enter DAY when scene mean (0..255) crosses above this from DUSK
+      enter_above: 150.0
+      enter_below: 255.0
+    # Indoor normal / overcast twilight
+    dusk:
+      exposure_ms: 20.0
+      gain: 4.0
+      enter_above: 50.0
+      enter_below: 160.0
+    # Dark scene, VCSEL fills NIR
+    night:
+      exposure_ms: 80.0
+      gain: 16.0
+      enter_above: 0.0
+      enter_below: 60.0
+  profile_min_dwell_s: 3.0      # min seconds before another profile switch
+
+  # Actually drive the sensor's exposure + gain from the profile selector.
+  #
+  # FALSE (default): the FX3 bridge runs its own auto-exposure. The
+  #   camera adapts to whatever the scene is — bright outdoor, indoor
+  #   bench, dim corner — without us locking it to one of three guesses.
+  #   This is the setting that produced a watchable image historically.
+  #
+  # TRUE: we flip the camera to MANUAL mode and command the current
+  #   profile's exposure_ms / gain. Sounds nice in theory but in
+  #   practice it: (a) the FX3 firmware silently ignores exposure
+  #   writes on this bridge, AND (b) the manual-mode flip itself sticks
+  #   even though the value doesn't, so the camera locks at some default
+  #   manual-exposure value with no AE — the displayed image goes dark
+  #   indoors and "looks like shit" outdoors. Flip on ONLY after a
+  #   bridge firmware update where exposure writes verifiably take.
+  #
+  # Either way the AGC + enhancement chain handles display dynamic range,
+  # so the visible image is never raw bridge output.
+  profile_control_exposure: false
+
+  # Bridge auto-exposure lock. Set this to a UVC log2(seconds) value to
+  # write CAP_PROP_AUTO_EXPOSURE=manual + CAP_PROP_EXPOSURE on the FX3
+  # bridge via cv2-DSHOW before PyAV opens the device. Killing bridge AE
+  # was the single biggest "static scene stops breathing frame to frame"
+  # win on this rig (2026-04-24). The bridge wanders between exposure
+  # values on every frame even when nothing in the scene moves.
+  #
+  # Conversion: -6 ≈ 1/64 s ≈ 16 ms, -7 ≈ 8 ms, -5 ≈ 32 ms, -4 ≈ 64 ms.
+  # Tune to match the brightness/mood of Leopard CameraTool's reference.
+  # Set to null to disable (bridge AE runs free).
+  manual_exposure_log2: null    # legacy UVC path — bridge ignores it on FX3
+  # Optional gain lock (CAP_PROP_GAIN). Bridge-specific scale; null=skip.
+  manual_gain: null
+  # PRIMARY exposure lock on the IMX568/FX3 rig. Sends LPCamera.ExposureExt
+  # via the 32-bit Leopard SDK helper before PyAV opens the device. The
+  # FX3 firmware ignores all standard UVC writes (proven in
+  # scripts/eo_probe_uvc_props.py) but DOES honor ExposureExt — it's the
+  # vendor extension Leopard's CameraTool uses. With manual_exposure_ext
+  # set, the static-scene "breathing" the user observed disappears
+  # (mean span 1.7 over 30s vs full-saturation drift before).
+  # Set to null to skip the SDK prelude entirely.
+  #
+  # NEW DEFAULT (2026-04-24): null → bridge runs its own auto-exposure
+  # via the SDK stream. With `eo.sensor: imx568` and `manual_exposure_ext:
+  # null`, IMX568Capture spawns the SDK helper with `--ae on` and lets
+  # the FX3/IMX568 firmware adapt exposure to the scene the same way
+  # CameraTool does on its default settings. This is what you want for
+  # "I'm pointing the bench at an arbitrary scene tomorrow and don't
+  # want to wake up to a blown-out white frame."
+  #
+  # Set this to a specific int (e.g. 1264 or 2000) to LOCK exposure for
+  # repeatable engineering tests / reference-comparison runs:
+  #   1264  reproduces leopard_reference.bmp at sub-decimal precision
+  #         (R/G/B mean = 16/17/15 raw — dim but stable)
+  #   2000  the calibrated value that produced the verified frame-to-
+  #         frame match against leopard_reference.bmp
+  # The GUI dev tab also exposes a toggle to flip this at runtime.
+  manual_exposure_ext: null
+
+  # Software auto-exposure (Auto mode driver).
+  #
+  # The FX3 bridge's own AE is broken on this rig in bright daylight
+  # (verified 2026-04-25 with scripts/sdk_daylight_diagnostic.py): it
+  # leaves the IMX568 fully analog-clipped through the 35mm NIR-pass
+  # lens and never recovers. Even Leopard's CameraTool produces a pure
+  # white frame in those conditions. So when the user is in "Auto" mode
+  # (manual_exposure_ext: null), this software AE thread polls raw u16
+  # stats from the SDK stream and drives ExposureExt itself, using a
+  # bracket-based binary search controller.
+  #
+  # Validated: converged 1264 -> 9 in 8 iterations on a saturated cloudy
+  # daylight scene (scripts/sdk_ae_loop.py).
+  #
+  # Manual mode (manual_exposure_ext: <int>) takes priority — software
+  # AE no-ops while the user is overriding.
+  auto_exposure:
+    enabled: true
+    target_p99_lo: 300.0    # raw u16; well above noise floor
+    target_p99_hi: 3500.0   # raw u16; comfortably below 4095 ceiling
+    initial_exposure_ext: 1264   # historical reference seed
+    step_period_s: 1.5      # how often the AE thread evaluates
+    reengage_frac_clip: 0.05  # only re-engage on catastrophic clip
+    max_blank_iters: 6      # consecutive blank stats before warning
+
+  # Percentile AGC on luma channel (mono sensor, BGR output has identical
+  # channels from DirectShow's YUY2 decode). Stretches low_percentile..
+  # high_percentile across 0..255 before publishing so YOLO + display see
+  # a consistent image regardless of current exposure.
+  #
+  # Tight bands like [2, 98] hard-clip ~4% of pixels to pure black/white,
+  # which on a sunlit outdoor scene gives a posterized "HDR-torture" look
+  # — what should be a smooth B&W image gets crushed shadows and blown
+  # highlights. [0.5, 99.5] only clips genuine outliers (hot pixels,
+  # sun-disk, sensor noise spikes) so the panel looks like a normal
+  # mono photo instead of a contrast-pumped render.
+  # AGC + enhancement: OFF by default.
+  #
+  # We tried "do clever processing on the 8-bit-from-12-bit FX3 output"
+  # — percentile AGC + gamma + CLAHE + unsharp — and on a low-light
+  # 7 pm indoor frame it turned grain into "oil-painting" ridge
+  # artifacts. The bridge already runs its own auto-exposure
+  # (profile_control_exposure: false); the simplest, most honest
+  # answer is to TRUST that AE and pass the frame through. This is
+  # also what every consumer webcam app does — no AGC, no gamma,
+  # no CLAHE, just whatever the sensor gave us.
+  #
+  # The processing chain remains code-available and YAML-toggleable
+  # for daylight scenes that benefit from it. To enable:
+  #   * set agc.enabled: true              ← turn the chain on at all
+  #   * set enhance.gamma: 0.85            ← mild midtone lift
+  #   * set enhance.clahe.enabled: true    ← local contrast (DAYLIGHT ONLY!)
+  #   * set enhance.unsharp.enabled: true  ← extra sharpness on clean frames
+  #
+  # In low light, EVERY stage past percentile clip will amplify noise.
+  # Don't touch them on a noisy scene; fix exposure first.
+  agc:
+    # OFF — passthrough, like Leopard CameraTool does. Per-frame
+    # percentile AGC was enabled briefly and produced the exact symptoms
+    # the user reported: "granular, noisy, breathing." All three were
+    # the AGC's fault:
+    #   * granular/noisy: stretching a raw-mean-~16 frame to 0..255 is
+    #     a 6× multiplication of sensor noise.
+    #   * breathing: the [0.5, 99.5] thresholds drift fractionally with
+    #     noise frame-to-frame; after the 6× stretch that drift becomes
+    #     visible brightness wobble.
+    # CameraTool just displays the raw 8-bit frame as-is. Doing the
+    # same here gets Leopard-quality output. If we ever want the frame
+    # brighter than Leopard without breathing, use a *fixed* gain
+    # (constant multiplier, NOT percentile-based) — see eo_processor.
+    enabled: false
+    low_percentile:  0.5
+    high_percentile: 99.5
+
+  enhance:
+    # Median 3×3 — fast salt-and-pepper denoise. Cheap (~1 ms), edge-
+    # preserving. Off by default since we're in passthrough; enable
+    # together with agc.enabled to clean the input before stretching.
+    denoise:
+      enabled: false
+      ksize: 3
+    # Midtone lift. 1.0 = no change. 0.85 = mild lift (good for daylight).
+    # Set to 1.0 (or omit) to disable.
+    gamma: 1.0
+    # Local contrast. Off by default — amplifies noise on low-light input.
+    # Re-enable only on clean daylight frames; clip_limit 1.0–1.5 is safe.
+    clahe:
+      enabled: false
+      clip_limit: 1.5
+      tile_grid: 8
+    # Edge sharpening. Off by default — same reason as CLAHE.
+    unsharp:
+      enabled: false
+      amount: 0.4
+      radius: 1.0
+
+  # Optics. IMX568 + Commonlands CIL350 35mm is 11.05° H × 9.23° V.
+  # If you're running a test webcam instead of the real sensor, set
+  # `test_webcam` below and these get overridden at startup. Don't edit
+  # these two lines directly — they describe the real mission hardware.
+  hfov_deg: 11.05
+  vfov_deg: 9.23
+
+  # Test mode: when running with a generic webcam in place of the real
+  # IMX568 + 35mm lens, we need to tell fusion the *actual* FOV the
+  # webcam sees — otherwise cross-sensor angular matching is broken.
+  # Pick the profile matching your webcam (or add one). `none` uses the
+  # real-hardware optics above.
+  test_webcam: none                # none | insta360_link | logitech_c920 | generic_60
+                                   # (real IMX568 hardware — leave as 'none')
+  test_webcam_profiles:
+    none:            { hfov_deg: null, vfov_deg: null }
+    insta360_link:   { hfov_deg: 67.0, vfov_deg: 41.0 }   # CINSABNB, 79.5° DFOV @ 16:9
+    logitech_c920:   { hfov_deg: 70.4, vfov_deg: 43.3 }   # 78° DFOV @ 16:9
+    generic_60:      { hfov_deg: 60.0, vfov_deg: 36.9 }   # typical laptop cam
+
+  # MOSSE per-track correlation tracker (vision/mosse_tracker.py).
+  # Runs at frame rate alongside YOLO/ByteTrack to keep bboxes alive
+  # between classifier ticks (which may be throttled below frame rate)
+  # AND when YOLO confidence drops during gimbal slews due to motion
+  # blur. ByteTrack handles ID continuity via Kalman; MOSSE handles
+  # APPEARANCE-based bbox tracking.
+  #
+  # Set enabled=false to ship without MOSSE (legacy ByteTrack-only
+  # path). When enabled, the pool reseeds each ByteTrack ID on every
+  # fresh classifier output (so YOLO ground truth corrects MOSSE drift)
+  # and updates bboxes in between.
+  #
+  # Compute budget on Jetson AGX Xavier (8 Carmel cores @ 2.26 GHz):
+  #   per-track per-frame: ~1-3 ms for a 100x100 ROI MOSSE update
+  #   typical scene (3-5 ByteTrack IDs at 30 Hz): ~100-300 ms/s = 1 core
+  #   throttling YOLO 30 Hz → 10 Hz (classify_interval_frames: 3) frees
+  #   ~70% of GPU; combined net is LOWER total compute, not higher.
+  correlation_tracker:
+    # Activated 2026-05-03 at operator request. If false losses
+    # appear (bboxes pruned even when target is visible), lower
+    # psr_lost from 7.0 toward 5.0. If MOSSE drifts onto background
+    # between YOLO reseeds, raise psr_lost.
+    enabled: true
+    psr_lost: 7.0               # Bolme paper threshold; <7 = lost
+    # 2026-05-04: 5 → 12 (≈480 ms at 25 Hz EO) so MOSSE coasts EO
+    # ByteTrack IDs across fast-slew motion-blur dips, mirroring the
+    # bigger thermal bump. EO thinner than thermal (12 vs 15 frames)
+    # because the EO ByteTrack Kalman has its own coast — they
+    # combine multiplicatively for slew survival.
+    lost_frames: 12             # consecutive lost ticks → prune ID
+    learning_rate: 0.125        # online filter blending; 0.05–0.20
+    sigma: 2.0                  # Gaussian peak width; 2.0 default
+    # Cap the FFT working size per axis. Pure-numpy FFT cost is
+    # O(W*H*log(W*H)); a close-range vehicle filling a 300×200
+    # bbox in EO without this cap drove the publish loop down to
+    # 2-5 Hz when a fused track locked. We resize the patch into
+    # this cap before the FFT and scale the peak position back to
+    # frame coords. 96 keeps EO at frame rate; raise to 128 if
+    # patch-coarseness causes identity drift on small fast targets.
+    max_patch_dim: 96
+
+  classifier:
+    enabled: true
+    # EO currently forces COCO fallback (person/car/truck/bus/motorcycle)
+    # until a dedicated EO model exists. TODO: train EO drone detector.
+    model: models/yolov8n.pt
+    # 2026-05-03: lowered 0.45 → 0.35 alongside the thermal HV classifier
+    # bump to catch marginal-distance targets that flicker at the conf
+    # threshold. Same trade-off — ByteTrack + fusion filter the noise
+    # downstream.
+    # 2026-05-04: 0.35 → 0.25 after the night recording showed two
+    # engaged tracks lost during legitimate fast slews. Mechanism: night
+    # EO scenes have low SNR, YOLO confidence sits close to threshold,
+    # motion blur on slew briefly pushes it below, ByteTrack drops the
+    # ID, fusion runs out of observations on that sensor → engaged
+    # track grace expires before the slew completes. 0.25 keeps the
+    # detection stream alive through brief blur dips. Raise back to
+    # 0.35 for daylight if false-positives become noisy.
+    # 2026-05-08: conf_threshold raised 0.25 → 0.40. The previous 0.25
+    # was hunting marginal-distance/blur targets at the cost of FPs on
+    # streetlights, signs, and tree shapes (operator-verified streetlight
+    # FP at conf 0.31 in working_trial). The fix path is now tiled
+    # inference at native res (gives confident dets at long range)
+    # rather than dropping the threshold globally. classes_conf below
+    # supports per-class overrides (drone can stay lower).
+    conf_threshold: 0.40
+    classes: [person, vehicle]
+    classes_conf:
+      person:  0.40
+      vehicle: 0.40
+      drone:   0.20
+    include_drone: false        # TODO: enable after EO drone fine-tune
+    # imgsz: 832 matches the resolution seeker_eo_v3.pt was trained at
+    # (see thermal/training/train_eo_v3_close_targets.py docstring).
+    # Was 1280 — that ran ~2.4x slower than 832 AND mismatched the
+    # training distribution by 1.54x, causing a measured publish-rate
+    # bottleneck at ~12 Hz (operator-reported lag 2026-04-25). At 832
+    # we expect ~18-20 Hz publish, with no recall regression because
+    # 832 IS the model's native input size.
+    # Drop to 640 on weak GPUs; bump back to 1280 only if a future
+    # model is retrained at that resolution.
+    imgsz: 832
+    # 2026-05-08: classify every 3rd frame (was auto = 2 on GPU). At
+    # 25 fps capture this puts YOLO at ~8 Hz; MOSSE coasts in between
+    # at full frame rate, so the published bbox stream is still smooth.
+    # Lower YOLO Hz buys headroom for tiled inference (~4× the per-tick
+    # FLOPS). On a Jetson Xavier AGX (sm_72) yolov8n batch=4 imgsz=832
+    # TRT-FP16 ≈ 20 ms — at every-3rd that's 60 ms/sec compute, leaves
+    # the GPU available for thermal+radar+fusion.
+    classify_interval_frames: 3
+    min_bbox_px: 1500
+    # Tiled inference: split native 2472×2064 into a grid of overlapping
+    # tiles, run yolov8n on each at imgsz=832, merge with global NMS.
+    # Recovers small-target recall lost to the 1236 display-downscale.
+    # 2x2 with 25% overlap is the default — see vision/sahi_inference.py.
+    tiling:
+      enabled: false              # opt-in; flip to true after smoke
+      grid: [2, 2]                # 2x2 tiles
+      overlap_frac: 0.25
+      merge_iou: 0.5
+      run_on_native_frame: true   # tile the pre-downscale 2472×2064 frame
+    # ByteTrack (ultralytics model.track) owns persistence on the EO
+    # side now. These knobs are unused but kept for config compat; tune
+    # ByteTrack itself via its yaml if needed (see Future Work in README).
+    min_hits: 2
+    max_misses: 8
+    bbox_ema: 0.2
+
+radar:
+  # AWR2944P EVM, firmware: mmw_demoDDM (Doppler-Division MIMO, SDK 4.7.2.1).
+  # See docs/radar_setup.md for setup + flashing details.
+  #
+  # *Two* USB cables to the EVM:
+  #   J10 (FTDI_USB, left)   → COM6-9  — auxiliary FTDI UARTs, unused by us
+  #   J8  (XDS_USB,  right)  → COM10/11 — XDS110 virtual UARTs, WHICH WE USE
+  # MSS_UARTA (CLI/SBL) is routed only to the XDS110, not the FTDI. The
+  # flashing-mode SBL ROM and the functional-mode mmw_demoDDM CLI both live
+  # on COM11; the data UART (TLV stream) is on COM10 at 3_125_000 baud.
+  #
+  # Stock DDM firmware on AWR2944P emits detected-points + side-info TLVs
+  # only; targets are clustered client-side by radar.radar_manager (TI's
+  # Group Tracker is NOT compiled into this build of mmw_demoDDM).
+  enabled: true
+  cli_port: COM11               # CLI UART (115200), pushes .cfg here
+  data_port: COM10              # data UART (3_125_000), TLV stream comes in here
+  cli_baud: 115200
+  data_baud: 3125000            # verified by brute-forcing bauds until magic word aligned
+  # stream_timeout_s = 0 disables the V1.0 "no TLV for 3s → reconnect"
+  # path. The unified cfg's `lvdsStreamCfg -1 0 1 0` line enables raw-ADC
+  # LVDS but appears to suppress UART TLV output on this firmware build,
+  # so the legacy 3 s timeout fires every cycle and the reconnect's
+  # `sensorStop` kills LVDS. With 0, the manager pushes the cfg once,
+  # opens the data port, and just stays open — chip keeps streaming
+  # LVDS continuously to the DCA1000. A/A path is the source of truth
+  # in stock/AG/AA modes here.
+  stream_timeout_s: 0.0
+  # Phase 3 (validated 2026-04-29): unified cfg pushed once at boot.
+  # Identical to TI's highRange profile + ``lvdsStreamCfg -1 0 1 0`` so
+  # the chip emits BOTH TLV (existing path, drives Stock + A/G) AND raw
+  # ADC over LVDS to the DCA1000 (drives A/A PMM). Mode dispatch is
+  # purely host-side; no chip cfg change between modes.
+  cfg_path: "radar/cfg/awr2944P_unified.cfg"
+  # Phase 3 — DCA1000 networking (only used when A/A pipeline runs).
+  dca:
+    enabled: true
+    host_ip: "192.168.33.30"
+    dca_ip: "192.168.33.180"
+    config_port: 4096
+    data_udp_port: 4098
+  profile_name: awr2944p_ddm
+  snr_min_db: 6.0               # lower = more returns. Sparse-vehicle clouds were being gated out at 12 dB.
+  # Project objective is long-range detection. The highRange .cfg's
+  # profileCfg (slope 8.883 MHz/µs, ADC 30 MHz) supports ~250 m max
+  # unambiguous range — we pin max_range_m to the full capability.
+  # If you ever need further: author a new .cfg with a shallower slope.
+  max_range_m: 250.0
+  # Narrow the useful azimuth window — the AWR2944P antenna has lobes
+  # well off-boresight but most of that energy is sidelobe clutter at
+  # long range. Gating to ±az_half_deg concentrates the displayed point
+  # cloud into the main lobe, where SNR per target is highest and the
+  # remaining points are the ones worth clustering.
+  az_half_deg: 60.0
+  # Speed filter — drop points whose radial velocity (|doppler|) is
+  # below this threshold. 0.0 = off (show static returns too). Set
+  # above ~0.3 m/s to suppress walls / trees / parked cars and leave
+  # only movers, which is usually what you want for drone / vehicle
+  # watch. Applied BEFORE DBSCAN so static points don't pad clusters.
+  speed_min_mps: 0.4
+  # Near-range blanking — drop points (and hence any clusters) closer
+  # than this. Useful when the sensor mount, tripod, vehicle hood, or
+  # your own body are generating fat reflections right on top of the
+  # radar. 0.0 = off.
+  range_min_m: 0.0
+  # Software extrinsic calibration vs. EO (ground truth). Tunable live
+  # from the DEV-tab EXTRINSIC CALIBRATION sliders. Zero = radar boresight
+  # perfectly co-aligned with EO. Use to nudge the projected radar bbox
+  # on the EO/thermal panels until it overlaps the detected target.
+  extrinsic:
+    az_bias_deg: 0.0   # + = radar reads too far left; subtract bias to shift right
+    el_bias_deg: 0.0   # + = radar reads too low; subtract to shift up
+  # DBSCAN tuning — loose defaults so sparse vehicle returns still cluster.
+  # Larger eps_pos_m stitches a thin scatter into a single box; min_samples
+  # 3 lets a 3-point vehicle return form a box while still rejecting
+  # singletons that would flicker the display.
+  cluster_eps_pos_m: 8.0
+  cluster_eps_dop_mps: 3.0
+  # Min-samples 2 lets a distant sparse human (often just 2 returns) form
+  # a box. Singleton noise is still rejected by DBSCAN (a lone point
+  # needs ≥2 neighbours to be a core point); frame-to-frame M-of-N
+  # confirmation below kills the rare 2-point coincidence false positive.
+  cluster_min_samples: 2
+
+  # Kalman tracker — stabilises bboxes through flicker and brief dropouts.
+  # The clusterer runs a 6D constant-velocity Kalman filter per tracklet,
+  # predicts forward on frames with no association (coasting), and only
+  # publishes tracks that survived M-of-N confirmation.
+  tracker:
+    # Drop a coasting tracklet after this many consecutive missed
+    # associations. At ~13 Hz radar rate, 30 frames ≈ 2.3 s — enough
+    # to bridge a vehicle passing behind a tree / sign and still hold
+    # the ID for re-association. Combined with coast_vel_halflife_s
+    # damping below, a longer coast budget doesn't cause predictions
+    # to fly off into clutter.
+    coast_max_frames: 30
+    # Velocity half-life during coast (seconds). A coasting Kalman
+    # track normally holds its last-measured velocity forever, so if
+    # the target slows or stops while invisible, the KF prediction
+    # overshoots and the reacquired cluster lands outside the gate →
+    # new ID. Decaying velocity toward 0 keeps the prediction near
+    # "where the target probably still is".
+    coast_vel_halflife_s: 1.0
+    # New tracks must hit this many times in the last `confirm_window`
+    # frames before they're published to the GUI. Kills single-frame
+    # false positives that would otherwise flash as boxes.
+    confirm_min_hits: 2
+    confirm_window: 3
+    # Nearest-neighbour gate for cluster → tracklet association at dt=0
+    # (fresh hit). Gate grows by `gate_growth_m_per_s` per second since
+    # the last measurement, so coasting tracks keep a wider catch radius.
+    assoc_gate_m: 5.0
+    gate_growth_m_per_s: 2.0
+    # Absorb-orphan radius. When DBSCAN fragments a single long object
+    # (vehicle, wall) into two clusters, the second cluster can't claim
+    # the first's track (one-track-per-frame rule) and would otherwise
+    # spawn a phantom ID beside the real one. If its centroid sits
+    # within this many metres of an already-matched track, we drop it
+    # as a split sibling instead. Raise if you see twin IDs on big
+    # targets; lower if adjacent objects are being incorrectly merged.
+    merge_overlap_m: 5.0
+    # Process-noise RMS acceleration for the CV model. Higher = track
+    # reacts faster but jitters more; lower = smoother but lags maneuvers.
+    # 3.0 is tuned for humans that pivot sharply — a pedestrian changing
+    # direction had the KF velocity lag badly at 2.0 and the reacquired
+    # cluster landed outside the gate, causing ID churn.
+    q_accel_mps2: 3.0
+    # Measurement-noise std on position. DBSCAN centroids jitter
+    # ~10-20 cm frame-to-frame — 0.4 m is a realistic conservative value.
+    r_pos_m: 0.4
+    # Track graveyard — when a tracklet is reaped (coast budget exceeded)
+    # its last state is stashed for graveyard_ttl_s. If a new cluster
+    # appears within resurrect_radius_m of a graveyard entry, we reuse
+    # the old ID instead of minting a new one. Fixes "ID churn" where a
+    # target that briefly disappears (occlusion, sharp pivot, human
+    # changing direction) comes back with a fresh ID.
+    graveyard_ttl_s: 4.0
+    resurrect_radius_m: 12.0
+
+fusion:
+  # Cross-sensor fusion (Ticket 5). Reads Thermal + EO (+ Radar when
+  # it arrives) from the bus and emits global-ID tracks in angular
+  # space. EO is the primary sensor (its angles are trusted when
+  # both EO and Thermal see the same target). The GUI re-projects
+  # each fused track into every panel's pixel grid so the bbox is
+  # "the same bbox" across sensors.
+  enabled: true
+  # Phase 2 — store and match tracks in WORLD frame
+  # (cur_pan + cam_az_obs, cur_tilt + cam_el_obs) instead of camera
+  # frame. Keeps a target's track ID stable through gimbal motion;
+  # the camera-frame matcher silently transferred a track to whatever
+  # vehicle currently sat at the same camera-frame az during a slew
+  # (visible in 'single track oscilating after being in the center.jsonl'
+  # where world_az drifted ±2.5° in lock-step with the gimbal's
+  # commanded pan, instead of staying constant for the static target).
+  # Output FusedTrack still publishes CAMERA-frame az/el (= world -
+  # cur_pan at publish time) so gimbal control + GUI overlay don't
+  # need any changes. Set false to revert for A/B.
+  world_frame_fusion: true
+  rate_hz: 15                   # fusion tick rate (independent of sensors)
+  match_gate_deg: 0.7           # cross-sensor: max angular distance (deg) to fuse
+  track_match_gate_deg: 2.0     # per-tick: max angular distance to match existing track
+                                # (cameras are coplanar <5cm apart so parallax ~= 0°;
+                                #  looser gate prevents small bbox jitter spawning dup IDs)
+  min_hits: 1                   # ticks before a track is visible in the GUI
+  # Extended 2026-04-27 night from 30→300 (~20s @ 15Hz). Recording
+  # `revert not helping ghosts.jsonl` cluster analysis showed 35
+  # fused_track_born events but only 14 distinct world clusters —
+  # i.e., the same parked car was re-issuing IDs every time the user
+  # panned away then back. With max_misses=30 (~2s) any FOV exit >2s
+  # killed the track. With world-frame storage and sensor-stamped
+  # pose-at-capture (no phantom velocity drift), holding a track in
+  # memory for 20s is cheap and lets the same world position revive
+  # the original ID when the user pans back. Tracks that age out for
+  # real (target physically left the area) eventually still die.
+  # The publish gate (active_sensors) stops drawing the bbox after
+  # sensor_grace_ticks (~333ms) so a coasting track never visually
+  # confuses the operator — only the persistence ID is preserved.
+  max_misses: 300
+                                # (~20s at 15Hz). Long enough for a
+                                # static parked target to survive a
+                                # gimbal pan-away → pan-back cycle.
+  # Phase 2 — radar as third late-fusion sensor.
+  # Radar bboxes are derived from 3D cluster size projected at slant
+  # range, so they're coarser than EO/thermal pixel-detector boxes.
+  # A more permissive IoU gate keeps radar associating with EO/thermal
+  # tracks even when its bbox barely brushes the camera box.
+  radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
+
+gimbal:
+  # driver:
+  #   maestro            — V1 Pololu Maestro + hobby servos on COM4
+  #   waveshare_st3025   — V2 Waveshare bus-servo adapter + ST3025 (default)
+  # 2026-05-01: V2 hardware live on the bench, both servos calibrated.
+  driver: waveshare_st3025
+  enabled: true
+  port: COM4                    # legacy Maestro pin; ignored when driver=waveshare_st3025
+  rate_hz: 60                   # command/publish loop rate
+
+  # Home / rest pose. tilt convention: 0 = horizon, higher = more up.
+  # Operator-measured tilt envelope on this rig (2026-04-25, second
+  # cal) is 0..90° — see tilt_calibration block below. Pan envelope
+  # is ±45°.
+  home_pan_deg: 0.0
+  # Home sits at horizon (tilt 0°) — operator preference 2026-04-25.
+  # With absolute-angle sliders, dragging from horizon to wherever
+  # the scene needs is one gesture, so there's no "needs head-room"
+  # argument for parking elsewhere.
+  home_tilt_deg: 0.0
+
+  # Are the cameras rigidly mounted on the gimbal, or stationary next
+  # to it on the bench?
+  #
+  # false (bench / current setup): cameras on tripod, gimbal is its own
+  #   rig. Fused az/el is an absolute bench-frame bearing, so the gimbal
+  #   commands `pan = home_pan + az`, `tilt = home_tilt + el`. Flipping
+  #   this from true→false is what stopped the gimbal from slewing into
+  #   its limits on every TRACK press.
+  #
+  # true (flight / real mission): cameras rotate with the gimbal, az/el
+  #   is measured off-boresight and shrinks to zero as the gimbal
+  #   centers the target, so the command integrates: `pan += az`.
+  cameras_on_gimbal: true
+
+  # Auto-track control law tuning. The defaults inside gimbal_manager
+  # were picked for distant targets where centroid jitter is large
+  # and a wide deadband prevents twitchy hunting. Close foreground
+  # targets (e.g. a vehicle filling 30% of the EO frame) typically
+  # land inside that deadband while still visibly off-center, which
+  # looks like "track does nothing" to the operator. Lower defaults
+  # below trade a bit more residual servo activity for visibly
+  # responsive tracking on close targets.
+  # 2026-05-03 V2 (Waveshare ST3025 + encoder) centering bump:
+  # encoder feedback removed the "lazy servo" risk, so we can push
+  # the gain harder and allow bigger per-tick steps without
+  # overshoot risk. Operator wanted faster centering; this is the
+  # quick, low-risk lever (3 knobs, no code change).
+  #   kp_track       0.30 → 0.50  (+67% control gain)
+  #   max_step_deg   2.0  → 3.0   (per-tick cap; ST3025 handles 3°/tick)
+  # If overshoot shows up, add a small D term (separate commit).
+  kp_track:    0.50
+  deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
+  max_step_deg: 3.0           # was 2.0 — V2 servos can handle bigger steps
+  # D term on MEASUREMENT (not error). Subtracts kd × encoder velocity
+  # (dpose/dt) from the closed-loop proportional output. Brakes when the
+  # gimbal is moving fast toward target → smooth deceleration → no
+  # overshoot. `tracking 532026 try3.jsonl` track #1 transit had a 0.6°
+  # peak overshoot and ~3 cycles of bounce-back before settling — exactly
+  # what kd is for.
+  # 0.0 = pure-P (legacy). 0.02 is conservative; if overshoot persists,
+  # bump to 0.04. If gimbal feels sluggish near target, drop to 0.01.
+  kd_track:    0.02
+
+  # Soft-deadband band edges for the proportional control law. Below
+  # `track_zero_band_deg` of error: zero command. Between zero_band and
+  # `track_full_band_deg`: smooth ramp from 0 to kp*err. Above full_band:
+  # full proportional gain.
+  # 2026-04-27 phase-1 tuning: raised from 0.20/1.00 to 0.50/1.50 so the
+  # closed-loop stops generating tiny per-tick commands that fall below
+  # the Yahboom servo's internal deadband (~5-10 µs PWM ≈ 0.5-1°). Below
+  # the threshold the servo's feedback loop ignores the command as
+  # noise and the camera doesn't physically follow — controller's
+  # cur_pan advances anyway, gimbal_state lies. Operator-reported
+  # symptom: "gimbal is lazy" / "doesn't move at all" on small
+  # corrections in tracking number 4 + 5 recordings.
+  # 2026-05-03 V2: tried 0.50 → 0.25 to command earlier near center,
+  # but `tracking 532026 try2.jsonl` showed visible shake — the
+  # closed-loop kept chasing sub-0.5° YOLO bbox jitter, the servo
+  # responded in stutter-y 0.09° discrete steps every ~0.5 s. Reverted
+  # to 0.50: ignore obs noise within ±0.5° of center. The proper next
+  # step is an I-term to drive that 0.5° steady-state error to zero
+  # without commanding micro-corrections every tick.
+  track_zero_band_deg: 0.50
+  track_full_band_deg: 1.50
+  track_min_step_deg: 0.05
+
+  # Maestro driver PWM-gating threshold (microseconds). Each tick the
+  # gimbal_manager pushes a fresh us target to the Maestro at 60 Hz.
+  # When the change from the last successfully-sent us target is below
+  # this threshold the driver skips the write — the previous PWM stays
+  # active until accumulated change crosses the gate. The Yahboom servo
+  # has an internal feedback deadband ~5-10 µs (≈0.5-1°); below that it
+  # ignores commands. Without this gate, fine corrections never reach
+  # the servo because each per-tick PWM step is too small. With the
+  # gate, fine corrections accumulate into a single discrete step.
+  # Set 0 to disable (legacy behaviour, write every tick).
+  #
+  # 2026-04-28 evening: bumped 5.0 → 11.0 (≈1.0°) after `multiple bbs.jsonl`
+  # diagnosis. Tilt cal: 1° ≈ 10.78 µs, pan cal: 1° ≈ 7.78 µs. With the
+  # old 5 µs gate, single 0.5° dpad clicks (5.4 µs / 3.9 µs) just barely
+  # passed and the SERVO physically didn't move (Yahboom internal
+  # deadband > 5 µs). gimbal_manager.get_last_written_us still saw the
+  # 5.4 µs step land on the wire and advanced the published pose, but the
+  # camera pixels stayed put — so fusion's world conversion got a fresh
+  # pose every tick while bbox stayed at the same cam_el → phantom
+  # track births, every 0.5° of "commanded" tilt. With the gate at
+  # 11 µs, two 0.5° dpad clicks accumulate to 10.8 µs (still gated),
+  # three to 16.2 µs (passes) → servo gets a 1.5° step it can actually
+  # respond to, and get_last_written_us returns the value that
+  # corresponds to ACTUAL motion. New servos in 2 days will respond
+  # to smaller steps and we can dial this back.
+  maestro_min_us_step: 11.0
+
+  # Phase 3 — confidence gate for the velocity feed-forward applied
+  # in the closed-loop fused-track tick branch. Only add
+  # `lead_time * world_dot` lookahead when |world_dot| >= this
+  # threshold (per axis). Below threshold the axis is treated as
+  # static and lookahead is zero, so the noise floor in the alpha-
+  # beta velocity estimate (~0.5 °/s from YOLO bbox jitter) doesn't
+  # perturb a stationary target. 1.0 °/s is comfortably above noise,
+  # below typical walking-target rate (~12 °/s at 5 m range).
+  track_lookahead_min_dps: 1.0
+
+  # Alpha-beta predictor knobs (algorithms/track_predictor.py).
+  # Defaults are baked into PredictorParams; override here per rig.
+  #
+  # 2026-05-03: conservative re-tune for V2 (Waveshare ST3025 with
+  # encoders). The predictor now sees ENCODER-MEASURED pose instead
+  # of the controller's commanded rate-limited pose, so:
+  #   * gimbal_dps reflects real angular velocity (no longer flapping
+  #     because of commanded-pose jumps); the settled gate is stable.
+  #     Tightened settled_dps 15 → 8 to be more decisive about whether
+  #     the gimbal is actually moving — only safe with the cleaner
+  #     signal from Fix 1.
+  #   * predict_warmup_n 5 → 3 enables lookahead ~67ms sooner at 30 Hz
+  #     fresh-obs rate. Cleaner initial velocity estimate makes 3 obs
+  #     enough.
+  # vel_alpha and vel_clip_dps left at the conservative V1 values for
+  # now — bumping them is risky if any noise survives, and the bigger
+  # win is from Fix 1 (pose source) rather than re-tuning the filter.
+  # Revisit after a clean V2 recording shows the noise floor.
+  track_lead_time_s: 0.30
+  track_vel_alpha: 0.30
+  track_predict_warmup_n: 3
+  track_predict_cap_deg: 5.0
+  track_gimbal_settled_dps: 8.0
+  track_extrap_horizon_s: 2.0
+  track_vel_clip_dps: 30.0
+  # New 2026-04-26. When fresh observations stop, decay world_*_dot
+  # toward 0 with this half-life so the predictor doesn't coast on a
+  # stale velocity spike. Set 0 to disable (legacy behaviour).
+  track_vel_decay_halflife_s: 0.20
+  # New 2026-04-27. After this age-since-fresh-obs, the predictor's
+  # lead-time extrapolation is hard-zeroed. Replay confirmed that
+  # decay alone leaves residual hunting (~3° amplitude shrinking
+  # over 1+ s); zeroing lead at 0.3 s collapses the hunt immediately
+  # while still allowing 0.3 s of lead-aided convergence on a
+  # genuinely fresh track.
+  track_no_obs_lead_zero_after_s: 0.30
+  # Hysteresis ratio for the predictor's settled gate. With a single
+  # threshold at gimbal_settled_dps and a noisy gimbal_dps signal,
+  # the gate flipped at ~4 Hz on `night tracking a bit flickery.jsonl`
+  # track #6, producing 20 settled<->unsettled transitions in 5 s
+  # which the operator perceives as flicker. Hysteresis flips OUT of
+  # settled at gimbal_settled_dps but only flips BACK to settled when
+  # gimbal_dps drops below settled_dps × this ratio. 1.0 = legacy
+  # (no hysteresis); 0.6 collapses ~95% of the transient flips
+  # without slowing the legitimate slew/settle transitions.
+  track_settled_hysteresis_ratio: 0.6
+
+  # How many consecutive fusion ticks the engaged track can be missing
+  # from the fused-tracks list before the gimbal drops the lock and
+  # returns to manual. Fusion runs at 15 Hz, so ticks×~67ms.
+  # 2026-05-04: bumped 20 → 60 (1.3 s → 4 s) after the night recording
+  # showed two separate engaged tracks lost via `track_grace_expired`
+  # at miss_ticks=20 — both during legitimate fast slews where motion
+  # blur briefly pushed YOLO confidence below threshold and the
+  # thermal heat-detector lost cohesion in the same window. 4 s of
+  # grace lets MOSSE keep the per-sensor ID alive long enough for
+  # YOLO/heat to re-acquire on the other side of the slew, without
+  # holding a truly-dead lock so long that the operator notices.
+  track_grace_ticks: 60
+
+  # ── Lock mode (rock-solid persistent tracker) ──────────────────
+  #
+  # When the operator presses TRACK, spawn a dedicated per-sensor
+  # MOSSE tracker seeded from the engaged target's appearance.
+  # Updates every gimbal tick on the latest EO + thermal frames
+  # — survives YOLO/heat/fusion dropouts, ByteTrack ID swaps, brief
+  # occlusions. State machine: ACTIVE (PSR healthy, bbox green) →
+  # COASTING (PSR drops, bbox amber, watching for re-acquisition)
+  # → HARD_RELEASED (coast window expired, bbox cleared, return to
+  # manual). Auto-reseed when a fused track lands within
+  # `reseed_iou_min` of the lock bbox AND class matches.
+  #
+  # See vision/lock_tracker.py + GOOD_BASELINE.md for the design.
+  # SOFT REVERT: set enabled=false here and restart the bench. All
+  # lock-mode code paths are gated on this flag; legacy behaviour
+  # is byte-equivalent when disabled.
+  lock_mode:
+    # 2026-05-05: re-enabled to test v2 (commit 46868c0) which
+    # replaced v1's IoU/class auto-reseed (the multi-target swap
+    # bug from `recordings/lock poorly.jsonl`) with strict-ID-match
+    # reseed. Recorder also now serializes lock_state so post-hoc
+    # debugging is possible.
+    # SOFT REVERT: set enabled=false here, restart. All lock-mode
+    # code paths gate on this flag.
+    enabled: true                # master switch
+    psr_lost: 5.0                # MOSSE PSR threshold below which we coast
+    lost_frames: 5               # consecutive sub-PSR frames → COASTING
+    coast_window_s: 3.0          # max time COASTING before HARD_RELEASED
+    # v2 dropped reseed_iou_min — auto-reseed gates on ID equality
+    # only, no IoU search. Kept here for backward-compat readers
+    # but unused.
+    reseed_iou_min: 0.20
+    reseed_min_period_s: 0.30    # don't reseed faster than this even if obs allow
+    learning_rate: 0.125         # MOSSE online filter blending
+    sigma: 2.0                   # MOSSE Gaussian peak width
+    max_patch_dim: 96            # MOSSE FFT working size cap
+    # Solo render mode (operator request 2026-05-05). When an
+    # engagement is active AND this is true, the GUI hides all
+    # red detection boxes and all non-engaged fused-track boxes
+    # on both EO and thermal panels. Only the engaged target
+    # remains visible — as lock-mode corner brackets (when lock
+    # is ACTIVE/COASTING) or as the projected fused-track box
+    # otherwise. Decluttering for "I want to focus on the one
+    # target I picked." Set false for full situational awareness
+    # while engaged. Independent of `enabled` above — solo can
+    # be useful even with lock mode off.
+    solo_mode: true
+
+  # Tracking-mode slew rate cap (deg/sec). Applied to the controller's
+  # per-tick step ONLY when an engaged fused track is active; manual
+  # dpad / HOME slews keep the broader gimbal.controller.{pan,tilt}_
+  # slew_deg_per_s limits.
+  #
+  # Motion-blur math (why this matters):
+  #   * EO IMX568, 11.05° HFOV across 1236 display px → 112 px/°.
+  #     At 25 Hz capture (40 ms frame), 25 dps = 1.0° = 112 px of
+  #     blur. YOLOv8n's recall on 100+ px of motion blur drops off
+  #     a cliff — operator-reported `gimbal moves too fast loses
+  #     bbs.jsonl` shows engaged tracks dying mid-slew at 25-37 dps.
+  #   * 18 dps × 40 ms = 0.72° ≈ 80 px of blur. YOLO recovers.
+  #   * Thermal Boson is essentially blur-immune at this rate
+  #     (60 Hz × 0.4° = 7 px on the 640 px @ 37° wide preset).
+  #
+  # Trade-off: at 18 dps a 30° re-acquisition takes ~1.7 s instead
+  # of ~1 s. The right call when operator's primary complaint is
+  # "lock dies during slew" rather than "acquisition feels slow."
+  # Set 0 to disable the cap entirely (legacy behaviour); raise
+  # toward 30 if mid-slew lock loss stops happening on your scenes.
+  track_slew_cap_dps: 18.0
+
+  # ── Optical residual correction (Stage A diagnostic + Stage B closed-loop)
+  #
+  # Stage A is always on: when a synthetic-target lock is active, the
+  # gimbal manager runs LK optical flow on EO + thermal frames against
+  # an anchor captured at lock time. The measured pixel displacement,
+  # converted via the recorded FOV, gives the actual angular movement
+  # the camera made (since hobby servos have no position feedback). The
+  # difference vs the controller's commanded delta is the visual
+  # residual — emitted as the `optical_residual` event so we can A/B
+  # closed-loop work via replay tools.
+  #
+  # Stage B (gated by `optical_correction_enabled` below) feeds that
+  # residual into an integrator that biases the synth-target world-
+  # frame setpoint, closing the loop visually. Enable to A/B against
+  # the open-loop baseline. Disable while debugging Stage A.
+  # Default OFF. The current implementation oscillates against the
+  # combination of LK measurement noise + servo dead-zone (sub-deg
+  # corrections don't physically move the camera but the LK chain
+  # still propagates feature drift each tick). A correct closed-loop
+  # synth-target controller would anchor LK on the bbox CONTENT (not
+  # the central ROI) and use pixel-error-to-image-center directly as
+  # the control variable, the way the existing real-heat-blob path
+  # does — but that's a refactor, not a tuning. Leave Stage B disabled
+  # until that work lands. Conservative defaults below are safe to
+  # flip on for ad-hoc experimentation.
+  optical_correction_enabled: false      # default OFF
+  optical_correction_alpha: 0.05         # integrator gain per residual sample
+  optical_correction_max_deg: 3.0        # anti-windup cap on cumulative bias
+  optical_correction_min_features: 12    # below this, skip update (LK noisy)
+  optical_correction_warmup_s: 1.5       # ignore first N s post-lock
+  optical_correction_step_max_deg: 0.08  # per-tick cap on integrator change
+  optical_correction_settled_deg: 0.3    # only update when |cur - cmd| < this
+
+  # Stuck-servo safety: when a synth lock has been active for several
+  # seconds and the LK-measured camera motion is nowhere near what was
+  # commanded, release the servos to float (PWM=0) so we don't keep
+  # PWM-pumping a stalled motor. Triggers on:
+  #   - synth lock active for >= warmup_s
+  #   - |required slew| >= required_min_deg on either axis
+  #   - actual LK motion < (1 - residual_frac) * |required|
+  #   - condition holds for consec_threshold consecutive samples
+  stuck_servo_protection: true            # master kill switch
+  stuck_servo_warmup_s: 3.0               # don't trigger before this many s
+                                           # post-lock (gimbal still slewing)
+  stuck_servo_required_min_deg: 2.0       # only check on slews larger than this
+  stuck_servo_residual_frac: 0.7          # >70 % of slew not delivered = stuck
+  stuck_servo_consec_threshold: 8         # ~1.5 s at 6 Hz LK rate
+
+  # Fused-track unified control law. When true (default), the TRACK
+  # button uses the same closed-loop pixel-error proportional control
+  # as the heat-blob path — `d_pan = kp * trk.az_deg`, `d_tilt = kp *
+  # trk.el_deg`, soft deadband + max-step cap, low-pass error filter.
+  # No velocity-based mode switching; same algorithm whether the
+  # target is static or moving (per-operator ask 2026-04-27). The
+  # alpha-beta predictor still runs in parallel for diagnostics +
+  # replay parity but its lookahead output isn't fed to the
+  # controller in this mode (it added noise on static targets that
+  # made TRACK feel less stable than the synth lock).
+  # Set false to use the legacy predictor-driven setpoint.
+  fused_track_closed_loop: true
+
+  # Software safety envelope & slew rate.
+  #
+  # Operator-measured mechanical envelope (2026-04-25, second cal):
+  #   PAN   ch 0: 1950 µs = -45° (max LEFT),  1250 µs = +45° (max RIGHT)
+  #               (reduced from ±90° to ±45° to keep the camera mount
+  #                inside its safe travel — cables don't bind in this
+  #                range and the field of regard is still ample.)
+  #   TILT  ch 1: 1030 µs = 0° (horizon, exact),
+  #               2000 µs = 90° (vertical up, exact)
+  #               (tilt floor lowered from 3° to 0° — operator now
+  #                wants the gimbal to be able to look straight at
+  #                ground-level / horizon-level targets.)
+  # V2 (ST3025) envelope. When flipping driver back to maestro, narrow
+  # to {pan ±45, tilt 0..90} for V1 mechanical safety.
+  limits:
+    pan_min_deg: -60.0
+    pan_max_deg:  60.0
+    tilt_min_deg:   0.0
+    tilt_max_deg:  90.0
+    # ST3025's brushless motor + 12-bit encoder can do >300 deg/s; these
+    # caps protect against absurd setpoint jumps from tracking, not
+    # against the servo's physical capability.
+    # 2026-05-05: dropped 120 → 45 after operator reported "even the
+    # manual mode is really aggressive." 120 dps is enough to throw
+    # the bench around on a single dpad click — the servo physically
+    # delivers it. 45 dps takes ~1.5 s to slew 60° corner-to-corner
+    # on this rig, which is brisk but no longer abrupt. Manual dpad
+    # / WASD / HOME all use this limit; engaged tracking is further
+    # capped by gimbal.track_slew_cap_dps (default 18) so the chase
+    # path still respects the EO motion-blur envelope.
+    pan_slew_deg_per_s:  45.0
+    tilt_slew_deg_per_s: 45.0
+
+  # Linear angle→µs calibration per servo.
+  # Values reflect the actual mechanical/electrical envelope of THIS
+  # rig as measured by the operator in Maestro Control Center.
+  pan_calibration:
+    channel: 0
+    min_deg: -45.0
+    max_deg:  45.0
+    # With invert=true the controller maps:
+    #   -45° (LEFT)   → us_at_max_deg = 1950 µs
+    #   +45° (RIGHT)  → us_at_min_deg = 1250 µs
+    # i.e. LOWER pulse = MORE RIGHT pan. Direction-tested with
+    # operator: ◄ moves left, ► moves right. Same polarity as the
+    # earlier ±90° calibration — only the µs endpoints shifted.
+    us_at_min_deg: 1250.0
+    us_at_max_deg: 1950.0
+    invert: true        # servo mounted so +pan (right) needs lower pulse
+  tilt_calibration:
+    channel: 1
+    min_deg:  0.0
+    max_deg: 90.0
+    # 2026-04-25 operator-measured envelope (second cal):
+    #   1030 µs = 0°  (horizon, exact)
+    #   2000 µs = 90° (vertical up, exact)
+    # With invert=false the controller maps DIRECTLY:
+    #   0°  → us_at_min_deg = 1030 µs
+    #   90° → us_at_max_deg = 2000 µs
+    # i.e. HIGHER pulse = HIGHER tilt. Pressing ▲ (UP) drives the
+    # gimbal physically up. If after a mechanical mount change this
+    # is reversed, flip invert to true and leave the µs values alone.
+    us_at_min_deg: 1030.0
+    us_at_max_deg: 2000.0
+    invert: false
+
+  # ── V2 (Waveshare ST3025) bus-servo calibration ─────────────
+  # Active when driver: waveshare_st3025. Calibrated 2026-05-01 by
+  # hand-positioning the gimbal at home pose (tilt=horizon, pan=
+  # forward-centered) and reading the encoders. raw_min/max widen
+  # to ±60° (pan) and -15..+90° (tilt) around the calibrated zero.
+  waveshare:
+    port: null                  # auto-detect by VID/PID; pin to "COMn" if needed
+    baud: 1000000
+    # Servo-side acceleration ramp (register 0x29, 0..255). Higher = snappier
+    # response, lower = smoother. 0 disables the ramp (default firmware
+    # behaviour) and produces visible jerk on per-tick goal-position writes.
+    # Symmetric across axes — both servos are identical hardware and at
+    # the same per-tick rate they should feel the same.
+    # ki = Position-Integral gain (register 0x17, 0..255). Factory
+    # default is 0, which leaves a couple degrees of steady-state
+    # error against any constant load. Tilt has gravity pulling the
+    # mounted system down so it benefits more from I; pan only fights
+    # rolling friction. Too high causes hunting — 1..4 is the safe
+    # band.
+    tilt:
+      servo_id: 1
+      # 2026-05-01: spline re-clocked. Was zero_raw=893 invert=false;
+      # post-rework horizon sits at raw 1917 and vertical at raw 893,
+      # so we flip the convention: zero_raw=1917 (=horizon) with
+      # invert=true so increasing system tilt walks raw downward
+      # toward 893 (=vertical).
+      zero_raw: 1917            # raw at system 0° (horizon)
+      invert: true
+      raw_min: 893              # ≈ +90° system (vertical, lower raw end)
+      raw_max: 1917             # ≈   0° system (horizon, upper raw end)
+      acceleration: 50
+      ki: 8                     # gravity + stiction; raise if still settles off-zero, lower if it hunts
+    pan:
+      servo_id: 2
+      zero_raw: 2321            # raw at system 0° (forward-centered)
+      invert: false
+      raw_min: 1638             # ≈ -60° system
+      raw_max: 3004             # ≈ +60° system
+      acceleration: 50
+      ki: 2
+
+gui:
+  host: 127.0.0.1
+  port: 8080
+  open_browser: true
+  ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)
+  thermal_jpeg_quality: 80      # 8-bit colormapped thermal looks fine at 80.
+                                # (Briefly bumped to 92 on 2026-04-27; full
+                                # revert to original on operator request when
+                                # the visible image looked worse than the
+                                # baseline despite the bigger files.)
+  eo_jpeg_quality:     82       # Was 95 — dropped 2026-04-25 to free encode
+                                # budget. The shared WS broadcast loop was
+                                # CPU-bound at ~12 Hz with q=95; q=82 cuts
+                                # JPEG size ~40% and encode time ~25% with
+                                # near-invisible loss on mono. Result: WS
+                                # broadcasts at ~18-20 Hz, freeing thermal
+                                # to display at higher cadence too.
+                                # Raise back to 92-95 if you specifically
+                                # need foliage/brick/chain-link fidelity
+                                # at the cost of motion smoothness.
+
+recording:
+  enabled: true                 # Master kill switch. False = REC button is a no-op.
+  auto_start: false             # If true, begin recording at app launch.
+                                # Overridden at the CLI by `python main.py --auto-record`.
+  output_dir: ./recordings      # JSONL files land here as seeker_YYYY-MM-DD_HH-MM-SS.jsonl
+  jpeg_quality: 92              # Recording fidelity is decoupled from the wire (see
+                                # gui.eo_jpeg_quality). 92 = near-lossless, ~3-5 ms encode
+                                # per 640×512 frame. Drop to 85 if recordings stutter.
+  channels:                     # Per-channel enables. Set false to skip on disk.
+    thermal/frame: true
+    eo/frame: true
+    radar/frame: true
+    gimbal/state: true
+    fusion/tracks: true
+    events: true                # always-on in practice (no separate thread)
+
+logging:
+  level: INFO
+  log_dir: ./logs
+  max_bytes: 5242880
+  backup_count: 3

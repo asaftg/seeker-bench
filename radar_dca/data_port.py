@@ -151,10 +151,25 @@ class DataPortListener:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Larger kernel receive buffer — DCA can burst at 100s of Mb/s.
+        # Field log 2026-04-30 19:26 showed seq_drops=133K with only 28K
+        # packets received (5x more drops than packets) at the 8MB
+        # buffer — host can't keep up with chip's 9+ MB/s LVDS rate.
+        # Bump to 64 MB; Windows 10/11 typically allows up to 100+ MB
+        # via SO_RCVBUF. Worst case the OS clamps it lower silently.
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         except OSError:
-            pass  # not all platforms allow 8MB; best-effort
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+            except OSError:
+                pass  # best-effort
+        # Confirm what the OS actually granted (it may clamp).
+        try:
+            actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            log.info("DCA UDP recv buffer = %.1f MB (requested 64 MB)",
+                     actual / (1024 * 1024))
+        except OSError:
+            pass
         sock.bind((self.host_ip, self.data_port))
         sock.settimeout(self.recv_timeout_s)
         self._sock = sock

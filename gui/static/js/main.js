@@ -116,6 +116,10 @@ let _replayActive     = false;    // true when the WS envelope arrives with `rep
 let _lastMainTargetId = null;
 let _lastFusedEO      = [];
 let _lastRadarForEO   = [];
+// Lock-mode cache — same pattern as _lastFusedEO so the binary EO
+// fast-path can keep rendering the lock bbox between shared-sensors
+// JSON ticks. {state, bbox_eo, bbox_thermal} or null when off.
+let _lastLock         = null;
 
 // Replay-mode UI: pulse a red REPLAY badge in the topbar and show
 // the playback clock so the user has a single visible time reference
@@ -154,6 +158,115 @@ function _setReplayBadge(on, tSec) {
     }
   }
 }
+
+// Replay control bar — pause/play + seek slider + speed dropdown,
+// only visible when an envelope arrives with `replay:true`. State
+// mirror keeps the controls coherent with server-truth so the pause
+// glyph and slider position don't fight envelope updates while the
+// user is mid-scrub.
+const _replayState = {
+  duration_s: 0,
+  is_paused: false,
+  speed: 1,
+  playhead_t_s: 0,
+};
+let _userScrubbing = false;
+
+function _fmtMMSS(t) {
+  const tt = Math.max(0, Number(t) || 0);
+  const m = Math.floor(tt / 60);
+  const s = Math.floor(tt - m * 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function _updateReplayTimeReadout(cur, total) {
+  const el = document.getElementById("replay-time");
+  if (el) el.textContent = `${_fmtMMSS(cur)} / ${_fmtMMSS(total)}`;
+}
+
+function _setReplayBarVisible(on) {
+  const bar = document.getElementById("replay-bar");
+  if (!bar) return;
+  bar.hidden = !on;
+}
+
+// Throttled mid-drag seek so the user "sees video flow" while
+// scrubbing — server walks the timeline and emits a snapshot envelope
+// per seek, so panels repaint as the slider moves. 80 ms = ~12 Hz.
+let _lastSeekSentAt = 0;
+let _seekTrailingTimer = null;
+const SCRUB_THROTTLE_MS = 80;
+
+function _maybeSendScrubSeek(slider) {
+  const now = performance.now();
+  const since = now - _lastSeekSentAt;
+  if (since >= SCRUB_THROTTLE_MS) {
+    const t = Math.max(0, Number(slider.value) || 0);
+    wsSend({ cmd: "seek", t_s: t });
+    _lastSeekSentAt = now;
+    if (_seekTrailingTimer) {
+      clearTimeout(_seekTrailingTimer);
+      _seekTrailingTimer = null;
+    }
+  } else {
+    // Trailing-edge: ensure the latest position lands within one window.
+    if (_seekTrailingTimer) clearTimeout(_seekTrailingTimer);
+    _seekTrailingTimer = setTimeout(() => {
+      const tNow = Math.max(0, Number(slider.value) || 0);
+      wsSend({ cmd: "seek", t_s: tNow });
+      _lastSeekSentAt = performance.now();
+      _seekTrailingTimer = null;
+    }, SCRUB_THROTTLE_MS - since);
+  }
+}
+
+(() => {
+  const pauseBtn = document.getElementById("replay-pause");
+  const slider   = document.getElementById("replay-seek");
+  const speedSel = document.getElementById("replay-speed");
+  if (!pauseBtn || !slider) return;
+
+  pauseBtn.addEventListener("click", () => {
+    // Optimistic UI is intentionally avoided — the server's next
+    // envelope is the source of truth for the glyph.
+    wsSend({ cmd: _replayState.is_paused ? "play" : "pause" });
+  });
+
+  const beginScrub = () => { _userScrubbing = true; };
+  const onInput = () => {
+    _updateReplayTimeReadout(Number(slider.value) || 0, _replayState.duration_s);
+    if (_userScrubbing) _maybeSendScrubSeek(slider);
+  };
+  const commitScrub = () => {
+    if (!_userScrubbing) return;
+    if (_seekTrailingTimer) {
+      clearTimeout(_seekTrailingTimer);
+      _seekTrailingTimer = null;
+    }
+    const t = Math.max(0, Number(slider.value) || 0);
+    wsSend({ cmd: "seek", t_s: t });
+    _lastSeekSentAt = performance.now();
+    _userScrubbing = false;
+  };
+  slider.addEventListener("pointerdown", beginScrub);
+  slider.addEventListener("touchstart",  beginScrub, { passive: true });
+  slider.addEventListener("input",       onInput);
+  slider.addEventListener("pointerup",   commitScrub);
+  slider.addEventListener("touchend",    commitScrub);
+  // Keyboard arrow keys: `change` fires per press, no pointer events.
+  slider.addEventListener("change", () => {
+    if (_userScrubbing) return;  // commitScrub already handled this
+    const t = Math.max(0, Number(slider.value) || 0);
+    wsSend({ cmd: "seek", t_s: t });
+  });
+
+  if (speedSel) {
+    speedSel.addEventListener("change", () => {
+      const v = Number(speedSel.value) || 1;
+      wsSend({ cmd: "speed", v });
+    });
+  }
+})();
 
 // Cross-sensor overlay gating — source-centric. Each flag controls
 // whether that sensor's tracks project onto the OTHER panels:
@@ -589,27 +702,53 @@ const _tiltSliderVal = $("gimbal-tilt-slider-val");
 // programmatic `slider.value = …` would normally fire `input` and echo
 // the value back — pumping the gimbal. The flag short-circuits that.
 let _suppressSliderEcho = false;
+// User's intended setpoints, decoupled from slider DOM values. The DOM
+// values are constantly overwritten by updateGimbalUI to reflect the
+// MEASURED pose. When the user drags one slider, we must NOT read the
+// other slider's DOM value (which is measured, not what the user
+// wants) — that yanks the un-dragged axis backward to wherever the
+// servo currently lags. Symptom: dragging pan made tilt "crawl"
+// because the tilt slider's DOM value was the still-climbing measured
+// tilt, and we kept resending it as a fresh tilt command. Fix: track
+// what the USER asked for separately, and send those values.
+let _userPanSetpoint = 0.0;
+let _userTiltSetpoint = 0.0;
 
-function _sendPanTilt() {
+function _sendPanTiltFrom(axis) {
   if (!_panSlider || !_tiltSlider) return;
-  const pan  = parseFloat(_panSlider.value);
-  const tilt = parseFloat(_tiltSlider.value);
-  if (_panSliderVal)  _panSliderVal.textContent  = pan.toFixed(1)  + "°";
-  if (_tiltSliderVal) _tiltSliderVal.textContent = tilt.toFixed(1) + "°";
   if (_suppressSliderEcho) return;
-  wsSend({ command: "gimbal_absolute", pan_deg: pan, tilt_deg: tilt });
+  if (axis === "pan") {
+    _userPanSetpoint = parseFloat(_panSlider.value);
+    if (_panSliderVal) _panSliderVal.textContent = _userPanSetpoint.toFixed(1) + "°";
+  } else if (axis === "tilt") {
+    _userTiltSetpoint = parseFloat(_tiltSlider.value);
+    if (_tiltSliderVal) _tiltSliderVal.textContent = _userTiltSetpoint.toFixed(1) + "°";
+  }
+  wsSend({ command: "gimbal_absolute",
+           pan_deg: _userPanSetpoint, tilt_deg: _userTiltSetpoint });
 }
 
-if (_panSlider)  _panSlider.addEventListener("input", _sendPanTilt);
-if (_tiltSlider) _tiltSlider.addEventListener("input", _sendPanTilt);
+if (_panSlider)  _panSlider.addEventListener("input",  () => _sendPanTiltFrom("pan"));
+if (_tiltSlider) _tiltSlider.addEventListener("input", () => _sendPanTiltFrom("tilt"));
 
 const homeBtn = $("gimbal-home-btn");
 if (homeBtn) {
   homeBtn.addEventListener("click", () => {
     // Backend knows the configured home pose — don't compute it client-side.
     wsSend({ command: "gimbal_home" });
+    // Reset user setpoints so the next slider drag doesn't yank either
+    // axis back to a stale value left over from before HOME.
+    _userPanSetpoint = 0.0;
+    _userTiltSetpoint = 0.0;
   });
 }
+
+// Track mode (manual ↔ auto) so we resync user setpoints on transitions.
+// During auto-track the backend drives the gimbal, and our cached user
+// setpoints would be stale by the time the user takes manual control
+// back.
+let _lastGimbalMode = null;
+let _userSetpointsInitialized = false;
 
 function updateGimbalUI(gimbal) {
   if (!gimbal) return;
@@ -619,6 +758,20 @@ function updateGimbalUI(gimbal) {
   const tiltEl = $("gimbal-tilt");
   if (panEl)  panEl.textContent  = (_gimbalPan  != null) ? _gimbalPan.toFixed(1)  + "°" : "—";
   if (tiltEl) tiltEl.textContent = (_gimbalTilt != null) ? _gimbalTilt.toFixed(1) + "°" : "—";
+
+  // First-frame init + resync on auto→manual transition: snap user
+  // setpoints to the current measured pose so the next slider drag
+  // doesn't send a stale absolute setpoint.
+  const mode = gimbal.mode || "manual";
+  const transitionToManual = (_lastGimbalMode === "auto" && mode === "manual");
+  if ((!_userSetpointsInitialized || transitionToManual)
+      && _gimbalPan != null && _gimbalTilt != null) {
+    _userPanSetpoint = _gimbalPan;
+    _userTiltSetpoint = _gimbalTilt;
+    _userSetpointsInitialized = true;
+  }
+  _lastGimbalMode = mode;
+
   // Sync slider handles to reported gimbal position so the UI doesn't
   // get stuck showing the user's last drag while auto-track or HOME
   // commands move the gimbal elsewhere. Suppress the echo loop.
@@ -815,17 +968,18 @@ if (areaSlider) {
   // sliders. We now keep _MODE_LIVE fresh and refresh _MODE_SNAPSHOTS
   // on save, so a Stock→A/G→Stock round-trip restores Stock's
   // values instantly with no page reload.
-  let _MODE_LIVE      = { stock: null, ag: null, aa: null };
-  let _MODE_SNAPSHOTS = { stock: null, ag: null, aa: null };
-  let _CURRENT_MODE   = "stock";  // mirrors the radio group; outgoing mode on switch
+  // A/G mode removed 2026-05-05. Maps stay so saved configs that
+  // still carry an "ag" key load without crashing — but it's never
+  // used as a current mode and the radio is gone from the GUI.
+  let _MODE_LIVE      = { stock: null, aa: null };
+  let _MODE_SNAPSHOTS = { stock: null, aa: null };
+  let _CURRENT_MODE   = "stock";
 
   window.__hydrateRadarModes = (saved) => {
     if (!saved || typeof saved !== "object") return;
-    for (const m of ["stock", "ag", "aa"]) {
+    for (const m of ["stock", "aa"]) {
       if (saved[m] && typeof saved[m] === "object") {
         _MODE_SNAPSHOTS[m] = { ...saved[m] };
-        // Seed _MODE_LIVE too so the very first switch into this
-        // mode gets the saved values without a full page round-trip.
         _MODE_LIVE[m] = { ...saved[m] };
       }
     }
@@ -841,21 +995,17 @@ if (areaSlider) {
     cluster_eps_pos_m:   "radar-eps",
     cluster_min_samples: "radar-minpts",
   };
-  // A/G-only DSP knobs (revealed when mode=ag). Each entry is the
-  // payload key + DOM id + how to read its value.
-  const _AG_CTRLS = {
-    integrate_chirps:  { id: "ag-chirps",      type: "num"  },
-    cfar_algo:         { id: "ag-cfar-algo",   type: "str"  },
-    cfar_threshold_db: { id: "ag-cfar-thresh", type: "num"  },
-    capon_bf:          { id: "ag-capon",       type: "bool" },
-  };
+  // A/G mode currently exposes no DSP knobs — see HTML comment in
+  // the radar-mode-extra[data-mode="ag"] section. Empty so save/load
+  // skips the AG block instead of writing dead fields.
+  const _AG_CTRLS = {};
   // A/A-only PMM-classifier knobs (revealed when mode=aa).
+  // staggered_prf removed 2026-05-05: not implemented in detector.
   const _AA_CTRLS = {
     pmm_band_low_hz:   { id: "aa-pmm-low",      type: "num"  },
     pmm_band_high_hz:  { id: "aa-pmm-high",     type: "num"  },
     pmm_threshold_db:  { id: "aa-pmm-thresh",   type: "num"  },
     pmm_slow_time_win: { id: "aa-pmm-win",      type: "num"  },
-    staggered_prf:     { id: "aa-staggered-prf",type: "bool" },
   };
   function _readCtrl(spec) {
     const el = document.getElementById(spec.id);
@@ -878,11 +1028,7 @@ if (areaSlider) {
       const el = $(id); if (!el) continue;
       out[key] = Number(el.value);
     }
-    if (mode === "ag") {
-      for (const [k, spec] of Object.entries(_AG_CTRLS)) {
-        const v = _readCtrl(spec); if (v !== null) out[k] = v;
-      }
-    } else if (mode === "aa") {
+    if (mode === "aa") {
       for (const [k, spec] of Object.entries(_AA_CTRLS)) {
         const v = _readCtrl(spec); if (v !== null) out[k] = v;
       }
@@ -900,9 +1046,8 @@ if (areaSlider) {
       const row = rows.find(r => r.id === id);
       if (lbl && row) lbl.textContent = row.fmt(row.int ? Math.round(v) : v);
     }
-    // Mode-specific knobs (A/G or A/A); harmless when the section is
-    // hidden — the value just sits there until the user reveals it.
-    for (const [k, spec] of Object.entries(_AG_CTRLS)) _writeCtrl(spec, snap[k]);
+    // Mode-specific knobs (A/A only — A/G removed 2026-05-05);
+    // harmless when the section is hidden.
     for (const [k, spec] of Object.entries(_AA_CTRLS)) _writeCtrl(spec, snap[k]);
   }
   function _applyMode(newMode) {
@@ -931,11 +1076,7 @@ if (areaSlider) {
         if (snap[k] != null) tunePayload[k] = snap[k];
       }
       wsSend(tunePayload);
-      if (newMode === "ag") {
-        const ag = { command: "ag_tune" };
-        for (const k of Object.keys(_AG_CTRLS)) if (snap[k] != null) ag[k] = snap[k];
-        if (Object.keys(ag).length > 1) wsSend(ag);
-      } else if (newMode === "aa") {
+      if (newMode === "aa") {
         const aa = { command: "aa_tune" };
         for (const k of Object.keys(_AA_CTRLS)) if (snap[k] != null) aa[k] = snap[k];
         if (Object.keys(aa).length > 1) wsSend(aa);
@@ -943,11 +1084,11 @@ if (areaSlider) {
     }
     const status = document.getElementById("radar-backend-status");
     if (status) {
-      status.textContent = newMode === "stock" ? "STOCK" : (newMode === "ag" ? "A/G" : "A/A");
+      status.textContent = newMode === "stock" ? "STOCK" : "A/A";
       status.style.color = "var(--cyan)";
     }
   }
-  for (const mode of ["stock", "ag", "aa"]) {
+  for (const mode of ["stock", "aa"]) {
     const el = document.getElementById("radar-backend-" + mode);
     if (el) el.addEventListener("change", () => { if (el.checked) _applyMode(mode); });
   }
@@ -990,7 +1131,7 @@ if (areaSlider) {
     el.addEventListener("input",  onChange);
     el.addEventListener("change", onChange);
   }
-  for (const [k, spec] of Object.entries(_AG_CTRLS)) _wireModeStash("ag", k, spec);
+  // _AG_CTRLS is empty (A/G mode removed 2026-05-05).
   for (const [k, spec] of Object.entries(_AA_CTRLS)) _wireModeStash("aa", k, spec);
 
   // ───── A/G mode controls — paint label only at init; push to
@@ -1016,10 +1157,9 @@ if (areaSlider) {
     el.addEventListener("change", pushAndPaint);
     paintLabel();  // initial label only — no WS send at page load
   }
-  _wireModeControl("ag-chirps",      "ag_tune", "integrate_chirps",   v => v + " chirps");
-  _wireModeControl("ag-cfar-algo",   "ag_tune", "cfar_algo",          v => "");
-  _wireModeControl("ag-cfar-thresh", "ag_tune", "cfar_threshold_db",  v => v.toFixed(1) + " dB");
-  _wireModeControl("ag-capon",       "ag_tune", "capon_bf",           v => "");
+  // A/G DSP knobs removed 2026-05-05 — host CFAR pipeline is skipped
+  // (pmm_only=True) and chip-side CFAR can't be retuned at runtime.
+  // See HTML comment in radar-mode-extra[data-mode="ag"].
 
   // ── Dual-thumb PMM-band slider ────────────────────────────────────
   // The two `aa-pmm-low` / `aa-pmm-high` inputs share one track. We
@@ -1065,7 +1205,7 @@ if (areaSlider) {
   _wireModeControl("aa-pmm-high",    "aa_tune", "pmm_band_high_hz",   v => v.toFixed(0) + " Hz");
   _wireModeControl("aa-pmm-thresh",  "aa_tune", "pmm_threshold_db",   v => v.toFixed(1) + " dB");
   _wireModeControl("aa-pmm-win",     "aa_tune", "pmm_slow_time_win",  v => v + " chirps");
-  _wireModeControl("aa-staggered-prf","aa_tune","staggered_prf",      v => "");
+  // staggered_prf removed 2026-05-05 — not implemented in detector.
 
   // ───── SAVE CONFIG button — persist current slider values for the
   //       ACTIVE mode to disk. Each mode (Stock / A/G / A/A) has its
@@ -1340,8 +1480,8 @@ function connect() {
             const blob = new Blob([jpegBytes], { type: "image/jpeg" });
             eo._blobUrl = URL.createObjectURL(blob);
           }
-          eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
-          if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
+          eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO, _lastLock);
+          if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO, _lastLock);
           setPill("pill-eo", eo.connected ? "on" : "off", "EO");
           const eoHz = $("eo-hz");
           if (eoHz) eoHz.textContent = eo.connected ? (_eoFps.current + " Hz") : "— Hz";
@@ -1362,8 +1502,50 @@ function connect() {
     // point an LLM agent at ("at ~0:12 the gimbal jumped right").
     if (msg && msg.replay === true) {
       _setReplayBadge(true, Number(msg.replay_t_s || 0));
+
+      // Drive the replay control bar from server-truth fields. Each
+      // envelope carries playhead_t_s / duration_s / is_paused / speed
+      // (replay_server.py:_PlayerSession._send_envelope).
+      const playhead = Number(msg.playhead_t_s);
+      const duration = Number(msg.duration_s);
+      const paused   = !!msg.is_paused;
+      const speed    = Number(msg.speed);
+      if (Number.isFinite(playhead)) _replayState.playhead_t_s = playhead;
+      if (Number.isFinite(duration)) _replayState.duration_s   = duration;
+      if (Number.isFinite(speed))    _replayState.speed        = speed;
+      _replayState.is_paused = paused;
+
+      _setReplayBarVisible(true);
+
+      const slider = document.getElementById("replay-seek");
+      if (slider) {
+        const newMax = Number.isFinite(duration) ? duration : 0;
+        if (Number(slider.max) !== newMax) slider.max = String(newMax);
+        // Don't fight the user mid-drag.
+        if (!_userScrubbing && Number.isFinite(playhead)) {
+          slider.value = String(playhead);
+        }
+      }
+      if (!_userScrubbing) {
+        _updateReplayTimeReadout(_replayState.playhead_t_s, _replayState.duration_s);
+      }
+      const pauseBtn = document.getElementById("replay-pause");
+      if (pauseBtn) pauseBtn.textContent = paused ? "▶" : "⏸";
+
+      // Sync the speed dropdown to server-reported speed (keeps the
+      // selection truthful when speed was set via URL ?speed= or on
+      // another tab). Only adjust when an exact preset matches.
+      const speedSel = document.getElementById("replay-speed");
+      if (speedSel && Number.isFinite(speed)) {
+        const match = Array.from(speedSel.options)
+          .find(o => Math.abs(Number(o.value) - speed) < 0.001);
+        if (match && speedSel.value !== match.value) {
+          speedSel.value = match.value;
+        }
+      }
     } else if (_replayActive) {
       _setReplayBadge(false, 0);
+      _setReplayBarVisible(false);
     }
 
     // Out-of-band events (not periodic frames). Backend uses {event: "..."}
@@ -1399,10 +1581,36 @@ function connect() {
     _lastFusedEO      = fusedEO;
     _lastRadarForEO   = radarForEO;
 
+    // ── Lock-mode overlay (gimbal.lock_mode in YAML) ──
+    // gimbal.lock_state is "off" | "active" | "coasting" | "released".
+    // gimbal.lock_bbox_eo / lock_bbox_thermal carry per-sensor pixel
+    // bboxes maintained by the persistent MOSSE tracker. When present,
+    // these take priority over the projected fused-track bbox so the
+    // operator's engaged target stays visually locked across YOLO /
+    // heat / fusion dropouts. The view classes look at the gimbal
+    // payload directly via the parameter we pass through below.
+    const gLock = (msg.gimbal && msg.gimbal.lock_state) ? {
+      state: msg.gimbal.lock_state,
+      bbox_eo: msg.gimbal.lock_bbox_eo || null,
+      bbox_thermal: msg.gimbal.lock_bbox_thermal || null,
+      // v2: target_id used by the view classes to suppress the
+      // duplicate fused-track green box for the engaged target.
+      target_id: (msg.gimbal.lock_target_id != null
+                   ? Number(msg.gimbal.lock_target_id) : null),
+      // Solo render flag. When true AND an engagement is active
+      // (msg.main_target_id != null), the view classes hide every
+      // non-engaged detection + non-engaged fused-track box — only
+      // the engaged target is rendered.
+      solo_mode: !!(msg.gimbal && msg.gimbal.lock_solo_mode),
+      engaged_id: (msg.main_target_id != null
+                    ? Number(msg.main_target_id) : null),
+    } : null;
+    _lastLock = gLock;
+
     // ── Thermal panel ──
     const thermal = msg.thermal || {};
-    thermalView.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
-    if (thermalMini) thermalMini.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
+    thermalView.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal, gLock);
+    if (thermalMini) thermalMini.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal, gLock);
     syncZoomButtons(thermal.zoom_preset);
 
     _tickFrameFps(_thFps, (msg.thermal && msg.thermal.frame_id));
@@ -1415,13 +1623,13 @@ function connect() {
 
     // ── EO panel ──
     const eo = msg.eo || {};
-    eoView.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
+    eoView.update(eo, msg.main_target_id || null, fusedEO, radarForEO, gLock);
     // DEV-tab EO mini — same payload, same overlays. This is what the
     // user watches while tuning the THERMAL AZ/EL extrinsic sliders:
     // a thermal bias shifts the green fused/projected box on the EO
     // image, and the mini shows the slide in real time so the user
     // can lock the box onto the actual target without leaving DEV.
-    if (eoMini) eoMini.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
+    if (eoMini) eoMini.update(eo, msg.main_target_id || null, fusedEO, radarForEO, gLock);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
     // NOTE: do NOT call _tickFrameFps for EO here — the shared
     // "sensors" message strips eo.jpeg_b64 and only refreshes EO

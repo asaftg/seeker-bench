@@ -48,6 +48,17 @@ class PredictorParams:
     # any legitimate human/vehicle target rate at our typical ranges
     # but well below the latency-induced spike envelope.
     vel_clip_dps: float = 30.0
+    # Hysteresis ratio for the settled gate. The settled gate flips
+    # when ``gimbal_dps`` crosses ``gimbal_settled_dps``. With a
+    # single threshold and a noisy gimbal_dps signal that hovers
+    # near the threshold, the gate flips at frame rate — visible in
+    # `night tracking a bit flickery.jsonl` track #6 as a 4.3 Hz
+    # settled<->unsettled oscillation, and as upstream events the
+    # operator perceives as "flickery." With hysteresis_ratio=0.6,
+    # the gate flips OUT of settled at ``settled_dps`` (8 dps default)
+    # but only flips BACK to settled below ``settled_dps * 0.6`` (4.8
+    # dps). 1.0 = legacy (no hysteresis); recommend 0.5–0.7.
+    settled_hysteresis_ratio: float = 0.6
     # Half-life for velocity decay when fresh observations stop
     # arriving. Once `fresh_fused` is False for a tick, world_*_dot is
     # multiplied by exp(-dt / vel_decay_halflife_s) so the cached
@@ -97,6 +108,10 @@ class PredictorState:
     # multiplier per tick rather than re-applying the full age-factor
     # cumulatively.
     last_decay_t: Optional[float] = None
+    # Sticky settled gate. True iff the gimbal was settled on the
+    # previous tick. Used with `settled_hysteresis_ratio` so noise
+    # near the threshold doesn't flip the gate at frame rate.
+    prev_settled: bool = True
 
     def reset(self) -> None:
         self.world_az = None
@@ -111,6 +126,7 @@ class PredictorState:
         self.last_sp_pan = None
         self.last_sp_tilt = None
         self.last_decay_t = None
+        self.prev_settled = True
 
 
 def step(
@@ -166,7 +182,22 @@ def step(
     state.cur_tilt_prev = cur_tilt
     state.cur_pose_prev_t = now
 
-    settled = gimbal_dps < params.gimbal_settled_dps
+    # Settled gate with hysteresis. Flip OUT of settled at
+    # gimbal_settled_dps; flip BACK to settled only after
+    # gimbal_dps drops below settled_dps * hysteresis_ratio. Without
+    # this, gimbal_dps hovering near the threshold (typical when
+    # closed-loop is producing small per-tick steps) made the gate
+    # flip at frame rate — see PredictorParams.settled_hysteresis_ratio.
+    upper = params.gimbal_settled_dps
+    lower = upper * max(0.0, min(1.0, params.settled_hysteresis_ratio))
+    if state.prev_settled:
+        # Sticky-settled: take a fast tick to break out.
+        settled = gimbal_dps < upper
+    else:
+        # Sticky-unsettled: must drop well below the upper threshold
+        # to flip back to settled.
+        settled = gimbal_dps < lower
+    state.prev_settled = settled
 
     obs_world_az: Optional[float] = None
     obs_world_el: Optional[float] = None

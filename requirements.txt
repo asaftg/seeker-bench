@@ -10,7 +10,7 @@ scipy>=1.10,<2.0
 opencv-python>=4.8,<5.0
 
 # Classifier (YOLO) + ByteTrack
-ultralytics>=8.1,<9.0   # pulls in torch, torchvision
+ultralytics>=8.1,<8.2   # pulls in torch, torchvision
 lap>=0.5.12             # linear-assignment solver used by ByteTrack/BoT-SORT
 
 # Web GUI

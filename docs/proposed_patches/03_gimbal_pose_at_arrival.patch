@@ -1,0 +1,85 @@
+From: radar agent #2
+Date: 2026-05-08
+Subject: [PATCH] radar_manager: capture gimbal pose at packet arrival, not at fusion time
+
+`_process_and_publish` reads the gimbal state at line 723, AFTER the
+packet has already been parsed and clustered. With ~10-50 ms between
+packet arrival and clustering completion, and a gimbal slewing at up
+to ~10°/s, the captured pose can be 0.1-0.5° stale relative to the
+chip's actual capture moment. Fusion to EO/thermal then uses a stale
+pose, producing positional offset on the radar overlay.
+
+Fix: capture gimbal pose in the read thread at packet-arrival moment
+(line 631-632), stash it alongside `self._latest_pkt`, and read it
+from the stash in `_process_and_publish`.
+
+---
+ radar/radar_manager.py | 22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/radar/radar_manager.py b/radar/radar_manager.py
+--- a/radar/radar_manager.py
++++ b/radar/radar_manager.py
+@@ -98,6 +98,8 @@ class RadarManager:
+         self._latest_cond = threading.Condition()
+         self._latest_pkt: Optional[RadarPacket] = None
+         self._latest_seq: int = 0
++        # Gimbal pose at packet-arrival moment (≈ chip capture time).
++        self._latest_gimbal_at_capture: Tuple[Optional[float], Optional[float]] = (None, None)
+
+         self._stop = threading.Event()
+         self._reader_thread: Optional[threading.Thread] = None
+@@ -631,9 +633,15 @@ class RadarManager:
+             now = time.monotonic()
+             if chunk:
+                 for pkt in stream.feed(chunk):
++                    # Capture gimbal pose at packet-arrival to bind the
++                    # chip's actual capture moment to fusion downstream.
++                    gs = BUS.get_latest(Topic.GIMBAL)
++                    pan = float(gs.pan_deg) if isinstance(gs, GimbalState) else None
++                    tilt = float(gs.tilt_deg) if isinstance(gs, GimbalState) else None
+                     with self._latest_cond:
+                         self._latest_pkt = pkt
+                         self._latest_seq += 1
++                        self._latest_gimbal_at_capture = (pan, tilt)
+                         self._latest_cond.notify_all()
+                     last_pkt_time = now
+
+@@ -678,8 +686,9 @@ class RadarManager:
+                 while self._latest_seq == last_seen_seq and not self._stop.is_set():
+                     self._latest_cond.wait()
+                 if self._stop.is_set():
+                     break
+                 pkt = self._latest_pkt
+                 last_seen_seq = self._latest_seq
++                gimbal_at_capture = self._latest_gimbal_at_capture
+             if pkt is None:
+                 continue
+             try:
+-                self._process_and_publish(pkt)
++                self._process_and_publish(pkt, gimbal_at_capture)
+             except Exception as e:
+                 log.exception("Radar process loop error: %s", e)
+         log.info("RadarProcess thread stopped")
+
+-    def _process_and_publish(self, pkt: RadarPacket) -> None:
++    def _process_and_publish(self, pkt: RadarPacket,
++                              gimbal_at_capture: Tuple[Optional[float], Optional[float]] = (None, None)) -> None:
+@@ -720,12 +729,9 @@ class RadarManager:
+         self._frame_id += 1
+-        # Bind gimbal pose at frame ingest so fusion can convert to
+-        # world-frame using the pose at capture, not at fusion-tick time.
+-        gs_for_capture = BUS.get_latest(Topic.GIMBAL)
+-        if isinstance(gs_for_capture, GimbalState):
+-            gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
+-            gimbal_tilt_at_capture = float(gs_for_capture.tilt_deg)
+-        else:
+-            gimbal_pan_at_capture = None
+-            gimbal_tilt_at_capture = None
++        # Use the gimbal pose captured at packet arrival (≈ chip capture
++        # time), not the pose at fusion tick. See read_loop for the
++        # capture point.
++        gimbal_pan_at_capture, gimbal_tilt_at_capture = gimbal_at_capture
+         rf = RadarFrame(
+             timestamp=time.time(),
+             frame_id=self._frame_id,

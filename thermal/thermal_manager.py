@@ -146,14 +146,20 @@ class ThermalManager:
         ccfg = cfg.get("classifier", {})
         if enable_classifier and bool(ccfg.get("classifier_hv_enabled", False)):
             try:
-                # imgsz: "auto" = 960 on GPU (better small-target range), 640 on CPU.
+                # imgsz: "auto" = 640. The Boson is 640×512 native, so
+                # letterbox-padding to 640×640 is essentially a no-op
+                # resize. The previous auto-on-GPU value of 960 forced
+                # an UPSAMPLE before inference — ~2.25× the per-call
+                # work without adding any source detail, and shared GPU
+                # contention with the EO YOLO at imgsz=832 dragged
+                # thermal publish down to ~15 Hz. Operators wanting
+                # extra small-target recall can still set
+                # classifier_hv_imgsz: 832 or 960 explicitly in YAML;
+                # the auto path now picks the size the source frame
+                # actually carries information at.
                 _raw_imgsz = ccfg.get("classifier_hv_imgsz", "auto")
                 if isinstance(_raw_imgsz, str) and _raw_imgsz.lower() == "auto":
-                    try:
-                        import torch
-                        _hv_imgsz = 960 if torch.cuda.is_available() else 640
-                    except Exception:
-                        _hv_imgsz = 640
+                    _hv_imgsz = 640
                 else:
                     _hv_imgsz = int(_raw_imgsz)
                 self._classifier_hv = HumanVehicleClassifier(
@@ -183,6 +189,13 @@ class ThermalManager:
                 self._classifier_hv = None
 
         self._thcfg = cfg.get("thermal", {})
+        # JPEG quality for the colormapped display image. Encoded once on
+        # this process thread (see _process_and_publish) so the asyncio
+        # WS sender reuses bytes instead of re-encoding every tick — same
+        # pattern EO uses. Read from gui.thermal_jpeg_quality so the
+        # operator-tunable knob lives in one place.
+        gui_cfg = cfg.get("gui", {})
+        self._thermal_jpeg_quality = int(gui_cfg.get("thermal_jpeg_quality", 80))
         # classify_interval_frames: "auto" adapts to hardware (1 on GPU, 6 on CPU).
         _raw_interval = (cfg.get("classifier", {}) or {}).get("classify_interval_frames", "auto")
         if isinstance(_raw_interval, str) and _raw_interval.lower() == "auto":
@@ -224,6 +237,31 @@ class ThermalManager:
         self._frame_id = 0
         self._last_classifications = None  # cache between classifier runs
         self._last_hv_dets: list = []      # cached h/v full-frame detections
+
+        # MOSSE per-track correlation tracker for thermal HV ByteTrack
+        # IDs. Same architecture as EOManager: pool runs at frame rate,
+        # reseeds on every classifier tick, fills the gap between with
+        # appearance-based correlation. Operator complaint: bboxes
+        # vanish on thermal-engaged targets during fast slews / motion
+        # blur. ByteTrack's Kalman alone can't recover when YOLO drops
+        # detections entirely.
+        # Caveats vs EO: thermal targets often smaller (10-30 px) and
+        # less internally textured (hot blobs without sharp edges) →
+        # MOSSE PSR is typically lower on thermal. Operator may need
+        # to drop psr_lost from 7 to 5 for thermal specifically.
+        from vision.correlation_tracker_set import (
+            CorrelationTrackerSet, CorrelationTrackerSetConfig)
+        ct_cfg = (cfg.get("thermal", {}).get("correlation_tracker") or {})
+        self._mosse_pool = CorrelationTrackerSet(
+            CorrelationTrackerSetConfig(
+                enabled=bool(ct_cfg.get("enabled", False)),
+                psr_lost=float(ct_cfg.get("psr_lost", 5.0)),  # looser default
+                lost_frames=int(ct_cfg.get("lost_frames", 5)),
+                learning_rate=float(ct_cfg.get("learning_rate", 0.125)),
+                sigma=float(ct_cfg.get("sigma", 2.0)),
+                max_patch_dim=int(ct_cfg.get("max_patch_dim", 96)),
+            )
+        )
 
         # Latest-frame handoff from capture thread to process thread.
         # The capture thread drains the camera as fast as it can and
@@ -491,6 +529,11 @@ class ThermalManager:
             display_full = frame
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             raw16_full = gray.astype(np.uint16, copy=False)
+            # AGC-fallback path: the YUY2 camera already gave us a
+            # display-stretched uint8, so reuse it as the agc8 input
+            # for the heat detector below — same dedup intent as the
+            # raw16 path.
+            _agc8 = gray
             # Camera fell back to AGC8/YUY2 — we only have a uint8 BGR
             # already. Apply the post-AGC enhancement chain to the gray
             # channel and re-colormap so the operator sees the same
@@ -503,9 +546,13 @@ class ThermalManager:
                 display_full = frame
 
         # ── 2. Detect on the full frame ────────────────────────────
+        # Pass _agc8 (the already-AGC'd uint8) through to skip a
+        # duplicate percentile + cast inside HeatDetector. Saves ~8 ms
+        # per frame on a 640×512 Boson; lifts publish 15 Hz → ~18-19 Hz
+        # on multi-target scenes. See thermal-pipeline audit 2026-05-04.
         detections = []
         try:
-            detections = self._detector.detect(raw16_full)
+            detections = self._detector.detect(raw16_full, agc8=_agc8)
         except Exception as e:
             log.warning("Heat detector failed: %s", e)
 
@@ -680,6 +727,48 @@ class ThermalManager:
                     for d in hv_dets
                     if int(d.get("track_id", -1)) >= 0
                 ]
+                # Reseed the MOSSE pool on every fresh classifier
+                # output. YOLO ground truth corrects any drift the
+                # pool accumulated between classifier ticks.
+                if self._mosse_pool.enabled:
+                    from vision.correlation_tracker_set import DetectorHit
+                    hits = [
+                        DetectorHit(
+                            track_id=int(trk["id"]),
+                            bbox_xywh=tuple(int(v) for v in trk["bbox"]),
+                        )
+                        for trk in self._hv_tracks
+                    ]
+                    self._mosse_pool.on_detector_tick(
+                        display, hits, self._frame_id)
+            elif self._mosse_pool.enabled and self._hv_tracks:
+                # Between classifier ticks, run MOSSE on every active
+                # ByteTrack ID to update its bbox at FRAME RATE. ID,
+                # class, conf flow through unchanged from the last
+                # classifier output; only the bbox is corrected.
+                # Tracks the pool prunes (PSR < threshold for
+                # lost_frames) are removed from _hv_tracks so the
+                # downstream merge logic doesn't republish stale
+                # bboxes for vanished targets.
+                pool_out = self._mosse_pool.on_frame(
+                    display, self._frame_id)
+                kept = []
+                for trk in self._hv_tracks:
+                    tid = int(trk["id"])
+                    if tid in pool_out.bboxes:
+                        trk["bbox"] = tuple(int(v)
+                                             for v in pool_out.bboxes[tid])
+                        kept.append(trk)
+                    elif tid in pool_out.pruned:
+                        # Drop this track — pool says target is lost.
+                        continue
+                    else:
+                        # Pool didn't know about it (e.g. ID was
+                        # filtered out at reseed because bbox went
+                        # off-frame). Keep the stale entry; ByteTrack
+                        # may revive it on the next classifier tick.
+                        kept.append(trk)
+                self._hv_tracks = kept
 
             # Merge CONFIRMED h/v tracks into detections on EVERY frame
             # (not just classifier ticks) so overlays don't flicker.
@@ -742,6 +831,23 @@ class ThermalManager:
                     ))
 
         # ── 6. Publish ─────────────────────────────────────────────
+        # Encode the colormapped display once, on this thread. The shared
+        # WS _sender's thermal_to_wire reuses these bytes; without the
+        # cache it re-encodes the same frame every tick (~10-15 ms on a
+        # 640x512 Boson at q=80) and pins all GUI panels to ~7-9 Hz.
+        jpeg_bytes_cache: Optional[bytes] = None
+        if display is not None:
+            try:
+                ok, buf = cv2.imencode(
+                    ".jpg", display,
+                    [cv2.IMWRITE_JPEG_QUALITY, int(self._thermal_jpeg_quality)],
+                )
+                if ok:
+                    jpeg_bytes_cache = bytes(buf)
+            except Exception as e:
+                log.warning("Thermal JPEG encode failed (frame_id=%d): %s",
+                            self._frame_id, e)
+                jpeg_bytes_cache = None
         tf = ThermalFrame(
             timestamp=ts,
             frame_id=self._frame_id,
@@ -755,6 +861,8 @@ class ThermalManager:
             heat_tracks=heat_tracks_debug,
             gimbal_pan_at_capture=gimbal_pan_at_capture,
             gimbal_tilt_at_capture=gimbal_tilt_at_capture,
+            jpeg_bytes=jpeg_bytes_cache,
+            jpeg_quality=int(self._thermal_jpeg_quality),
         )
         BUS.publish(Topic.THERMAL, tf)
 

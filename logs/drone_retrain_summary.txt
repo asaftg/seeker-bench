@@ -1,7 +1,0 @@
-Drone retrain summary
-=====================
-zips processed:        1
-prep succeeded:        True
-training succeeded:    False
-model promoted to:     C:\Users\asaf.ruf.BLUERIVERTECH\Desktop\Seeker01\seeker_bench\models\seeker_thermal.pt
-full log:              C:\Users\asaf.ruf.BLUERIVERTECH\Desktop\Seeker01\seeker_bench\logs\drone_retrain.log

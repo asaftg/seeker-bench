@@ -28,6 +28,14 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+
+import sys as _sys
+def _imx_pick_backend():
+    if _sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    if _sys.platform.startswith("win"):
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
 from common.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -57,6 +65,7 @@ _FOURCC_CANDIDATES: list[Optional[str]] = ["YUY2", None]
 # DSHOW alone avoids a per-reconnect 100 ms × N-indices stall we'd
 # otherwise eat probing dead backends every few seconds.
 _BACKEND_CANDIDATES: list[tuple[int, str]] = [
+    (cv2.CAP_V4L2, "V4L2"),   # Jetson/Linux first
     (cv2.CAP_DSHOW, "DSHOW"),
 ]
 
@@ -407,7 +416,7 @@ def _set_uvc_manual_exposure(
     """
     result: dict = {}
     try:
-        cap = cv2.VideoCapture(int(device_index), cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(int(device_index), _imx_pick_backend())
     except Exception as e:
         result["open_error"] = repr(e)
         return result
@@ -469,6 +478,40 @@ def _set_leopard_exposure_ext(
     the SDK session before returning; the FX3 retains the manual-exposure
     state across that close, and PyAV can immediately reopen the device.
     """
+    # ---------- Linux branch via UVC XU (leopard_linux) ----------
+    # Same wire protocol as the Windows DLL (Leopard FX3 vendor XU,
+    # unit=3). Selectors discovered on this firmware: 0x06 = ExposureExt
+    # (u16 LE), 0x0d = gain (8B). The FX3 firmware silently ignores
+    # repeat writes of the same value, so we use the documented
+    # decoy-write workaround.
+    import sys as _sys
+    if _sys.platform.startswith("linux"):
+        try:
+            import time as _time
+            from eo.leopard_linux import LeopardLinux as _LL, _SIZES as _LS
+            _LS[0x06] = 2; _LS[0x0d] = 8
+            _last = getattr(_set_leopard_exposure_ext, "_last_exp", None)
+            decoy = 100 if _last != 100 else 200
+            tgt = int(exposure_ext)
+            cam = _LL("/dev/video0")
+            try:
+                cam._xu_write(0x06, decoy.to_bytes(2, "little"))
+                _time.sleep(0.05)
+                cam._xu_write(0x06, tgt.to_bytes(2, "little"))
+                if gain is not None:
+                    g = int(gain) & 0xffff
+                    cam._xu_write(0x0d, (g.to_bytes(2, "little")) * 4)
+                rb = int.from_bytes(cam._xu_read(0x06), "little")
+            finally:
+                cam.close()
+            _set_leopard_exposure_ext._last_exp = tgt
+            return {"linux_xu": True, "exposure_ext_set": tgt,
+                    "exposure_ext_readback": rb,
+                    "gain_set": gain, "ae_off": ae_off}
+        except Exception as _e:
+            return {"linux_xu_failed": repr(_e), "exposure_ext_set": int(exposure_ext)}
+    # ---------- end Linux branch ----------
+
     import json as _json
     import os as _os
     import subprocess as _subprocess
@@ -840,6 +883,49 @@ class IMX568Capture:
                     "PyAV: no IMX568/Leopard/FX3 device found in dshow "
                     "device list — falling back to OpenCV",
                 )
+
+        # ── Linux RAW V4L2 path (Linux mirror of Windows PyAV-DSHOW
+        # raw-YUY2 trick from commit 540846d). cv2.CAP_V4L2 + CAP_PROP_
+        # CONVERT_RGB=0 is silently ignored on this OpenCV build (same
+        # firmware bug DSHOW had on Windows), so we go around OpenCV
+        # entirely via direct V4L2 mmap ioctls. The grab() byte-slice
+        # path then extracts a clean mono Y plane with full 0..255
+        # dynamic range — no green-tint dead zone in Y∈[120,179].
+        import sys as _sys_lin
+        import os as _os_lin
+        if _sys_lin.platform.startswith("linux"):
+            try:
+                from eo._v4l2_raw_backend import RawV4L2Backend
+                for _dev in ("/dev/video0", "/dev/video1"):
+                    if not _os_lin.path.exists(_dev):
+                        continue
+                    v4l2cap = RawV4L2Backend(_dev, NATIVE_W, NATIVE_H)
+                    if not v4l2cap.open():
+                        v4l2cap.release()
+                        continue
+                    ok, _test = v4l2cap.read()
+                    if (ok and _test is not None
+                            and _test.ndim == 2
+                            and _test.shape == (NATIVE_H, 2 * NATIVE_W)):
+                        self._cap = v4l2cap  # type: ignore[assignment]
+                        self.device_index = 0
+                        self.actual_width = NATIVE_W
+                        self.actual_height = NATIVE_H
+                        self._fourcc = "YUY2"
+                        self._raw_yuy2_mode = True
+                        self._sw_ae_enabled = False
+                        log.info(
+                            "IMX568Capture mode: RAW_V4L2_YUY2 on %s "
+                            "(clean mono Y, no DSHOW dead-zone recovery)",
+                            _dev,
+                        )
+                        return
+                    v4l2cap.release()
+                log.info("Linux RawV4L2Backend could not produce raw YUY2 "
+                         "frame — falling back to cv2.CAP_V4L2 BGR path")
+            except Exception as _e_v4l2:
+                log.info("Linux RawV4L2Backend init threw %r — "
+                         "falling back to cv2.CAP_V4L2", _e_v4l2)
 
         candidates = self._candidate_indices()
         last_err: Optional[str] = None

@@ -396,14 +396,38 @@ class EOManager:
                 _imgsz = 640
             else:
                 _imgsz = int(_raw_imgsz)
+            # Per-class conf overrides — see app_config.yaml `classes_conf`.
+            # When set, conf_threshold becomes the FLOOR (model receives
+            # min(thresholds) at predict time) and per-class filtering
+            # happens after. Lets us keep drone permissive (small hard
+            # targets) while keeping person/vehicle strict (FP-prone on
+            # streetlights/poles).
+            _classes_conf = ccfg.get("classes_conf") or {}
+            # Tiled (SAHI) inference config. See vision/sahi_inference.py.
+            _tiling_cfg = ccfg.get("tiling") or {}
+            self._tiling_enabled: bool = bool(_tiling_cfg.get("enabled", False))
+            self._tiling_grid: tuple[int, int] = tuple(
+                _tiling_cfg.get("grid", [2, 2])
+            )
+            self._tiling_overlap_frac: float = float(
+                _tiling_cfg.get("overlap_frac", 0.25)
+            )
+            self._tiling_merge_iou: float = float(
+                _tiling_cfg.get("merge_iou", 0.5)
+            )
             try:
                 self._classifier = EOClassifier(
                     fallback_model_path=str(ccfg.get("model", "models/yolov8n.pt")),
                     conf_threshold=self._conf_threshold,
                     imgsz=_imgsz,
+                    per_class_conf=_classes_conf if _classes_conf else None,
                 )
-                log.info("EO classifier loaded (active=%s, imgsz=%d, conf=%.2f)",
-                         self._classifier.active, _imgsz, self._conf_threshold)
+                log.info(
+                    "EO classifier loaded (active=%s, imgsz=%d, conf=%.2f, "
+                    "per_class_conf=%s)",
+                    self._classifier.active, _imgsz, self._conf_threshold,
+                    _classes_conf or "(none)",
+                )
             except Exception as e:
                 log.warning("EO classifier init failed: %s", e)
                 self._classifier = None
@@ -417,6 +441,27 @@ class EOManager:
         # Last ByteTrack detection list; republished every frame between
         # classifier ticks so overlays don't flicker.
         self._last_dets: list[dict] = []
+
+        # MOSSE correlation tracker pool — runs at frame rate to keep
+        # bboxes alive between YOLO ticks. ByteTrack's Kalman coast
+        # only handles motion; MOSSE handles APPEARANCE-based tracking,
+        # i.e. when YOLO's confidence dies due to motion blur during a
+        # gimbal slew but the target is still visibly there. See
+        # vision/mosse_tracker.py for algorithm. Disabled by default
+        # while the integration matures; flip the YAML knob to enable.
+        from vision.correlation_tracker_set import (
+            CorrelationTrackerSet, CorrelationTrackerSetConfig)
+        ct_cfg = (cfg.get("eo", {}).get("correlation_tracker") or {})
+        self._mosse_pool = CorrelationTrackerSet(
+            CorrelationTrackerSetConfig(
+                enabled=bool(ct_cfg.get("enabled", False)),
+                psr_lost=float(ct_cfg.get("psr_lost", 7.0)),
+                lost_frames=int(ct_cfg.get("lost_frames", 5)),
+                learning_rate=float(ct_cfg.get("learning_rate", 0.125)),
+                sigma=float(ct_cfg.get("sigma", 2.0)),
+                max_patch_dim=int(ct_cfg.get("max_patch_dim", 96)),
+            )
+        )
 
         # Optical-pose-feedback state. Used to detect when the published
         # gimbal pose advances WITHOUT the camera physically moving (lazy
@@ -466,6 +511,12 @@ class EOManager:
         self._cls_in_pending: Optional[tuple[int, np.ndarray]] = None
         self._cls_out_lock = threading.Lock()
         self._cls_out_dets: list[dict] = []
+        # One-shot signal: True the first publish-tick that reads a
+        # fresh classifier result (worker just finished). Process
+        # thread consumes/clears it. Lets the MOSSE pool distinguish
+        # "reseed on YOLO ground truth" from "interpolate between
+        # ticks" without burning a sequence number.
+        self._cls_out_dets_fresh_flag: bool = False
         self._cls_out_fid: int = -1
 
         # Source lifecycle lock. Held during set_device / set_exposure_ext
@@ -1165,7 +1216,40 @@ class EOManager:
             if self._classifier is None:
                 continue
             try:
-                raw = self._classifier.track(frame)
+                if self._tiling_enabled:
+                    # Tiled (SAHI) path: native frame in, per-tile
+                    # batched predict, global NMS, returned as plain
+                    # detections (no ByteTrack IDs — MOSSE pool below
+                    # owns continuity for tiled output).
+                    from vision.sahi_inference import tiled_predict
+                    raw = tiled_predict(
+                        self._classifier._hv._model,
+                        frame,
+                        grid=self._tiling_grid,
+                        overlap_frac=self._tiling_overlap_frac,
+                        imgsz=self._classifier._hv.imgsz,
+                        conf=self._classifier._hv.conf_threshold,
+                        merge_iou=self._tiling_merge_iou,
+                        per_class_conf=self._classifier._hv.per_class_conf
+                            or None,
+                    )
+                    # Tiled path doesn't carry ByteTrack IDs (the
+                    # tracker can't reason across tile-frames sensibly).
+                    # MOSSE pool uses track_id as a dict key, so we
+                    # synthesize unique monotonically-decreasing IDs.
+                    # Each tile-tick spawns fresh MOSSE trackers; old
+                    # ones decay via max_misses. Acceptable churn —
+                    # the alternative (per-frame IoU-keyed re-ID) is a
+                    # full mini-tracker that would replicate ByteTrack's
+                    # job. If this churn shows up as MOSSE-pool memory
+                    # growth, we add an LRU cap on the pool size.
+                    if not hasattr(self, "_tile_id_seq"):
+                        self._tile_id_seq = -100000
+                    for d in raw:
+                        self._tile_id_seq -= 1
+                        d.setdefault("track_id", self._tile_id_seq)
+                else:
+                    raw = self._classifier.track(frame)
             except Exception as e:
                 log.warning("EO async inference failed (fid=%d): %s", fid, e)
                 continue
@@ -1179,6 +1263,7 @@ class EOManager:
             with self._cls_out_lock:
                 self._cls_out_dets = dets
                 self._cls_out_fid = fid
+                self._cls_out_dets_fresh_flag = True
         log.info("EOManager classify thread stopped")
 
     # ───────────────────────── pipeline ──────────────────────────────
@@ -1208,13 +1293,24 @@ class EOManager:
 
         # 0. IMX568 pipeline: downscale → AGC → profile switching.
         #
-        # Downscale FIRST. Every subsequent operation scales with pixel
-        # count; halving width quarters the per-frame cost of AGC, YOLO's
-        # internal letterbox, and the JPEG encode the GUI bridge runs.
-        # At ~1236 px wide the detail available at 250 m is still far more
-        # than thermal or radar can contribute, so we lose nothing useful.
+        # Downscale FIRST for display/JPEG-encode. Every subsequent
+        # operation scales with pixel count; halving width quarters
+        # the per-frame cost of AGC, JPEG encode, JSONL recording.
+        #
+        # 2026-05-08: when tiled inference is enabled, we keep the
+        # NATIVE frame around to feed the tiled classifier — that's
+        # the whole point of tiling (give YOLO native pixels for
+        # long-distance targets). Display path still uses 1236-wide.
+        # The native frame is NOT cached past _process_and_publish,
+        # so memory cost is one extra 2472×2064×3 ≈ 15 MB per tick.
+        native_frame: Optional[np.ndarray] = None
         if self._sensor_backend == "imx568":
             if self._display_max_width > 0 and frame.shape[1] > self._display_max_width:
+                if self._tiling_enabled:
+                    # Hold a reference to the native frame for the
+                    # classifier path — no copy, the downscale below
+                    # produces a NEW buffer so this stays valid.
+                    native_frame = frame
                 scale = self._display_max_width / float(frame.shape[1])
                 new_w = self._display_max_width
                 new_h = int(round(frame.shape[0] * scale))
@@ -1330,13 +1426,60 @@ class EOManager:
                 # Single-slot: if a frame is still pending, drop it.
                 # The newer one is fresher and ByteTrack persist=True
                 # handles the gap. Notify wakes the worker.
-                self._cls_in_pending = (self._frame_id, frame)
+                #
+                # When tiling is enabled, hand the classifier the
+                # NATIVE 2472×2064 frame so per-tile inference gets
+                # full sensor resolution. Otherwise hand it the
+                # already-downscaled 1236-wide display frame.
+                cls_input = native_frame if (self._tiling_enabled and
+                                              native_frame is not None) else frame
+                self._cls_in_pending = (self._frame_id, cls_input)
                 self._cls_in_cond.notify()
         # Publish the worker's latest result (or empty list before any
         # result has come back). Coasting between worker updates is
         # the same coasting behaviour the synchronous path used to do.
         with self._cls_out_lock:
             self._last_dets = list(self._cls_out_dets)
+            # Note whether THIS tick produced fresh classifier output
+            # (so MOSSE can reseed on it instead of just running update).
+            fresh_dets_this_tick = bool(self._cls_out_dets_fresh_flag)
+            self._cls_out_dets_fresh_flag = False
+
+        # ── Frame-rate MOSSE pool ────────────────────────────────
+        # When YOLO is throttled (or its confidence drops during a
+        # gimbal slew), `_last_dets` carries STALE bboxes from N frames
+        # ago. The pool runs MOSSE on each ByteTrack ID every frame to
+        # provide fresh, frame-rate per-target bboxes. On classifier
+        # ticks: reseed each tracker on the new YOLO bbox (kills drift).
+        # Between classifier ticks: tracker output replaces the stale
+        # bbox in _last_dets. ByteTrack ID, conf, and class are
+        # preserved — only the bbox is corrected by MOSSE.
+        if self._mosse_pool.enabled and self._last_dets:
+            from vision.correlation_tracker_set import DetectorHit
+            if fresh_dets_this_tick:
+                hits = []
+                for d in self._last_dets:
+                    raw_tid = d.get("track_id")
+                    if raw_tid is None or int(raw_tid) < 0:
+                        continue
+                    bx, by, bw, bh = d["bbox"]
+                    hits.append(DetectorHit(
+                        track_id=int(raw_tid),
+                        bbox_xywh=(int(bx), int(by), int(bw), int(bh)),
+                    ))
+                pool_out = self._mosse_pool.on_detector_tick(
+                    frame, hits, self._frame_id)
+            else:
+                pool_out = self._mosse_pool.on_frame(frame, self._frame_id)
+            # Override stale bboxes with MOSSE's frame-rate output.
+            # IDs the pool dropped (lost streak) silently leave
+            # _last_dets untouched — fusion's max_misses handles them.
+            for d in self._last_dets:
+                tid = d.get("track_id")
+                if tid is None or int(tid) < 0:
+                    continue
+                if int(tid) in pool_out.bboxes:
+                    d["bbox"] = pool_out.bboxes[int(tid)]
 
         # 2. Republish last detection list every frame so overlays hold
         #    steady between YOLO ticks. ByteTrack's internal Kalman
@@ -1455,29 +1598,39 @@ class EOManager:
                         and bus_pan is not None and bus_tilt is not None
                         and self._prev_bus_pan is not None
                         and self._prev_bus_tilt is not None):
-                    # phaseCorrelate returns (dx, dy) of CURR relative
-                    # to PREV (positive dx = image moved right).
-                    # Camera motion is opposite the image content motion.
-                    sh = cv2.phaseCorrelate(self._prev_frame_small,
-                                             small_gray)
-                    dx_px, dy_px = sh[0]
-                    nh, nw = small_gray.shape
-                    # Downsampled FOV → deg/px on the small image.
-                    deg_per_px_h = self._hfov / float(nw)
-                    deg_per_px_v = self._vfov / float(nh)
-                    # Camera pan-right shifts content left, so dpan = -dx*deg/px.
-                    # Camera tilt-up shifts content down, so dtilt = +dy*deg/px.
-                    dpan_optical = -float(dx_px) * deg_per_px_h
-                    dtilt_optical = float(dy_px) * deg_per_px_v
                     bus_dpan = bus_pan - self._prev_bus_pan
                     bus_dtilt = bus_tilt - self._prev_bus_tilt
-                    # Reject BUS updates that aren't backed by optics.
+                    # phaseCorrelate is ~3 ms per call on a 256-wide
+                    # downsample. The override below only fires when
+                    # |bus_d*| > bus_motion_min_deg, so on a static
+                    # gimbal (the common case) the phaseCorrelate
+                    # output is computed and discarded. Skip it when
+                    # neither axis crossed the motion gate. We still
+                    # update self._prev_frame_small below so the very
+                    # next frame after motion-start has a fresh prev.
                     if (abs(bus_dpan) > self._bus_motion_min_deg
-                            and abs(dpan_optical) < self._optical_confirm_deg):
-                        gimbal_pan_at_capture = self._prev_bus_pan
-                    if (abs(bus_dtilt) > self._bus_motion_min_deg
-                            and abs(dtilt_optical) < self._optical_confirm_deg):
-                        gimbal_tilt_at_capture = self._prev_bus_tilt
+                            or abs(bus_dtilt) > self._bus_motion_min_deg):
+                        # phaseCorrelate returns (dx, dy) of CURR relative
+                        # to PREV (positive dx = image moved right).
+                        # Camera motion is opposite the image content motion.
+                        sh = cv2.phaseCorrelate(self._prev_frame_small,
+                                                 small_gray)
+                        dx_px, dy_px = sh[0]
+                        nh, nw = small_gray.shape
+                        # Downsampled FOV → deg/px on the small image.
+                        deg_per_px_h = self._hfov / float(nw)
+                        deg_per_px_v = self._vfov / float(nh)
+                        # Camera pan-right shifts content left, so dpan = -dx*deg/px.
+                        # Camera tilt-up shifts content down, so dtilt = +dy*deg/px.
+                        dpan_optical = -float(dx_px) * deg_per_px_h
+                        dtilt_optical = float(dy_px) * deg_per_px_v
+                        # Reject BUS updates that aren't backed by optics.
+                        if (abs(bus_dpan) > self._bus_motion_min_deg
+                                and abs(dpan_optical) < self._optical_confirm_deg):
+                            gimbal_pan_at_capture = self._prev_bus_pan
+                        if (abs(bus_dtilt) > self._bus_motion_min_deg
+                                and abs(dtilt_optical) < self._optical_confirm_deg):
+                            gimbal_tilt_at_capture = self._prev_bus_tilt
 
                 self._prev_frame_small = small_gray
                 # Remember what we ACCEPTED as the bus pose so the next

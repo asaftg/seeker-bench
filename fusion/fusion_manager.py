@@ -1024,21 +1024,26 @@ class FusionManager:
             except ValueError:
                 tc = TargetClass.UNKNOWN
             # Convert track-stored world az/el back to camera frame for
-            # the published FusedTrack. Prefer the per-track last-
-            # observed stamped pose (optically-confirmed; doesn't lie
-            # when servo deadband eats commands) over self._cur_gimbal_pose
-            # (which mirrors the published gimbal/state — affected by the
-            # same lazy-servo lie). For tracks that have NOT had a fresh
-            # observation in this tick, this is the pose at THEIR last
-            # observation — which corresponds to the actual pixel
-            # position the bbox was last seen at; better than recomputing
-            # against a possibly-lying current pose.
-            tpan = trk.get("last_obs_pose_pan")
-            ttilt = trk.get("last_obs_pose_tilt")
-            if tpan is None: tpan = cur_pan
-            if ttilt is None: ttilt = cur_tilt
-            pub_az = float(trk["az"]) - tpan
-            pub_el = float(trk["el"]) - ttilt
+            # the published FusedTrack using the LATEST gimbal pose at
+            # publish time. With the V2 driver this is the encoder-
+            # measured pose published by gimbal_manager (truthful), so
+            # the published cam-frame az/el follows the actual camera
+            # angle smoothly between observations.
+            #
+            # Earlier (commit bcc3d58) this used the per-track
+            # last_obs_pose_pan/tilt to defend against V1's lying
+            # commanded pose. That fix kept pub_az static between
+            # observations and SNAPPED on every fresh obs as the
+            # stamped pose updated to match the current obs's pose
+            # — visible as 6-7° cam_az teleports on `tracker 532026.jsonl`
+            # track #11 even though world_az was moving smoothly. With
+            # encoder feedback, the BUS-published pose IS truth, so
+            # using the latest pose at publish gives a smoothly tracking
+            # bbox per-tick. The per-track stamps are still RECORDED on
+            # the track dict for downstream debugging but no longer
+            # drive the published cam frame.
+            pub_az = float(trk["az"]) - cur_pan
+            pub_el = float(trk["el"]) - cur_tilt
             # Also publish world-frame az/el directly. Consumers needing
             # world coords (gimbal_manager's predictor) read these to
             # avoid the (cur_pan + cam_az) round-trip, which leaks the

@@ -12,6 +12,7 @@ single process. Flags:
 from __future__ import annotations
 
 import argparse
+import atexit
 import signal
 import sys
 import threading
@@ -23,6 +24,7 @@ import uvicorn
 
 from common.config import load_config
 from common.frame_bus import BUS
+from common.frames import Topic
 from common.logging_setup import configure, get_logger
 from eo.eo_manager import EOManager
 from fusion.fusion_manager import FusionManager
@@ -50,6 +52,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
     p.add_argument("--no-gimbal", action="store_true", help="Disable gimbal (Maestro servo controller)")
     p.add_argument("--no-radar", action="store_true", help="Disable radar (AWR2944P)")
+    p.add_argument("--no-aa", action="store_true",
+                   help="Skip the DCA1000 raw-ADC (A/A / PMM) pipeline. "
+                        "TLV path (Topic.RADAR) still runs; only the "
+                        "DCAPipeline thread is suppressed. Diagnostic flag "
+                        "for isolating GUI lag — the range-FFT worker is "
+                        "GIL-heavy and competes with the asyncio loop.")
+    p.add_argument(
+        "--radar-firmware",
+        choices=["demoDDM"],
+        default="demoDDM",
+        help="Radar firmware backend. Single supported mode: chip runs "
+             "TI's mmw_demoDDM (or our patched fork). Chip emits TLV "
+             "(humans/vehicles via on-chip CFAR) AND raw ADC over LVDS "
+             "(host PMM for drones) simultaneously. Other modes (studio, "
+             "studio-py, external) deprecated -- they bypassed the TLV "
+             "consumer and broke human/vehicle detection.",
+    )
     p.add_argument("--host", default=None, help="GUI bind host")
     p.add_argument("--port", type=int, default=None, help="GUI bind port")
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser")
@@ -179,6 +198,23 @@ def main() -> int:
         fusion = FusionManager()
         fusion.start()
 
+    # Start gimbal manager early — independent of every other sensor and
+    # we don't want it blocked by long downstream startups (the radar
+    # path's mmW Studio bring-up waits up to 90 s for the first DCA1000
+    # packet on UDP:4098, which previously starved the gimbal of any
+    # initialization until that wait completed or timed out — visible
+    # in seeker.log as "Studio launched ... Waiting for first DCA1000
+    # packet" with NO subsequent "GimbalManager started" line).
+    gimbal: GimbalManager | None = None
+    gimbal_cfg = (cfg.get("gimbal") or {})
+    if not args.no_gimbal and bool(gimbal_cfg.get("enabled", True)):
+        try:
+            gimbal = GimbalManager()
+            gimbal.start()
+        except Exception as e:
+            log.warning("Gimbal manager failed to start: %s — continuing without gimbal", e)
+            gimbal = None
+
     # Start radar manager — optional. Degrades gracefully if the EVM
     # is absent (publishes connected=false sentinel; GUI shows DISCONNECTED).
     radar: RadarManager | None = None
@@ -221,10 +257,20 @@ def main() -> int:
                 speed_min_mps=float(radar_cfg.get("speed_min_mps", 0.0)),
                 range_min_m=float(radar_cfg.get("range_min_m", 0.0)),
                 profile_name=str(radar_cfg.get("profile_name", "awr2944p_ddm")),
+                # 0 disables the legacy "no TLV → reconnect" path; the
+                # unified cfg's lvdsStreamCfg suppresses UART TLV on
+                # this firmware so the timeout would fire forever and
+                # the reconnect would stomp LVDS.
+                stream_timeout_s=float(radar_cfg.get("stream_timeout_s", 3.0)),
                 cluster_params=cluster_params,
                 az_bias_deg=float(_ext.get("az_bias_deg", 0.0)),
                 el_bias_deg=float(_ext.get("el_bias_deg", 0.0)),
             )
+            # demoDDM mode: RadarManager owns the chip via UART CLI
+            # (cfg push, sensorStart, TLV consumer producing the
+            # humans/vehicles target list on Topic.RADAR). Always start
+            # it -- skipping this is what broke detection in the prior
+            # external/studio modes.
             radar.start()
             # Phase 3: build the composite that wraps RadarManager + the
             # DCA1000 raw-ADC pipeline. The composite owns mode dispatch
@@ -237,7 +283,12 @@ def main() -> int:
                 _dca_control = None
                 _dca_listener = None
                 _dca_pipeline = None
-                if bool(_dca.get("enabled", True)):
+                _dca_enabled = bool(_dca.get("enabled", True)) and not args.no_aa
+                if args.no_aa:
+                    log.info("--no-aa: skipping DCA1000 raw-ADC pipeline "
+                             "(diagnostic mode — Topic.RADAR_AA will be "
+                             "absent; TLV radar path unaffected)")
+                if _dca_enabled:
                     _host_ip = str(_dca.get("host_ip", "192.168.33.30"))
                     _dca_ip = str(_dca.get("dca_ip", "192.168.33.180"))
                     _cfg_port = int(_dca.get("config_port", 4096))
@@ -270,20 +321,24 @@ def main() -> int:
                             "falling back to hard-coded defaults", e,
                         )
                         _dims = dims_from_cfg()
+                    # New DCAPipeline owns its own per-mode defaults; the
+                    # composite calls set_mode/set_params after start() to
+                    # activate the operator's saved knobs from radar_modes.json.
+                    #
+                    # pmm_only=True: in hybrid demoDDM mode the chip's
+                    # on-chip CFAR provides humans/vehicles via TLV
+                    # (RadarManager + Topic.RADAR). DCAPipeline only
+                    # needs to do PMM for drones on raw ADC -- skipping
+                    # Stage 3 (Doppler FFT) + Stage 4 (CFAR/AoA) +
+                    # tracker frees CPU and avoids the host-side
+                    # AoA-without-DDMA-unfold bug.
                     _dca_pipeline = DCAPipeline(
                         listener=_dca_listener,
                         dims=_dims,
-                        pmm_band_low_hz=50.0,
-                        pmm_band_high_hz=500.0,
-                        # 18 dB default per pmm_detector docstring.
-                        # Earlier values (6 dB, 12 dB) tracked the
-                        # post-Hann-guard noise floor — see the
-                        # detector's threshold_db docstring for the
-                        # 2026-04-29 drill-test analysis.
-                        pmm_threshold_db=18.0,
                         profile_name="awr2944p_unified",
                         max_range_m=float(radar_cfg.get("max_range_m", 250.0)),
                         az_half_deg=float(radar_cfg.get("az_half_deg", 60.0)),
+                        pmm_only=True,
                     )
                 # Build composite. start() is idempotent; the inner
                 # RadarManager.start() above is also called inside, but
@@ -294,8 +349,25 @@ def main() -> int:
                     dca_listener=_dca_listener,
                     dca_pipeline=_dca_pipeline,
                     initial_mode="stock",
+                    radar_firmware=args.radar_firmware,
                 )
-                composite.start()
+                # Run composite.start() in a daemon thread. The mmW
+                # Studio bring-up inside it waits up to 90 s for the
+                # first DCA1000 packet on UDP:4098 — historically
+                # blocked main.py from reaching GUI startup until the
+                # wait completed or timed out. Composite construction
+                # above is non-blocking, so `radar = composite` is
+                # safe to assign IMMEDIATELY; create_app downstream
+                # gets a valid reference even if the chip bring-up is
+                # still in progress when the GUI binds. The composite
+                # publishes connected=False sentinels until the DCA
+                # path is alive — same UX as a missing EVM.
+                _comp_starter = threading.Thread(
+                    target=composite.start,
+                    name="composite_start",
+                    daemon=True,
+                )
+                _comp_starter.start()
                 # Use composite as THE radar reference everywhere — it
                 # exposes the same set_tuning/set_extrinsic/diagnostics
                 # surface as RadarManager and additionally drives mode.
@@ -346,17 +418,8 @@ def main() -> int:
             log.warning("Radar manager failed to start: %s — continuing without radar", e)
             radar = None
 
-    # Start gimbal manager — optional. Degrades gracefully if the
-    # Maestro isn't plugged in (publishes connected=false state).
-    gimbal: GimbalManager | None = None
-    gimbal_cfg = (cfg.get("gimbal") or {})
-    if not args.no_gimbal and bool(gimbal_cfg.get("enabled", True)):
-        try:
-            gimbal = GimbalManager()
-            gimbal.start()
-        except Exception as e:
-            log.warning("Gimbal manager failed to start: %s — continuing without gimbal", e)
-            gimbal = None
+    # (Gimbal manager started earlier — moved ahead of radar so the
+    # radar's mmW Studio bring-up doesn't gate manual control.)
 
     # Load persisted extrinsic calibration (if any) and apply it to the
     # live managers BEFORE the GUI starts pushing frames. This is what
@@ -378,6 +441,10 @@ def main() -> int:
     # start() is a no-op). Lifecycle is driven by gui.app's WS handler
     # OR --auto-record below.
     rec_cfg = (cfg.get("recording") or {})
+    # demoDDM mode: humans/vehicles arrive on Topic.RADAR (TLV via
+    # RadarManager); drone PMM hits arrive on Topic.RADAR_AA (raw-ADC
+    # via DCAPipeline). Recorder writes BOTH as separate JSONL channels
+    # ("radar/frame" + "radar/aa_frame") -- see jsonl_recorder._channels_table.
     recorder = JSONLRecorder(
         BUS,
         output_dir=str(rec_cfg.get("output_dir", "./recordings")),
@@ -423,7 +490,53 @@ def main() -> int:
                 pass
         threading.Thread(target=_delayed_open, daemon=True).start()
 
+    # Producer-rate probe: every 5 s, log the publish cadence each
+    # sensor manager achieves on FrameBus. Decoupled from the GUI WS
+    # broadcast rate — when "GUI panel shows 7 Hz but radar producer
+    # is at 19 Hz" we know the bottleneck is downstream of the bus,
+    # not in the producer. (Multiple agents have wasted hours fixing
+    # the wrong layer here.)
+    def _producer_rate_probe():
+        from common.frame_bus import BUS as _BUS
+        from common.frames import Topic as _T
+        last = {_T.RADAR: (None, None), _T.EO: (None, None),
+                _T.THERMAL: (None, None)}
+        WINDOW_S = 5.0
+        while True:
+            time.sleep(WINDOW_S)
+            parts = []
+            for topic, label in ((_T.RADAR, "radar"),
+                                 (_T.EO, "eo"),
+                                 (_T.THERMAL, "thermal")):
+                obj = _BUS.get_latest(topic)
+                fid = getattr(obj, "frame_id", None)
+                ts = time.monotonic()
+                prev_fid, prev_ts = last[topic]
+                if fid is not None and prev_fid is not None and prev_ts is not None:
+                    df = fid - prev_fid
+                    dt = ts - prev_ts
+                    hz = (df / dt) if dt > 0 else 0.0
+                    parts.append(f"{label}={hz:.1f}Hz(+{df}f/{dt:.1f}s)")
+                else:
+                    parts.append(f"{label}=warming")
+                last[topic] = (fid, ts)
+            log.info("[producer_rate] %s", "  ".join(parts))
+    threading.Thread(target=_producer_rate_probe, daemon=True,
+                     name="ProducerRateProbe").start()
+
+    # Single-shot guard: radar.stop() must run EXACTLY ONCE per
+    # process. Calling sensorStop twice on a STOPPED chip wedges the
+    # mmw_demoDDM CLI parser into a state where it stops acking ANY
+    # command for the rest of the chip's power cycle. Both _shutdown
+    # (signal path) and _atexit_radar_stop (fallback path) share this
+    # flag so whichever fires first does the work and the other one
+    # is a no-op.
+    _shutdown_done = {"v": False}
+
     def _shutdown(*_):
+        if _shutdown_done["v"]:
+            return
+        _shutdown_done["v"] = True
         log.info("Shutdown signal received, stopping sensors")
         try:
             if recorder.is_recording:
@@ -448,25 +561,45 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass  # Windows / non-main thread
 
+    # atexit fallback so sensorStop runs even if Ctrl+C bypasses the
+    # signal handler (uvicorn occasionally dies before the handler
+    # fires).
+    def _atexit_radar_stop() -> None:
+        if _shutdown_done["v"]:
+            return
+        _shutdown_done["v"] = True
+        try:
+            if radar is not None:
+                log.info("atexit: stopping radar (chip sensorStop)")
+                radar.stop()
+        except Exception:
+            log.exception("atexit radar.stop failed")
+    atexit.register(_atexit_radar_stop)
+
     log.info("GUI -> http://%s:%d/", host, port)
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
-        try:
-            if recorder.is_recording:
-                recorder.stop()
-        except Exception:
-            log.exception("recorder stop failed at shutdown")
-        if gimbal is not None:
-            gimbal.stop()
-        if fusion is not None:
-            fusion.stop()
-        if radar is not None:
-            radar.stop()
-        if eo is not None:
-            eo.stop()
-        if thermal is not None:
-            thermal.stop()
+        # Gated by the same flag as _shutdown / _atexit_radar_stop so
+        # we never double-call radar.stop(). Other sensors are safe
+        # to stop multiple times.
+        if not _shutdown_done["v"]:
+            _shutdown_done["v"] = True
+            try:
+                if recorder.is_recording:
+                    recorder.stop()
+            except Exception:
+                log.exception("recorder stop failed at shutdown")
+            if gimbal is not None:
+                gimbal.stop()
+            if fusion is not None:
+                fusion.stop()
+            if radar is not None:
+                radar.stop()
+            if eo is not None:
+                eo.stop()
+            if thermal is not None:
+                thermal.stop()
 
     return 0
 

@@ -11,6 +11,8 @@ import {
   drawSyntheticTargetBox,
   drawRubberBand,
   drawRadarBox,
+  drawLockBrackets,
+  drawLockLabel,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -172,11 +174,13 @@ export class ThermalView {
     if (this._lastFrameW > 0) this._draw();
   }
 
-  update(thermal, mainTargetId = null, fused = [], devMode = false, radarTargets = []) {
+  update(thermal, mainTargetId = null, fused = [], devMode = false, radarTargets = [], lock = null) {
     this._mainTargetId = mainTargetId;
     this._lastFused = fused || [];
     this._devMode = !!devMode;
     this._lastRadarTargets = radarTargets || [];
+    // Lock-mode (see eo_view.js for the architecture comment).
+    this._lock = (lock && lock.bbox_thermal) ? lock : null;
     if (!thermal || !thermal.connected) {
       if (this.overlay) this.overlay.classList.remove("hidden");
       this._clear();
@@ -242,6 +246,11 @@ export class ThermalView {
     // Synthetic user-seeded detections are peeled off first and drawn
     // with the dedicated magenta "USER TARGET" style; they never
     // participate in fused suppression.
+    // Solo render gate (see eo_view.js for the comment).
+    const soloEngaged = (this._lock && this._lock.solo_mode
+                          && this._lock.engaged_id != null)
+        ? this._lock.engaged_id : null;
+
     for (const det of this._lastDetections) {
       if (det && det.synthetic) {
         drawSyntheticTargetBox(this.ctx, det, scale, dx, dy);
@@ -254,6 +263,20 @@ export class ThermalView {
       const fusedId = (det.fused_id != null)
         ? det.fused_id
         : fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal", 0.20, det);
+      // Solo: hide detections that don't belong to the engaged target.
+      if (soloEngaged != null
+          && (fusedId == null || Number(fusedId) !== soloEngaged)) {
+        continue;
+      }
+      // Lock-bracket suppression: when a lock bbox is rendered for this
+      // target on this panel, skip the raw heat/classifier detection so
+      // the operator sees ONE engagement box (the lock corner brackets)
+      // not the brackets stacked on top of the orange/colored rectangle.
+      if (soloEngaged != null
+          && this._lock && this._lock.bbox_thermal
+          && fusedId != null && Number(fusedId) === soloEngaged) {
+        continue;
+      }
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);
@@ -265,7 +288,14 @@ export class ThermalView {
     //   =1 sensor   → nothing on the detecting panel (raw already drawn),
     //                 dashed class-colored box on the OTHER panel showing
     //                 the projected location ("another sensor says so").
+    // v2 lock-mode suppression: see eo_view.js for the rationale.
+    const lockedId = (this._lock && this._lock.bbox_thermal
+                       && this._lock.target_id != null)
+        ? this._lock.target_id : null;
     for (const trk of this._lastFused) {
+      if (lockedId != null && trk.id === lockedId) continue;
+      // Solo: hide non-engaged fused tracks entirely.
+      if (soloEngaged != null && trk.id !== soloEngaged) continue;
       const nSensors = (trk.sensors || []).length;
       const bbox = trk.bbox_thermal;
       if (!bbox) continue;
@@ -294,6 +324,23 @@ export class ThermalView {
         if (ht && ht.synthetic) continue;
         drawHeatTrackDebug(this.ctx, ht, scale, dx, dy);
       }
+    }
+
+    // Lock-mode bbox (v2): corner brackets + crosshair, ID label.
+    // See eo_view.js for the design rationale.
+    if (this._lock && this._lock.bbox_thermal) {
+      const bb = this._lock.bbox_thermal;
+      const px = dx + bb.x * scale;
+      const py = dy + bb.y * scale;
+      const pw = bb.w * scale;
+      const ph = bb.h * scale;
+      const coasting = this._lock.state === "coasting";
+      const color = coasting ? "#ffb000" : "#00e676";
+      drawLockBrackets(this.ctx, px, py, pw, ph, color, coasting);
+      const labelText = coasting
+        ? `LOCK · COAST #${this._lock.target_id ?? ""}`
+        : `LOCK #${this._lock.target_id ?? ""}`;
+      drawLockLabel(this.ctx, px, py, color, labelText);
     }
 
     // Rubber-band rectangle while the user is dragging in draw mode.

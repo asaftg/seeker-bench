@@ -176,14 +176,14 @@
           <div class="gslider-row">
             <span class="gslider-label">PAN</span>
             <input class="gslider" type="range" id="gimbal-pan-slider"
-                   min="-45" max="45" step="0.5" value="0"
+                   min="-60" max="60" step="0.5" value="0"
                    title="Drag to absolute pan angle (deg). Range comes from app_config.yaml">
             <span class="gslider-val mono" id="gimbal-pan-slider-val">0°</span>
           </div>
           <div class="gslider-row">
             <span class="gslider-label">TILT</span>
             <input class="gslider" type="range" id="gimbal-tilt-slider"
-                   min="0" max="90" step="0.5" value="30"
+                   min="0" max="90" step="0.5" value="0"
                    title="Drag to absolute tilt angle (deg). 0 = horizon, 90 = vertical up">
             <span class="gslider-val mono" id="gimbal-tilt-slider-val">30°</span>
           </div>
@@ -551,6 +551,19 @@
   </section><!-- /.tab-content[dev] -->
 
 </div><!-- /.stage -->
+
+<div id="replay-bar" hidden>
+  <button id="replay-pause" class="rb-btn" title="Pause / Play (server-truth)">⏸</button>
+  <input id="replay-seek" type="range" min="0" max="0" step="0.1" value="0" title="Scrub — drag to scrub through frames">
+  <span id="replay-time" class="mono">0:00 / 0:00</span>
+  <select id="replay-speed" title="Playback speed">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+  </select>
+</div>
 
 <script type="module" src="/static/js/main.js"></script>
 </body>

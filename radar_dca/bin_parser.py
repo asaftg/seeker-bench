@@ -1,28 +1,26 @@
 """DCA1000 raw-ADC `.bin` file parser.
 
 Reads the binary blob the DCA1000 dumps when capturing in raw-ADC LVDS
-mode (Studio default + our setup) and produces complex-valued chirp
-matrices ready for range-FFT + PMM.
+mode and produces real-valued chirp matrices (presented as complex64
+with zero imaginary part for downstream-API compatibility).
 
-Wire layout (per SPRUIJ4A §5 and the DCA1000 quick start guide):
+Wire layout — empirically verified 2026-05-08 against `channelCfg 15 15`
+recording (tools/diag_layout_decode.py, all four RX show uniform
+energy ≈ 330 under this layout; any other reshape leaves two RX zero):
 
-  - The DCA dumps EVERY UDP payload it received during the capture
-    session, concatenated in receipt order. Per-packet headers
-    (4-byte sequence + 6-byte byte counter + footer) are STRIPPED by
-    the DCA before writing — what hits disk is the raw ADC payload
-    only. So a `.bin` file is a contiguous stream of int16 samples.
+  - Per-sample format (cfg `adcCfg 2 0` = 16-bit REAL ADC; `lvdsStreamCfg
+    -1 0 1 0` = HW-only ADC streaming, dataFmt=1):
+      sample_lo  sample_hi
+    Each ADC sample is a signed int16 little-endian. One sample =
+    2 BYTES (NOT 4 — there is no IQ pair on this cfg). A previous
+    revision of this file was written assuming complex-1x mode which
+    halved the effective RX count; that bug is fixed here.
 
-  - Per-sample format (lvdsMode=1, dataFormatMode=3 = complex 1x):
-      I0_lo  I0_hi  Q0_lo  Q0_hi  I1_lo  I1_hi  Q1_lo  Q1_hi ...
-    Each I/Q is a signed int16 little-endian. One complex sample =
-    4 bytes.
-
-  - Per-chirp packing:
-      RX0_sample0  RX1_sample0  RX2_sample0  RX3_sample0
-      RX0_sample1  RX1_sample1  RX2_sample1  RX3_sample1
-      ...
-    i.e. RX-interleaved, sample-major. (TI's convention; matches
-    Studio's "channel interleave 0" mode in the setup.json.)
+  - Per-chirp packing (RX-major, sample-minor):
+      RX0_sample0  RX0_sample1  ...  RX0_sample(N-1)
+      RX1_sample0  RX1_sample1  ...  RX1_sample(N-1)
+      RX2_sample0  ...                          ...
+      RX3_sample0  ...               RX3_sample(N-1)
 
   - Per-frame packing:
       chirp0  chirp1  chirp2  ...  chirp(numChirpsPerFrame - 1)
@@ -31,8 +29,13 @@ Wire layout (per SPRUIJ4A §5 and the DCA1000 quick start guide):
     delimiters; the file just contains numFrames worth of chirps
     back-to-back. Caller must know numChirpsPerFrame from the cfg.
 
-So the canonical reshape is:
+Returned shape (preserves the prior public contract so downstream
+replay.py / pmm_detector.py / herm_replay_v2.py keep working):
     (n_frames, n_chirps_per_frame, n_samples, n_rx)  complex64
+The imaginary part is zero — downstream code that does an rfft (real
+input) or treats the data as complex behaves identically; the
+range-FFT + RX-AoA stages that previously read garbage out of the
+"missing" RX channels now see real signal there.
 
 Inputs:
   - ``bin_path``  : path to ``adc_data_Raw_0.bin`` (or post-processed
@@ -80,8 +83,11 @@ class CaptureDims:
 
     @property
     def bytes_per_sample(self) -> int:
-        # Complex int16: I = 2 bytes, Q = 2 bytes.
-        return 4
+        # Real int16 ADC sample. The cfg uses `adcCfg 2 0` = 16-bit real;
+        # there is NO IQ pair on the wire. (Prior revision said 4 here,
+        # which silently halved the effective RX count by causing the
+        # reshape to skip every other RX as if it were a Q channel.)
+        return 2
 
     @property
     def bytes_per_chirp(self) -> int:
@@ -155,22 +161,27 @@ def dims_from_mmwave_json(cfg_path: str | Path) -> CaptureDims:
 def _bytes_to_complex_chirp(buf: bytes, n_samples: int, n_rx: int) -> np.ndarray:
     """Decode one chirp's bytes into a (n_samples, n_rx) complex64 array.
 
-    Wire order (channel interleave 0):
-        RX0_s0  RX1_s0  RX2_s0  RX3_s0   RX0_s1  RX1_s1 ... RX3_s1   ...
+    Wire order (RX-major within chirp, real int16):
+        RX0_s0  RX0_s1  ...  RX0_s(N-1)
+        RX1_s0  RX1_s1  ...  RX1_s(N-1)
+        RX2_s0  ...                  ...
+        RX3_s0  ...          RX3_s(N-1)
 
-    Each RX_sN is a complex int16 pair (I lo/hi, Q lo/hi) = 4 bytes.
-    Total per chirp = n_samples * n_rx * 4 bytes.
+    Each sample is a single signed int16 = 2 bytes (real ADC, no IQ).
+    Total per chirp = n_samples * n_rx * 2 bytes.
+
+    Returned shape is (n_samples, n_rx) complex64 with imag == 0 to
+    keep the public contract identical to the prior buggy version.
     """
-    if len(buf) != n_samples * n_rx * 4:
+    if len(buf) != n_samples * n_rx * 2:
         raise ValueError(
-            f"chirp buf length {len(buf)} != expected {n_samples * n_rx * 4}"
+            f"chirp buf length {len(buf)} != expected {n_samples * n_rx * 2}"
         )
-    # int16 view: each pair of consecutive int16s is one complex sample.
     raw = np.frombuffer(buf, dtype=np.int16)
-    # Reshape: (n_samples, n_rx, 2) where last dim is [I, Q]
-    raw = raw.reshape(n_samples, n_rx, 2)
-    return (raw[..., 0].astype(np.float32) +
-            1j * raw[..., 1].astype(np.float32))
+    # Wire is RX-major (n_rx rows, n_samples columns); transpose to the
+    # canonical (n_samples, n_rx) shape downstream expects.
+    real_part = raw.reshape(n_rx, n_samples).T.astype(np.float32)
+    return real_part.astype(np.complex64)
 
 
 def parse_bin_full(
@@ -200,17 +211,18 @@ def parse_bin_full(
         log.warning("trailing %d bytes in %s (last frame partial); ignoring",
                     leftover, bin_path)
 
-    # Reshape: int16 buffer → (n_frames, n_chirps, n_samples, n_rx, 2)
-    n_int16 = n_frames * dims.n_chirps_per_frame * dims.n_samples * dims.n_rx * 2
+    # Reshape: int16 buffer → (n_frames, n_chirps, n_rx, n_samples), then
+    # transpose to canonical (n_frames, n_chirps, n_samples, n_rx).
+    n_int16 = n_frames * dims.n_chirps_per_frame * dims.n_rx * dims.n_samples
     raw = np.frombuffer(raw_bytes[: n_frames * bpf], dtype=np.int16)
     if raw.shape[0] != n_int16:
         raise RuntimeError(
             f"int16 count mismatch: got {raw.shape[0]}, expected {n_int16}"
         )
-    raw = raw.reshape(n_frames, dims.n_chirps_per_frame, dims.n_samples,
-                      dims.n_rx, 2)
-    return (raw[..., 0].astype(np.float32) +
-            1j * raw[..., 1].astype(np.float32)).astype(np.complex64)
+    raw = raw.reshape(n_frames, dims.n_chirps_per_frame, dims.n_rx,
+                      dims.n_samples)
+    real_cube = raw.transpose(0, 1, 3, 2).astype(np.float32)
+    return real_cube.astype(np.complex64)
 
 
 def parse_bin_streaming(
@@ -235,10 +247,10 @@ def parse_bin_streaming(
                             len(buf), bpf)
                 return
             raw = np.frombuffer(buf, dtype=np.int16)
-            raw = raw.reshape(dims.n_chirps_per_frame, dims.n_samples,
-                              dims.n_rx, 2)
-            cube = (raw[..., 0].astype(np.float32) +
-                    1j * raw[..., 1].astype(np.float32)).astype(np.complex64)
+            raw = raw.reshape(dims.n_chirps_per_frame, dims.n_rx,
+                              dims.n_samples)
+            real_cube = raw.transpose(0, 2, 1).astype(np.float32)
+            cube = real_cube.astype(np.complex64)
             yield frame_idx, cube
             frame_idx += 1
 

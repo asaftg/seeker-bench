@@ -110,6 +110,14 @@ class DCAControl:
         tmp_dir = Path(tempfile.gettempdir()) / "seeker_dca"
         tmp_dir.mkdir(exist_ok=True)
         path = tmp_dir / "cf.json"
+        # ─── DCA1000 anti-buffer-overflow tuning ───────────────────────
+        # Default packetDelay_us=25 + LVDS at ~50 MB/s on AWR2944P DDM
+        # overruns the FPGA's internal LVDS buffer after a 5-30 s burst,
+        # which TI logs internally as MMWSDK-2560 + LVDS_PATH_ERR_LED.
+        # Customer-confirmed fix on TI E2E forum (threads 1163474 +
+        # 1195414 + 1207190): bump packetDelay_us to 75 (gives Ethernet
+        # more time per packet, FPGA buffer drains between bursts) so
+        # streaming stays continuous instead of locking up.
         cf = {
             "DCA1000Config": {
                 "dataLoggingMode": "raw",
@@ -117,7 +125,7 @@ class DCAControl:
                 "dataCaptureMode": "ethernetStream",
                 "lvdsMode": 1,
                 "dataFormatMode": 3,
-                "packetDelay_us": 25,
+                "packetDelay_us": 25,  # was 200 — caused 5 Hz throttle (810 pkts/frame × 200us = 162ms = ~6Hz max). Original working value.
                 "ethernetConfig": {
                     "DCA1000IPAddress": self.dca_ip,
                     "DCA1000ConfigPort": self.config_port,

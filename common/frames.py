@@ -148,6 +148,15 @@ class ThermalFrame:
     gimbal_pan_at_capture: Optional[float] = None
     gimbal_tilt_at_capture: Optional[float] = None
 
+    # Pre-encoded JPEG bytes of the colormapped display image at
+    # `jpeg_quality`. Encoded ONCE on the thermal process thread so the
+    # asyncio WS sender doesn't pay cv2.imencode + base64 every tick
+    # (~10-15 ms/tick on a 640x512 Boson at q=80, the dominant remaining
+    # cost in the shared _sender after EO went binary). Same contract as
+    # EOFrame.jpeg_bytes below — None for disconnected sentinel frames.
+    jpeg_bytes: Optional[bytes] = None
+    jpeg_quality: int = 80
+
 
 # ───────────────────────────────────────────────────────────────
 # EO (visible / NIR RGB) frames — Ticket 3
@@ -435,3 +444,25 @@ class GimbalState:
     # None when no LK measurement is available.
     target_resid_az_deg: Optional[float] = None
     target_resid_el_deg: Optional[float] = None
+    # Lock-mode tracker output (gimbal.lock_mode.enabled).
+    # When the operator presses TRACK on a fused track, gimbal_manager
+    # spawns a per-sensor MOSSE lock tracker seeded from that track's
+    # bbox content. The lock survives YOLO/heat/fusion dropouts —
+    # bbox is published every gimbal tick regardless of classifier
+    # state. None when lock mode is OFF (config disabled) or the
+    # operator hasn't engaged a track. See vision/lock_tracker.py
+    # for the state machine. lock_state is one of:
+    #   "off" / "active" / "coasting" / "released"
+    # GUI renders lock_bbox_eo / lock_bbox_thermal with priority over
+    # the projected fused-track bbox; "coasting" gets an amber edge.
+    lock_state: str = "off"
+    lock_bbox_eo: Optional["BBox"] = None
+    lock_bbox_thermal: Optional["BBox"] = None
+    # Fused-track ID the lock is currently anchored on. The GUI uses
+    # this to SUPPRESS the projected fused-track green box for the
+    # engaged target — without this, the lock bbox and the fused-
+    # track box render simultaneously and the operator sees two
+    # boxes for what's logically one engagement (the v1 confusion
+    # documented in `recordings/lock poorly.jsonl` retro). None when
+    # lock mode is OFF.
+    lock_target_id: Optional[int] = None
