@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """Pre-stream XU init for IMX568 on Linux.
 
-The Leopard FX3 firmware boots into XU 0x09 = 0x55aa (soft-trigger
-armed mode) — the bridge withholds AE updates until a soft-trigger
-fires, leaving the sensor stuck at saturation defaults. Writing
-XU 0x09 = 0 disables soft-trigger -> free-running streaming with
-bridge AE active. Mirrors Windows behavior where profile_control_
-exposure=false and the bridge runs its own AE.
+Disables FX3 trigger mode (XU 0x0b = [0,0]) so the sensor runs free.
+Verified by decompiling LeopardCamera.dll: this is what
+LPCamera.EnableTriggerMode(false, false) writes.
 
-Also leave XU 0x06 (ExposureExt) alone so bridge AE can drive it.
-seeker software AE will overwrite later via the patched
-_set_leopard_exposure_ext if config enables it.
+Note: trigger-disable also gets re-applied inside _v4l2_raw_backend.py
+on every open() (after STREAMON) and periodically during streaming.
+This script is now mostly informational/preflight.
 """
 import sys, time
 sys.path.insert(0, "/home/asaftg/seeker-bench")
 from eo.leopard_linux import LeopardLinux, _SIZES
-_SIZES[0x09] = 2  # soft-trigger / streaming-mode toggle
+_SIZES[0x0b] = 2
 
 DEV = "/dev/video0"
 RETRIES = 5
@@ -24,10 +21,10 @@ for i in range(RETRIES):
     try:
         c = LeopardLinux(DEV)
         try:
-            before = int.from_bytes(c._xu_read(0x09), "little")
-            c._xu_write(0x09, (0).to_bytes(2, "little"))
-            after = int.from_bytes(c._xu_read(0x09), "little")
-            print("[xu_init] %s soft-trigger 0x%04x -> 0x%04x  (free-running streaming)"
+            before = int.from_bytes(c._xu_read(0x0b), "little")
+            c._xu_write(0x0b, bytes([0, 0]))
+            after = int.from_bytes(c._xu_read(0x0b), "little")
+            print("[xu_init] %s trigger_mode 0x%04x -> 0x%04x (free-running)"
                   % (DEV, before, after))
         finally:
             c.close()

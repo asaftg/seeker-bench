@@ -1,0 +1,20 @@
+[Unit]
+Description=Seeker-01 sensor-fusion stack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/asaftg/seeker-bench
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=/bin/sh -c '/usr/bin/sudo /usr/sbin/nvpmodel -m 0 || true'
+ExecStartPre=/bin/sh -c '/usr/bin/sudo /usr/bin/jetson_clocks || true'
+ExecStartPre=/bin/sh -c '/usr/bin/python3 /home/asaftg/seeker-bench/scripts/leopard_xu_init.py || true'
+ExecStart=/home/asaftg/seeker-bench/.venv/bin/python /home/asaftg/seeker-bench/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

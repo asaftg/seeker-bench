@@ -593,6 +593,15 @@ class IMX568Capture:
         # 2026-04-24 with frame-to-frame B/G/R diff < 0.03 vs the
         # reference BMP. PyAV/OpenCV YUY2 paths produce visible breathing
         # and YUY2-decode artifacts and are now fallback-only.
+        # On Linux the 32-bit Python+pythonnet+LeopardCamera.dll stack
+        # cannot run (the helper is a Windows .exe). Force off so the
+        # SDK helper spawn-fail loop does not pollute logs and confuse
+        # eo_managers reopen watchdog. Linux uses RawV4L2Backend
+        # which gives the same RAW12 reinterpretation the helper
+        # would have provided on Windows.
+        import sys as _sys_uss
+        if _sys_uss.platform.startswith("linux"):
+            use_sdk_stream = False
         self._use_sdk_stream = bool(use_sdk_stream)
         self._sdk_stream_mode: bool = False  # set True if SDK path opens
         # Cap to 25 fps — beyond that the FX3 USB3 bus saturates under
@@ -904,15 +913,25 @@ class IMX568Capture:
                         v4l2cap.release()
                         continue
                     ok, _test = v4l2cap.read()
+                    log.info("RawV4L2Backend probe: ok=%s test=%s shape=%s",
+                             ok, type(_test).__name__,
+                             None if _test is None else _test.shape)
                     if (ok and _test is not None
                             and _test.ndim == 2
                             and _test.shape == (NATIVE_H, 2 * NATIVE_W)):
+                        # FX3 ships RAW12 RGGB packed as <u2 inside YUYV envelope.
+                        # See eo/_v4l2_raw_backend.py top-of-file comment for the
+                        # full forensic story (decompiled DLL + saved .raw analysis).
+                        # Take the SDK-stream code path so grab() calls
+                        # self._cap.grab(), which does the u16 reinterpretation
+                        # + p1/p99 stretch and populates last_raw_stats for AE.
                         self._cap = v4l2cap  # type: ignore[assignment]
                         self.device_index = 0
                         self.actual_width = NATIVE_W
                         self.actual_height = NATIVE_H
-                        self._fourcc = "YUY2"
-                        self._raw_yuy2_mode = True
+                        self._fourcc = "RAW12"
+                        self._sdk_stream_mode = True
+                        self._raw_yuy2_mode = False
                         self._sw_ae_enabled = False
                         log.info(
                             "IMX568Capture mode: RAW_V4L2_YUY2 on %s "

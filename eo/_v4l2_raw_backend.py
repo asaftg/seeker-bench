@@ -1,14 +1,41 @@
-"""Direct V4L2 mmap backend that returns RAW YUY2 bytes — Linux equivalent
-of imx568_capture._PyAVDshowBackend (which gives raw YUY2 on Windows by
-bypassing OpenCV DSHOW). Output shape is (H, 2*W) uint8, matching what
-imx568_capture.grab() expects in `_raw_yuy2_mode`. No FFMPEG/PyAV/GStreamer
-required — uses only ctypes + V4L2 ioctls.
+"""Direct V4L2 mmap + RAW12 reinterpretation backend for IMX568 on Linux.
 
-Why this is needed: cv2.VideoCapture(/dev/videoN, CAP_V4L2) returns BGR
-that has been YUV->RGB converted with U=V=0 (mono sensor). The conversion
-math forces G=Y+135, R=Y-179, B=Y-227, producing the *exact same* dead-zone
-posterization as Windows DSHOW (Y in [120,179] is irrecoverable). Routing
-the raw byte stream around that conversion preserves the full Y signal.
+============================================================================
+WHAT THE FX3 ACTUALLY SHIPS  (proven by decompiling LeopardCamera.dll +
+analyzing CameraTool's saved .raw frames + verifying on the live Jetson
+stream, 2026-05-08):
+============================================================================
+
+The Leopard FX3 firmware on the LI-USB30-IMX568-GMSL2 module ALWAYS
+streams RAW12 RGGB Bayer data, regardless of the SENSOR_DATA_MODE you
+pass to LPCamera.SetParam. The bytes are packed as little-endian uint16
+(values 0..4095, four bits zero-padded in each pair). The UVC descriptor
+advertises this stream as YUYV — a transport lie — because the FX3
+firmware was built without ever exposing a real RAW12 UVC FourCC.
+
+LeopardCamera.dll's SetParam method literally discards the data_type
+argument and asks DirectShow for a YUYV/16bpp stream regardless. The
+Windows pipeline that produces the high-quality image is:
+
+    1. Read YUYV-shaped bytes from the FX3 (just bulk USB transfer).
+    2. Reinterpret the byte stream as numpy uint16 LE.
+    3. p1/p99 stretch on the raw u16 to recover full dynamic range.
+    4. Replicate luma to BGR (or debayer if color is wanted).
+
+This file does the same on Linux without a single XU write or USB
+trick — direct V4L2 mmap to get the bytes, then numpy reinterpretation.
+
+============================================================================
+DEAD HYPOTHESES (don't waste time re-trying):
+============================================================================
+- Hidden V4L2 raw FourCCs:    none. S_FMT redirects every Bayer FOURCC to
+                              YUYV. (Verified 2026-05-08.)
+- Hidden USB alt-settings:    only bAlternateSetting=0 exists.
+- XU mode-switch selector:    none. 32-value sweep across all 12
+                              supported XU selectors flipped nothing
+                              about the byte content.
+- The DLL using a private USB endpoint: no — DLL only references
+                              DirectShowLib (no usblib, no WinUSB).
 """
 from __future__ import annotations
 import ctypes, fcntl, mmap, os
@@ -53,11 +80,26 @@ class _v4l2_pix_format(ctypes.Structure):
 
 
 class _format_union(ctypes.Union):
+    # raw_data on this kernel = 200 bytes.
     _fields_ = [("pix", _v4l2_pix_format), ("_pad", ctypes.c_byte * 200)]
 
 
 class _v4l2_format(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_uint32), ("fmt", _format_union)]
+    # Tegra L4T 35.6 (kernel 5.10.216-tegra) struct v4l2_format layout:
+    #     __u32 type;          // offset 0
+    #     __u32 _reserved;     // offset 4 (NOT in mainline videodev2.h
+    #                          //           but emitted by Tegra build)
+    #     union { ... } fmt;   // offset 8
+    # Total = 208 bytes -> VIDIOC_S_FMT = 0xc0d05605.
+    # Without the _reserved spacer, the union starts at offset 4 from
+    # ctypes' perspective but the kernel reads/writes at offset 8 ->
+    # every pix field shifted by one slot, height absorbs width's value,
+    # pixelformat absorbs height, etc. Empirically reproduced 2026-05-08.
+    _fields_ = [
+        ("type", ctypes.c_uint32),
+        ("_reserved", ctypes.c_uint32),
+        ("fmt", _format_union),
+    ]
 
 
 class _v4l2_requestbuffers(ctypes.Structure):
@@ -137,15 +179,46 @@ class RawV4L2Backend:
         self._fd = -1
         self._maps: list = []
         self._streaming = False
+        # Per-frame raw u16 stats — fed to seeker's eo_manager AE loop.
+        # Same shape as LeopardSDKStreamCapture.last_raw_stats on Windows.
+        self.last_raw_stats: Optional[dict] = None
+        # Cache the last successful frame so grab() can return it on a
+        # transient DQBUF timeout instead of None. seeker's eo_manager
+        # treats grab()==None as "device disconnected" and tears the cap
+        # down, which on Linux is fatal because the OS-level fd has to
+        # be re-acquired and there's a small race window where /dev/video0
+        # stays EBUSY.
+        self._last_bgr: Optional[np.ndarray] = None
+        # Frames since last trigger-state recheck. We re-disable trigger
+        # mode every N frames in case the FX3 firmware re-arms it (which
+        # has been observed to happen sporadically — root cause unknown).
+        self._frames_since_trigger_check: int = 0
 
     def isOpened(self) -> bool:  # noqa: N802
         return self._fd >= 0
 
-    def open(self) -> bool:
-        try:
-            self._fd = os.open(self._dev, os.O_RDWR | os.O_NONBLOCK)
-        except OSError:
-            self._fd = -1
+    @property
+    def is_alive(self) -> bool:
+        """IMX568Capture.is_open() looks at this attribute when in
+        _sdk_stream_mode (the Windows SDK path uses a thread + flag)."""
+        return self._fd >= 0 and self._streaming
+
+    def open(self, retries: int = 8, backoff_s: float = 0.5) -> bool:
+        """Open with retry. seeker tries the SDK helper (Windows .exe) first
+        on Linux, which fails — but it can briefly leave /dev/video0 in EBUSY
+        from the failing Popen. A few retries with backoff handles that race."""
+        import time as _t
+        last_err = None
+        for attempt in range(retries):
+            try:
+                self._fd = os.open(self._dev, os.O_RDWR | os.O_NONBLOCK)
+                break
+            except OSError as e:
+                last_err = e
+                self._fd = -1
+                if attempt < retries - 1:
+                    _t.sleep(backoff_s)
+        if self._fd < 0:
             return False
         try:
             f = _v4l2_format()
@@ -158,11 +231,22 @@ class RawV4L2Backend:
             self._w = f.fmt.pix.width
             self._h = f.fmt.pix.height
 
+            # REQBUFS can fail with EBUSY too (right after another process
+            # released the device). Retry with backoff like the open call.
             req = _v4l2_requestbuffers()
             req.count = self._n
             req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
             req.memory = V4L2_MEMORY_MMAP
-            fcntl.ioctl(self._fd, VIDIOC_REQBUFS, req)
+            import time as _t
+            for _attempt in range(8):
+                try:
+                    fcntl.ioctl(self._fd, VIDIOC_REQBUFS, req)
+                    break
+                except OSError as _e_rq:
+                    if _e_rq.errno in (16, 11):  # EBUSY, EAGAIN
+                        _t.sleep(0.5)
+                        continue
+                    raise
             if req.count < 2:
                 self.release()
                 return False
@@ -184,17 +268,55 @@ class RawV4L2Backend:
             t = ctypes.c_int(V4L2_BUF_TYPE_VIDEO_CAPTURE)
             fcntl.ioctl(self._fd, VIDIOC_STREAMON, t)
             self._streaming = True
+
+            # ── Disable FX3 trigger mode → free-running ──
+            # The Leopard FX3 firmware boots into trigger-mode (XU 0x0b
+            # nonzero); in that state the sensor only captures on a soft-
+            # trigger pulse and the stream returns black-level frames
+            # forever. The Windows DLL's LPCamera.EnableTriggerMode(false,
+            # false) writes XU 0x0b = [0, 0] (verified by decompiling
+            # LeopardCamera.dll's IL: token 0x0600002e).
+            #
+            # We MUST do this AFTER STREAMON — XU writes seem to be
+            # ignored by the FX3 firmware unless the UVC streaming
+            # interface is active. Earlier attempts to write XU from a
+            # control-only fd silently failed.
+            try:
+                from eo.leopard_linux import LeopardLinux as _LL, _SIZES as _LS
+                _LS[0x0b] = 2
+                _ll = _LL(self._dev)
+                try:
+                    _ll._xu_write(0x0b, bytes([0, 0]))
+                finally:
+                    _ll.close()
+            except Exception:
+                # Non-fatal: streaming might still work if firmware was
+                # already in free-running mode.
+                pass
+
+            # Warmup: drain a few frames to prime the pipeline before
+            # returning. Without this, the first caller-side grab() can
+            # hit a 1s DQBUF timeout (the FX3 needs ~200-500ms to
+            # actually start delivering frames after STREAMON + the
+            # trigger-disable XU write that we just did).
+            import time as _t
+            for _w in range(5):
+                ok, _ = self.read(timeout_s=2.0)
+                if ok:
+                    break
+                _t.sleep(0.05)
+
             return True
         except Exception:
             self.release()
             return False
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def read(self, timeout_s: float = 1.0) -> Tuple[bool, Optional[np.ndarray]]:
         """Return (True, raw_yuy2_buf) where buf is (H, 2*W) uint8."""
         if self._fd < 0:
             return False, None
         import time as _t
-        deadline = _t.monotonic() + 1.0
+        deadline = _t.monotonic() + float(timeout_s)
         buf = _v4l2_buffer()
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
         buf.memory = V4L2_MEMORY_MMAP
@@ -223,6 +345,87 @@ class RawV4L2Backend:
         except OSError:
             pass
         return True, raw
+
+    def grab(self) -> Optional[np.ndarray]:
+        """RAW12 reinterpretation path.
+
+        Reads the raw byte stream, treats it as little-endian uint16
+        (RAW12 RGGB Bayer values 0..4095 padded to 16 bits), computes
+        per-frame raw stats (fed to seeker's eo_manager AE), then
+        applies a p1/p99 stretch to produce mono BGR uint8 for the
+        downstream YOLO/GUI path.
+
+        Mirrors the Windows LeopardSDKStreamCapture.grab() return shape
+        so IMX568Capture._sdk_stream_mode can take the early-return
+        path verbatim.
+        """
+        # Periodically re-disable trigger mode. We do it every ~150 frames
+        # (~5-15 sec at 10-30 fps) so a transient FX3 re-arm doesn't
+        # silently freeze the stream forever. Cheap: one XU write.
+        self._frames_since_trigger_check += 1
+        if self._frames_since_trigger_check >= 150:
+            self._frames_since_trigger_check = 0
+            try:
+                from eo.leopard_linux import LeopardLinux as _LL, _SIZES as _LS
+                _LS[0x0b] = 2
+                _ll = _LL(self._dev)
+                try:
+                    cur = int.from_bytes(_ll._xu_read(0x0b), "little")
+                    if cur != 0:
+                        _ll._xu_write(0x0b, bytes([0, 0]))
+                finally:
+                    _ll.close()
+            except Exception:
+                pass
+        ok, raw = self.read()
+        if not ok or raw is None:
+            # Return the last good frame on transient timeout — eo_manager
+            # treats None as "disconnected" and tears down the source.
+            return self._last_bgr
+        # Reinterpret as RAW12 u16 LE.
+        # Note: raw is (H, 2W) uint8 contiguous; .tobytes() avoids any
+        # stride surprises, and frombuffer is zero-copy.
+        u16 = np.frombuffer(raw.tobytes(), dtype="<u2").reshape(self._h, self._w)
+
+        # Stats on a strided sample (cheap, fed to AE).
+        # Same kind of stats LeopardSDKStreamCapture.last_raw_stats
+        # populates on Windows — see eo_manager.AEController.step().
+        sample = u16[::8, ::8]
+        s_p1 = float(np.percentile(sample, 1))
+        s_p99 = float(np.percentile(sample, 99))
+        s_mean = float(sample.mean())
+        s_max = int(sample.max())
+        s_frac_clip = float((sample >= 4090).sum()) / sample.size
+        self.last_raw_stats = {
+            "p1": s_p1,
+            "p99": s_p99,
+            "mean": s_mean,
+            "max": s_max,
+            "frac_clip": s_frac_clip,
+        }
+
+        # AGC stretch (same as leopard_stream_capture: p1 -> 0, p99 -> 255).
+        span = max(s_p99 - s_p1, 4.0)
+        scaled = (u16.astype(np.float32) - s_p1) * (255.0 / span)
+        y8 = np.clip(scaled, 0.0, 255.0).astype(np.uint8)
+
+        # Replicate luma to BGR — matches IMX568Capture's documented
+        # output contract ("the sensor is mono; we keep BGR replicated
+        # so downstream YOLO doesn't have to special-case").
+        # NB: even though the sensor is technically RGGB Bayer, seeker's
+        # downstream expects mono input (the operator's reference image
+        # is mono after IR-cut). Debayering would require a white-balance
+        # decision per scene; the Windows pipeline also runs mono-only.
+        bgr = np.stack([y8, y8, y8], axis=-1)
+        self._last_bgr = bgr
+        return bgr
+
+    # eo_manager calls .stop() on the source when it suspects a
+    # disconnect. LeopardSDKStreamCapture has stop() (terminates the
+    # subprocess); we just release the V4L2 fd. Without this, eo_manager
+    # silently swallows AttributeError and leaves /dev/video0 EBUSY.
+    def stop(self) -> None:
+        self.release()
 
     def release(self) -> None:
         try:
