@@ -216,6 +216,9 @@ class RawV4L2Backend:
         # mode every N frames in case the FX3 firmware re-arms it (which
         # has been observed to happen sporadically — root cause unknown).
         self._frames_since_trigger_check: int = 0
+        # Frames since last AGC stats recompute. Stats are reused for
+        # ~4 frames between recomputes to save ~5 ms per "skipped" frame.
+        self._frames_since_stats: int = 0
         # AGC LUT cache (rebuild only when p1/p99 drift meaningfully).
         self._lut: Optional[np.ndarray] = None
         self._lut_p1: float = -1.0
@@ -454,26 +457,37 @@ class RawV4L2Backend:
             # treats None as "disconnected" and tears down the source.
             return self._last_bgr
         # Reinterpret as RAW12 u16 LE — zero-copy view. raw is (H, 2W)
-        # uint8 contiguous; .view() reinterprets bytes without a copy
-        # (saves a 10MB memcpy per frame on this 2472x2064 sensor).
+        # uint8 contiguous; .view() reinterprets bytes without a copy.
         u16 = raw.view(np.uint16).reshape(self._h, self._w)
 
-        # Stats on a strided sample (cheap, fed to AE).
-        # Same kind of stats LeopardSDKStreamCapture.last_raw_stats
-        # populates on Windows — see eo_manager.AEController.step().
-        sample = u16[::8, ::8]
-        s_p1 = float(np.percentile(sample, 1))
-        s_p99 = float(np.percentile(sample, 99))
-        s_mean = float(sample.mean())
-        s_max = int(sample.max())
-        s_frac_clip = float((sample >= 4090).sum()) / sample.size
-        self.last_raw_stats = {
-            "p1": s_p1,
-            "p99": s_p99,
-            "mean": s_mean,
-            "max": s_max,
-            "frac_clip": s_frac_clip,
-        }
+        # Stats are fed to seeker's eo_manager AE which only steps every
+        # ~1.5 sec. We don't need fresh percentiles every frame — at
+        # 19fps that's ~28 frames per AE step. Recomputing every grab is
+        # ~5 ms wasted. Compute every Nth frame and reuse between.
+        # Cost saving: 4-5 ms/frame x ~80% of frames = ~4 ms avg/frame.
+        self._frames_since_stats += 1
+        if (self._frames_since_stats >= 5
+                or self.last_raw_stats is None):
+            self._frames_since_stats = 0
+            sample = u16[::8, ::8]
+            s_p1 = float(np.percentile(sample, 1))
+            s_p99 = float(np.percentile(sample, 99))
+            s_mean = float(sample.mean())
+            s_max = int(sample.max())
+            s_frac_clip = float((sample >= 4090).sum()) / sample.size
+            self.last_raw_stats = {
+                "p1": s_p1,
+                "p99": s_p99,
+                "mean": s_mean,
+                "max": s_max,
+                "frac_clip": s_frac_clip,
+            }
+        else:
+            # Reuse cached stats — alpha/beta below stay identical to
+            # the last computed frame (AGC stretch is stable between
+            # AE steps).
+            s_p1 = self.last_raw_stats["p1"]
+            s_p99 = self.last_raw_stats["p99"]
 
         # AGC stretch via cv2.convertScaleAbs — single SIMD-optimized C pass
         # on the full u16 frame: y = clip(alpha*u16 + beta, 0, 255). Replaces

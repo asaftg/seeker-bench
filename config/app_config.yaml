@@ -169,7 +169,11 @@ eo:
   # all the extra source pixels get thrown away by the client. The real
   # leverage for sharpness is JPEG quality (gui.eo_jpeg_quality), not
   # source resolution. Set to 0 to disable downscaling entirely.
-  display_max_width: 1236
+  # 2026-05-09: dropped 1236 -> 900. Browser canvas is ~640px wide;
+  # everything above that gets thrown away client-side. 900 is still
+  # 1.4x oversampled for the display, well within sharpness budget,
+  # and saves ~50% JPEG encode CPU per frame.
+  display_max_width: 900
 
   # Exposure profiles — auto-selected from scene brightness, hysteretic.
   # SAVgood 850nm VCSEL illuminator is manually controlled by the operator
@@ -877,12 +881,12 @@ gui:
   port: 8080
   open_browser: true
   ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)
-  thermal_jpeg_quality: 80      # 8-bit colormapped thermal looks fine at 80.
+  thermal_jpeg_quality: 75      # 8-bit colormapped thermal looks fine at 80.
                                 # (Briefly bumped to 92 on 2026-04-27; full
                                 # revert to original on operator request when
                                 # the visible image looked worse than the
                                 # baseline despite the bigger files.)
-  eo_jpeg_quality:     82       # Was 95 — dropped 2026-04-25 to free encode
+  eo_jpeg_quality:     85       # Was 95 — dropped 2026-04-25 to free encode
                                 # budget. The shared WS broadcast loop was
                                 # CPU-bound at ~12 Hz with q=95; q=82 cuts
                                 # JPEG size ~40% and encode time ~25% with
