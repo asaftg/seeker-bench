@@ -236,6 +236,46 @@ class RawV4L2Backend:
                         size=size, data=buf)
         fcntl.ioctl(self._fd, UVCIOC_CTRL_QUERY, q)
 
+    def set_exposure_ext(self, value: int) -> int:
+        """Write ExposureExt (XU 0x06, u16 LE) on the streaming fd.
+
+        Replaces the legacy path that opened a 2nd LeopardLinux fd to
+        /dev/video0 every AE tick — which UVC kernel-driver throttles
+        and causes EO frame-rate cliffs (every ~1.5s the AE thread
+        would briefly steal the device, dropping EO to 1 Hz).
+
+        Uses the documented decoy-write workaround (FX3 firmware
+        silently ignores repeat writes of the same value, so we write
+        a distinct decoy first, then the real target).
+
+        Returns the readback value (0 on error)."""
+        if self._fd < 0:
+            return 0
+        try:
+            last = getattr(self, "_last_exp_written", None)
+            decoy = 100 if last != 100 else 200
+            tgt = int(value) & 0xffff
+            self._xu_write_on_stream_fd(0x06, decoy.to_bytes(2, "little"))
+            import time as _t
+            _t.sleep(0.05)  # FX3 firmware needs settle time per Leopard SDK
+            self._xu_write_on_stream_fd(0x06, tgt.to_bytes(2, "little"))
+            self._last_exp_written = tgt
+            return tgt
+        except OSError:
+            return 0
+
+    def set_gain_rgb(self, gain: int) -> None:
+        """Write RGB gain (XU 0x0d, 8B = 4×u16 LE) on streaming fd."""
+        if self._fd < 0:
+            return
+        try:
+            g = int(gain) & 0xffff
+            self._xu_write_on_stream_fd(
+                0x0d, (g.to_bytes(2, "little")) * 4
+            )
+        except OSError:
+            pass
+
     @property
     def is_alive(self) -> bool:
         """IMX568Capture.is_open() looks at this attribute when in

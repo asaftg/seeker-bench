@@ -41,6 +41,14 @@ from common.logging_setup import get_logger
 log = get_logger(__name__)
 
 
+# Module-level reference to the currently-streaming RawV4L2Backend on
+# Linux. _set_leopard_exposure_ext() uses this to route XU exposure
+# writes through the streaming fd instead of opening a 2nd fd to
+# /dev/video0 (which the UVC kernel driver throttles, causing EO
+# frame-rate cliffs every AE tick).
+_active_v4l2_backend = None  # type: Optional[object]
+
+
 # Native resolution confirmed via eo_imx568_probe.py — anything lower
 # and the FX3 bridge falls back to a cropped/binned mode we don't want.
 NATIVE_W = 2472
@@ -486,6 +494,27 @@ def _set_leopard_exposure_ext(
     # decoy-write workaround.
     import sys as _sys
     if _sys.platform.startswith("linux"):
+        # PRIMARY Linux path: route XU writes through the currently-
+        # streaming RawV4L2Backend's fd. Avoids opening a 2nd fd to
+        # /dev/video0, which the UVC kernel driver throttles (EO would
+        # dip to 1 Hz for ~1.5s every time we did this).
+        try:
+            cap = _active_v4l2_backend
+            if cap is not None and hasattr(cap, "set_exposure_ext"):
+                tgt = cap.set_exposure_ext(int(exposure_ext))
+                if gain is not None and hasattr(cap, "set_gain_rgb"):
+                    cap.set_gain_rgb(int(gain))
+                return {"linux_xu_streaming": True,
+                        "exposure_ext_set": tgt,
+                        "gain_set": gain, "ae_off": ae_off}
+        except Exception as _e_streaming:
+            # Fall through to fresh-fd path on unexpected error
+            pass
+
+        # Fallback: open a fresh LeopardLinux fd. Only used if the
+        # active backend isn't a RawV4L2Backend (e.g. in a unit test
+        # before start(), or on a future PyAV path). KNOWN to throttle
+        # the streaming fd if active — avoid in production.
         try:
             import time as _time
             from eo.leopard_linux import LeopardLinux as _LL, _SIZES as _LS
@@ -505,7 +534,7 @@ def _set_leopard_exposure_ext(
             finally:
                 cam.close()
             _set_leopard_exposure_ext._last_exp = tgt
-            return {"linux_xu": True, "exposure_ext_set": tgt,
+            return {"linux_xu_fallback": True, "exposure_ext_set": tgt,
                     "exposure_ext_readback": rb,
                     "gain_set": gain, "ae_off": ae_off}
         except Exception as _e:
@@ -926,6 +955,8 @@ class IMX568Capture:
                         # self._cap.grab(), which does the u16 reinterpretation
                         # + p1/p99 stretch and populates last_raw_stats for AE.
                         self._cap = v4l2cap  # type: ignore[assignment]
+                        global _active_v4l2_backend
+                        _active_v4l2_backend = v4l2cap
                         self.device_index = 0
                         self.actual_width = NATIVE_W
                         self.actual_height = NATIVE_H

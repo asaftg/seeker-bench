@@ -48,6 +48,19 @@ thermal:
       wide:   { hfov_deg: 37.5 }
       mid:    { hfov_deg: 18.75 }
       narrow: { hfov_deg: 12.5 }
+  # MOSSE correlation tracker bridges H/V classifier gaps.
+  # When classify_interval_frames > 1, YOLO only runs every Nth
+  # frame. Between runs MOSSE tracks each existing bbox so IDs +
+  # labels stay locked. Cost ~1-3 ms per active track per frame.
+  # PSR loss threshold is looser than EOs because thermal targets
+  # (hot blobs) have less texture for correlation.
+  correlation_tracker:
+    enabled: true
+    psr_lost: 5.0
+    lost_frames: 6
+    learning_rate: 0.125
+    max_patch_dim: 96
+
 
 heat_detector:
   # residual = frame - spatial_mean(frame)
@@ -82,7 +95,11 @@ classifier:
   model_path: models/yolov8n.pt
   trained_model_path: models/seeker_thermal.pt   # preferred if exists
   conf_threshold: 0.40          # higher = fewer false DRONE labels; lower = catches faint drones
-  classify_interval_frames: auto  # auto | int. auto = 1 on GPU, 6 on CPU (~5Hz on laptop).
+  # 2026-05-08: bumped from auto(=1) -> 4. Thermal H/V YOLO TRT FP16
+  # is ~50ms per inference; running every frame at 60Hz capture caps
+  # publish rate at ~13-18Hz. With MOSSE correlation_tracker bridging
+  # the gaps, tracks stay locked between classifier ticks.
+  classify_interval_frames: 4  # was: auto (= 1 on GPU)
   roi_padding_px: 16
   # Model class-index → TargetClass mapping.
   # For the fine-tuned seeker_thermal.pt trained on thermal drone
