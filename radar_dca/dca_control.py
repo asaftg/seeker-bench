@@ -401,3 +401,20 @@ class DCAControl:
         except DCAControlError:
             # Swallow — stop should never raise.
             pass
+
+
+# --- LINUX DISPATCH SHIM (auto-added 2026-05-08) ---
+# On Linux, ``DCA1000EVM_CLI_Control.exe`` does not exist. Re-export the
+# Linux-native UDP-based implementation under the same ``DCAControl``
+# name so callers do not need a platform branch. Behaviour is
+# byte-identical at the wire level (same lvdsMode/dataFormatMode/
+# packetDelay defaults derived from the cf.json the Windows path
+# generates).
+import sys as _sys
+if _sys.platform.startswith("linux"):
+    from radar_dca.dca_control_linux import (
+        DCAControl,           # noqa: F811 -- intentional re-export
+        DCAControlError,      # noqa: F811
+        FpgaVersion,          # noqa: F811
+        SystemStatus,         # noqa: F811
+    )

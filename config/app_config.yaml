@@ -570,6 +570,7 @@ fusion:
   radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
 
 gimbal:
+  driver: waveshare_st3025      # 2026-05-08: switched from maestro (V1) to bus-servo (V2) hardware
   # Pan/tilt via Pololu Micro Maestro 6-Channel (Ticket 4).
   # Port is auto-detected via USB VID=0x1FFB, BUT: in "USB Dual Port"
   # serial mode the Maestro exposes TWO COM ports (Command + TTL), and
@@ -579,7 +580,7 @@ gimbal:
   # 13). COM4 was verified as the Command Port via `scripts/gimbal_probe
   # --sweep`. Leave this pinned; run the probe again if ports shuffle.
   enabled: true
-  port: /dev/seeker_maestro                    # Command Port (COM5 on this box is TTL)
+  port: /dev/seeker_gimbal                    # Command Port (COM5 on this box is TTL)
   rate_hz: 60                   # command/publish loop rate
 
   # Home / rest pose. tilt convention: 0 = horizon, higher = more up.
@@ -817,6 +818,42 @@ gimbal:
     us_at_min_deg: 1030.0
     us_at_max_deg: 2000.0
     invert: false
+
+  waveshare:
+    port: null                  # auto-detect by VID/PID; pin to "COMn" if needed
+    baud: 1000000
+    # Servo-side acceleration ramp (register 0x29, 0..255). Higher = snappier
+    # response, lower = smoother. 0 disables the ramp (default firmware
+    # behaviour) and produces visible jerk on per-tick goal-position writes.
+    # Symmetric across axes — both servos are identical hardware and at
+    # the same per-tick rate they should feel the same.
+    # ki = Position-Integral gain (register 0x17, 0..255). Factory
+    # default is 0, which leaves a couple degrees of steady-state
+    # error against any constant load. Tilt has gravity pulling the
+    # mounted system down so it benefits more from I; pan only fights
+    # rolling friction. Too high causes hunting — 1..4 is the safe
+    # band.
+    tilt:
+      servo_id: 1
+      # 2026-05-01: spline re-clocked. Was zero_raw=893 invert=false;
+      # post-rework horizon sits at raw 1917 and vertical at raw 893,
+      # so we flip the convention: zero_raw=1917 (=horizon) with
+      # invert=true so increasing system tilt walks raw downward
+      # toward 893 (=vertical).
+      zero_raw: 1917            # raw at system 0° (horizon)
+      invert: true
+      raw_min: 893              # ≈ +90° system (vertical, lower raw end)
+      raw_max: 1917             # ≈   0° system (horizon, upper raw end)
+      acceleration: 50
+      ki: 8                     # gravity + stiction; raise if still settles off-zero, lower if it hunts
+    pan:
+      servo_id: 2
+      zero_raw: 2321            # raw at system 0° (forward-centered)
+      invert: false
+      raw_min: 1638             # ≈ -60° system
+      raw_max: 3004             # ≈ +60° system
+      acceleration: 50
+      ki: 2
 
 gui:
   host: 0.0.0.0

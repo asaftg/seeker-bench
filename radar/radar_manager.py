@@ -342,7 +342,43 @@ class RadarManager:
         return None
 
     def _run_xds110_reset(self) -> bool:
-        """Pulse nRST on the AWR via XDS110 JTAG. Returns True on exit 0."""
+        """Pulse nRST on the AWR via the XDS110 debug bridge. Returns True
+        on success. Linux uses an in-tree pyusb-based pulser
+        (``tools/xds110reset_linux.py``); Windows shells out to TI's
+        ``xds110reset.exe`` shipped with CCS.
+
+        On Linux the AWR2944P's XDS110 is fully software-resettable via
+        libusb — no CCS install is required. The pyusb path was added
+        2026-05-08 when seeker moved from Windows to the Jetson; the
+        Windows-only path stayed in place for the bench laptop.
+        """
+        import sys as _sys
+        if _sys.platform.startswith("linux"):
+            try:
+                import os as _os2
+                _tools_dir = _os2.path.join(
+                    _os2.path.dirname(_os2.path.dirname(_os2.path.abspath(__file__))),
+                    "tools",
+                )
+                if _tools_dir not in _sys.path:
+                    _sys.path.insert(0, _tools_dir)
+                from xds110reset_linux import xds110_pulse_nrst
+            except Exception as e:
+                log.error(
+                    "[ISSUE2-RECOVERY] xds110reset_linux import failed: %s "
+                    "(install pyusb in the venv, then retry)", e,
+                )
+                return False
+            log.warning("[ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)")
+            try:
+                xds110_pulse_nrst(hold_ms=80)
+            except Exception as e:
+                log.error("[ISSUE2-RECOVERY] xds110reset_linux failed: %s", e)
+                return False
+            log.info("[ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting")
+            return True
+
+        # ---- Windows path (legacy) ----
         exe = self._find_xds110_reset()
         if exe is None:
             log.error(
