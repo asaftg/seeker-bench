@@ -880,7 +880,7 @@ gui:
   host: 0.0.0.0
   port: 8080
   open_browser: true
-  ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)
+  ws_fps: 40                    # 2026-05-09: was 30 (too aggressive, dropped thermal). 40 keeps thermal headroom while halving CPU vs original 60.
   thermal_jpeg_quality: 75      # 8-bit colormapped thermal looks fine at 80.
                                 # (Briefly bumped to 92 on 2026-04-27; full
                                 # revert to original on operator request when
