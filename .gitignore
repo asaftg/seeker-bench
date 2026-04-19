@@ -19,6 +19,7 @@ logs/*.log.*
 recordings/
 datasets/*/images/
 datasets/*/labels/
+datasets/**/*.zip
 runs/
 
 # Model weights (auto-downloaded; large)
