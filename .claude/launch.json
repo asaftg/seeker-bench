@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "seeker-gui-fake-thermal",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main.py", "--fake-thermal"],
+      "port": 8080
+    },
+    {
+      "name": "seeker-gui-real-camera",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main.py"],
+      "port": 8080
+    }
+  ]
+}

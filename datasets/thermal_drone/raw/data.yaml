@@ -1,0 +1,14 @@
+# Thermal Drone Detection Dataset
+# Source: University of Zagreb, Zenodo 10.5281/zenodo.15633051
+# License: CC BY 4.0
+# Resolution: 640x512 (matches FLIR Boson 640)
+# Train: 1504 images (1236 with drone, 268 negatives)
+# Val: 429 images
+# Test: 211 images
+
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['drone']

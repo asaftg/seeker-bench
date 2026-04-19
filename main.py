@@ -1,0 +1,102 @@
+"""
+Seeker-01 entry point.
+
+Launches the enabled sensor managers and the FastAPI GUI in a
+single process. Flags:
+
+    --fake-thermal     Use synthetic thermal source (no camera needed)
+    --no-classifier    Skip the YOLO/shape classifier
+    --host, --port     Override GUI bind address
+    --no-browser       Don't auto-open Chrome
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import threading
+import time
+import webbrowser
+
+import uvicorn
+
+from common.config import load_config
+from common.logging_setup import configure, get_logger
+from gui.app import create_app
+from thermal.thermal_manager import ThermalManager
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Seeker-01 Bench Test")
+    p.add_argument("--fake-thermal", action="store_true", help="Synthetic thermal source")
+    p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
+    p.add_argument("--host", default=None, help="GUI bind host")
+    p.add_argument("--port", type=int, default=None, help="GUI bind port")
+    p.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser")
+    p.add_argument("--device", default="auto", help="Camera device index")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    cfg = load_config()
+    log_cfg = cfg.get("logging", {})
+    configure(
+        level=str(log_cfg.get("level", "INFO")),
+        log_dir=log_cfg.get("log_dir"),
+        max_bytes=int(log_cfg.get("max_bytes", 5_000_000)),
+        backup_count=int(log_cfg.get("backup_count", 3)),
+    )
+    log = get_logger(__name__)
+    log.info("=" * 50)
+    log.info("Seeker-01 starting (fake_thermal=%s)", args.fake_thermal)
+    log.info("=" * 50)
+
+    # Start thermal manager
+    thermal = ThermalManager(
+        use_fake=args.fake_thermal,
+        device_index=args.device,
+        enable_classifier=not args.no_classifier,
+    )
+    thermal.start()
+
+    # Build FastAPI app. The thermal manager is passed in so the runtime
+    # config endpoints can mutate detector parameters live from the GUI.
+    app = create_app(thermal_manager=thermal)
+
+    host = args.host or str(cfg.get("gui", {}).get("host", "127.0.0.1"))
+    port = args.port or int(cfg.get("gui", {}).get("port", 8080))
+    open_browser = not args.no_browser and bool(cfg.get("gui", {}).get("open_browser", True))
+
+    if open_browser:
+        def _delayed_open():
+            time.sleep(1.0)  # let uvicorn bind first
+            try:
+                webbrowser.open(f"http://{host}:{port}/")
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_open, daemon=True).start()
+
+    def _shutdown(*_):
+        log.info("Shutdown signal received, stopping sensors")
+        thermal.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    try:
+        signal.signal(signal.SIGTERM, _shutdown)
+    except (AttributeError, ValueError):
+        pass  # Windows / non-main thread
+
+    log.info("GUI -> http://%s:%d/", host, port)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+    finally:
+        thermal.stop()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

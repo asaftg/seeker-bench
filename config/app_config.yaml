@@ -1,0 +1,94 @@
+# ───────────────────────────────────────────────────────────
+# Seeker-01 Bench Test — Application Config
+# ───────────────────────────────────────────────────────────
+# Every tunable lives here. Code modules should never hardcode
+# thresholds or paths; they read from this file via common.config.
+# Changing a value here and restarting the app should be enough.
+
+thermal:
+  # Camera
+  device_index: auto            # auto | 0 | 1 | 2 | 3
+  resolution: [640, 512]        # FLIR Boson 640
+  mode: RAW16                   # RAW16 (Y16) | AGC8 (YUY2)
+  target_fps: 60
+
+  # FOV (FLIR ADK 40640U075 is 75°H × ~60°V)
+  hfov_deg: 75.0
+  vfov_deg: 60.0
+
+  # AGC
+  agc:
+    low_percentile: 2
+    high_percentile: 98
+    colormap: INFERNO           # INFERNO | IRONBOW | WHITE_HOT
+
+  # Digital zoom presets (emulated narrow FOV)
+  digital_zoom:
+    enabled: true
+    preset: full                # full | wide | mid | narrow | tight
+    presets:
+      full:   { hfov_deg: 75.0 }
+      wide:   { hfov_deg: 37.5 }
+      mid:    { hfov_deg: 18.75 }
+      narrow: { hfov_deg: 12.5 }
+
+heat_detector:
+  # residual = frame - spatial_mean(frame)
+  # threshold = median(residual) + k * 1.4826 * MAD(residual)
+  # Defaults tuned for an INDOOR 8-bit AGC'd scene — raise threshold_k
+  # or lower min_blob_area_px once you're pointing at sky backgrounds.
+  threshold_k: 8.0              # lower = more sensitive (x MAD)
+  background_kernel: 31         # spatial background kernel (odd)
+  min_blob_area_px: 80          # ignores noise specks (< ~9x9 px)
+  max_blob_area_px: 30000       # allow large targets (hot cup at narrow zoom)
+  max_detections_per_frame: 6
+  algorithm: tophat
+  tophat_kernel: 31             # max target diameter in pixels (odd; bigger = catches larger objects)
+
+  # Temporal tracker — suppresses flicker, smooths bboxes.
+  # A blob must survive `min_hits` frames before a box is drawn;
+  # a confirmed blob survives up to `max_misses` frames of missing
+  # detections before being dropped.
+  tracker:
+    enabled: true
+    max_dist_px: 40             # max centroid distance (px) to match across frames
+    min_hits: 5                 # consecutive frames before a box is shown
+    max_misses: 5               # grace frames after a track stops matching
+    ema: 0.5                    # bbox smoothing: 0 = raw, 1 = frozen
+
+classifier:
+  enabled: true
+  model_path: models/yolov8n.pt
+  trained_model_path: models/seeker_thermal.pt   # preferred if exists
+  conf_threshold: 0.40          # higher = fewer false DRONE labels; lower = catches faint drones
+  classify_interval_frames: 15  # YOLO runs every Nth frame; tracker keeps labels sticky between runs
+  roi_padding_px: 16
+  # Model class-index → TargetClass mapping.
+  # For the fine-tuned seeker_thermal.pt trained on thermal drone
+  # data: class 0 = drone. Stock COCO weights are not loaded.
+  class_to_target:
+    0: drone
+
+radar:
+  enabled: false                # Phase A: radar disconnected placeholder
+  # real radar params added in Phase B
+
+fusion:
+  enabled: false                # Phase A: no fusion
+
+gui:
+  host: 127.0.0.1
+  port: 8080
+  open_browser: true
+  ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)
+  thermal_jpeg_quality: 80
+
+recording:
+  output_dir: ./recordings
+  format: placeholder           # Phase A: stub; HDF5 added later
+
+logging:
+  level: INFO
+  log_dir: ./logs
+  max_bytes: 5242880
+  backup_count: 3

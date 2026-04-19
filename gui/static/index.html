@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SEEKER-01 Bench Test</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- Top bar -->
+<div class="topbar">
+  <div class="topbar-left">
+    <div class="logo">SEEKER<span>-01</span></div>
+    <div class="connection-pills">
+      <div id="pill-radar"   class="pill pill-disconnected"><span class="pill-dot"></span>RADAR</div>
+      <div id="pill-thermal" class="pill pill-disconnected"><span class="pill-dot"></span>THERMAL</div>
+      <div id="pill-fusion"  class="pill pill-disconnected"><span class="pill-dot"></span>FUSION</div>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="ws-status" class="ws-status">WS: connecting…</span>
+  </div>
+</div>
+
+<!-- Tab bar -->
+<div class="tabbar">
+  <div class="tab active" data-tab="main">MAIN</div>
+  <div class="tab" data-tab="thermal">THERMAL</div>
+  <div class="tab" data-tab="engineering">ENGINEERING</div>
+</div>
+
+<!-- Main dashboard -->
+<div class="page active" data-page="main">
+  <div class="dashboard-grid">
+    <div id="banner" class="detection-banner banner-scanning">
+      <span class="banner-icon">◯</span>
+      <span id="banner-text">SCANNING — NO HEAT DETECTED</span>
+    </div>
+
+    <!-- Thermal panel -->
+    <div class="sensor-panel">
+      <div class="panel-header">
+        <div class="panel-title"><span class="dot" style="background:var(--thermal-orange)"></span>THERMAL</div>
+        <div class="panel-controls">
+          <button class="panel-btn active" data-zoom="full">75°</button>
+          <button class="panel-btn" data-zoom="wide">37°</button>
+          <button class="panel-btn" data-zoom="mid">18°</button>
+          <button class="panel-btn" data-zoom="narrow">12°</button>
+        </div>
+      </div>
+      <div class="panel-subbar">
+        <label class="slider-row">
+          <span class="slider-label">SENSITIVITY</span>
+          <!-- Inverted: left = strictest (high k), right = most sensitive.
+               k = median + k*MAD threshold. Low k = catches faint blobs.
+               Useful range is ~2-20; beyond 20 nothing is ever detected. -->
+          <input id="thr-slider" type="range" min="2" max="20" step="0.5" value="14" data-invert="1">
+          <span class="slider-val" id="thr-val">8.0</span>
+          <span class="slider-unit">×MAD</span>
+        </label>
+        <label class="slider-row">
+          <span class="slider-label">MIN BLOB</span>
+          <input id="minarea-slider" type="range" min="3" max="500" step="1" value="420" data-invert="1">
+          <span class="slider-val" id="minarea-val">80</span>
+          <span class="slider-unit">px</span>
+        </label>
+      </div>
+      <div class="panel-body">
+        <canvas id="thermal-canvas" class="sensor-canvas"></canvas>
+        <div id="thermal-disconnected" class="disconnect-overlay hidden">THERMAL<br>DISCONNECTED</div>
+      </div>
+    </div>
+
+    <!-- Radar panel (Phase A: disconnected placeholder) -->
+    <div class="sensor-panel">
+      <div class="panel-header">
+        <div class="panel-title"><span class="dot" style="background:var(--radar-cyan)"></span>RADAR</div>
+      </div>
+      <div class="panel-body">
+        <canvas id="radar-canvas" class="sensor-canvas"></canvas>
+        <div class="disconnect-overlay">RADAR<br>DISCONNECTED</div>
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div class="status-bar">
+      <div class="status-card">
+        <div class="status-icon thermal">T</div>
+        <div>
+          <div class="status-label">THERMAL FPS</div>
+          <div class="status-value" id="stat-thermal-fps">—</div>
+        </div>
+      </div>
+      <div class="status-card">
+        <div class="status-icon thermal">D</div>
+        <div>
+          <div class="status-label">DETECTIONS</div>
+          <div class="status-value" id="stat-det-count">0</div>
+        </div>
+      </div>
+      <div class="status-card">
+        <div class="status-icon radar">R</div>
+        <div>
+          <div class="status-label">RADAR</div>
+          <div class="status-value" id="stat-radar">OFFLINE</div>
+        </div>
+      </div>
+      <div class="status-card">
+        <div class="status-icon fused">F</div>
+        <div>
+          <div class="status-label">FUSION</div>
+          <div class="status-value" id="stat-fusion">INACTIVE</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Thermal detail page -->
+<div class="page" data-page="thermal">
+  <div class="detail-grid">
+    <div class="sensor-panel">
+      <div class="panel-header">
+        <div class="panel-title"><span class="dot" style="background:var(--thermal-orange)"></span>LIVE FEED</div>
+      </div>
+      <div class="panel-body">
+        <canvas id="thermal-canvas-big" class="sensor-canvas"></canvas>
+        <div id="thermal-disconnected-big" class="disconnect-overlay hidden">THERMAL<br>DISCONNECTED</div>
+      </div>
+    </div>
+    <div class="sensor-panel">
+      <div class="panel-header">
+        <div class="panel-title">DETECTIONS</div>
+      </div>
+      <div class="panel-body panel-body-scroll">
+        <table class="det-table">
+          <thead><tr><th>#</th><th>BBOX</th><th>AREA</th><th>CONTRAST</th><th>CLASS</th><th>CONF</th></tr></thead>
+          <tbody id="det-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Engineering page -->
+<div class="page" data-page="engineering">
+  <div class="eng-grid">
+    <div class="sensor-panel">
+      <div class="panel-header"><div class="panel-title">TIMING</div></div>
+      <div class="panel-body" style="padding:14px">
+        <div class="timing-row"><span class="timing-label">WS frame rate</span><span class="timing-val" id="eng-ws-fps">—</span></div>
+        <div class="timing-row"><span class="timing-label">Thermal frame id</span><span class="timing-val" id="eng-frame-id">—</span></div>
+        <div class="timing-row"><span class="timing-label">Image size</span><span class="timing-val" id="eng-size">—</span></div>
+        <div class="timing-row"><span class="timing-label">HFOV / VFOV</span><span class="timing-val" id="eng-fov">—</span></div>
+        <div class="timing-row"><span class="timing-label">Zoom preset</span><span class="timing-val" id="eng-zoom">—</span></div>
+        <div class="timing-row"><span class="timing-label">Detections / frame</span><span class="timing-val" id="eng-det">—</span></div>
+        <div class="timing-row"><span class="timing-label">Classifier</span><span class="timing-val" id="eng-classifier">—</span></div>
+      </div>
+    </div>
+    <div class="sensor-panel">
+      <div class="panel-header"><div class="panel-title">CONNECTION</div></div>
+      <div class="panel-body" style="padding:14px">
+        <div class="timing-row"><span class="timing-label">WebSocket URL</span><span class="timing-val" id="eng-ws-url">—</span></div>
+        <div class="timing-row"><span class="timing-label">WebSocket state</span><span class="timing-val" id="eng-ws-state">—</span></div>
+        <div class="timing-row"><span class="timing-label">Last frame age</span><span class="timing-val" id="eng-age">—</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

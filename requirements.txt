@@ -1,0 +1,28 @@
+# ───────────────────────────────────────────────────────────
+# Seeker-01 Bench Test — Phase A (Thermal + GUI)
+# ───────────────────────────────────────────────────────────
+# Pin to compatible-release specifiers so fresh installs on
+# field laptops stay reproducible without being locked.
+
+# Core numerics / CV
+numpy>=1.24,<3.0
+scipy>=1.10,<2.0
+opencv-python>=4.8,<5.0
+
+# Classifier (YOLO)
+ultralytics>=8.1,<9.0   # pulls in torch, torchvision
+
+# Web GUI
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+websockets>=12.0,<14.0
+
+# Config + data
+pyyaml>=6.0,<7.0
+pillow>=10.0,<12.0
+
+# Testing
+pytest>=7.4,<9.0
+
+# Packaging (used by build_exe.bat, not by runtime)
+pyinstaller>=6.3,<7.0

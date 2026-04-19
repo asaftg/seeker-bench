@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Logs + data
+logs/*.log
+logs/*.log.*
+recordings/
+datasets/*/images/
+datasets/*/labels/
+runs/
+
+# Model weights (auto-downloaded; large)
+models/*.pt
+!models/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
