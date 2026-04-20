@@ -201,18 +201,38 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
 
         async def _sender() -> None:
             while True:
-                tf = BUS.get_latest(Topic.THERMAL)
-                ef = BUS.get_latest(Topic.EO)
-                payload = build_ws_message(
-                    tf=tf,
-                    ef=ef,
-                    jpeg_quality=jpeg_quality,
-                    tracker_on=state["tracker_on"],
-                    nir_mode=state["nir_mode"],
-                    gimbal_pan=state["gimbal_pan"],
-                    gimbal_tilt=state["gimbal_tilt"],
-                )
-                await ws.send_text(json.dumps(payload))
+                try:
+                    tf = BUS.get_latest(Topic.THERMAL)
+                    ef = BUS.get_latest(Topic.EO)
+                    payload = build_ws_message(
+                        tf=tf,
+                        ef=ef,
+                        jpeg_quality=jpeg_quality,
+                        tracker_on=state["tracker_on"],
+                        nir_mode=state["nir_mode"],
+                        gimbal_pan=state["gimbal_pan"],
+                        gimbal_tilt=state["gimbal_tilt"],
+                    )
+                    # `default=str` is a safety net for numpy scalars that
+                    # slip through the dataclass contracts — better to ship
+                    # a stringified value than kill the WS connection.
+                    text = json.dumps(payload, default=str)
+                except WebSocketDisconnect:
+                    raise
+                except Exception:
+                    log.exception("build_ws_message failed — skipping frame")
+                    await asyncio.sleep(period)
+                    continue
+
+                try:
+                    await ws.send_text(text)
+                except WebSocketDisconnect:
+                    raise
+                except RuntimeError as e:
+                    # Starlette raises RuntimeError once the socket is closed.
+                    # Treat it as a clean disconnect rather than an error.
+                    log.info("WebSocket send after close: %s", e)
+                    return
                 await asyncio.sleep(period)
 
         async def _receiver() -> None:
