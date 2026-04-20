@@ -78,8 +78,15 @@ classifier:
   # thermal imagery than a fine-tuned model.
   classifier_hv_enabled: true
   classifier_hv_model: models/seeker_thermal_hv.pt
-  classifier_hv_conf: 0.40
+  classifier_hv_conf: 0.55           # higher = fewer FPs on warm chips/ceiling lights
   classifier_hv_classes: [person, vehicle]
+  # Reject tiny h/v detections — a real person/car at bench range is
+  # much bigger than a hand-sized warm patch. Tune up if too conservative.
+  classifier_hv_min_bbox_px: 2500    # ~50x50 minimum area
+  # Temporal persistence: a h/v box must survive this many classifier
+  # runs at IoU >= 0.3 before it's drawn. Kills single-frame flicker FPs.
+  classifier_hv_min_hits: 2
+  classifier_hv_max_misses: 3
 
 radar:
   enabled: false                # Phase A: radar disconnected placeholder

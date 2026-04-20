@@ -107,9 +107,24 @@ class ThermalManager:
             try:
                 self._classifier_hv = HumanVehicleClassifier(
                     model_path=str(ccfg.get("classifier_hv_model", "models/seeker_thermal_hv.pt")),
-                    conf_threshold=float(ccfg.get("classifier_hv_conf", 0.40)),
+                    conf_threshold=float(ccfg.get("classifier_hv_conf", 0.55)),
                 )
-                log.info("HV classifier loaded (active=%s)", self._classifier_hv.active)
+                self._hv_min_bbox_px = int(ccfg.get("classifier_hv_min_bbox_px", 2500))
+                self._hv_min_hits = int(ccfg.get("classifier_hv_min_hits", 2))
+                self._hv_max_misses = int(ccfg.get("classifier_hv_max_misses", 3))
+                # Simple h/v persistence tracker: each entry is
+                # {bbox, class, conf, hits, misses}. We IoU-match each new
+                # YOLO det to the nearest cached track; a track must reach
+                # `min_hits` before it's shown, and decays after `max_misses`
+                # classifier runs without a matching detection.
+                self._hv_tracks: list[dict] = []
+                log.info(
+                    "HV classifier loaded (active=%s, conf>=%s, min_bbox=%d, min_hits=%d)",
+                    self._classifier_hv.active,
+                    float(ccfg.get("classifier_hv_conf", 0.55)),
+                    self._hv_min_bbox_px,
+                    self._hv_min_hits,
+                )
             except Exception as e:
                 log.warning("HV classifier init failed: %s — h/v disabled", e)
                 self._classifier_hv = None
@@ -126,6 +141,7 @@ class ThermalManager:
         self._source: Optional[_CaptureLike] = None
         self._frame_id = 0
         self._last_classifications = None  # cache between classifier runs
+        self._last_hv_dets: list = []      # cached h/v full-frame detections
 
         # Latest-frame handoff from capture thread to process thread.
         # The capture thread drains the camera as fast as it can and
@@ -365,100 +381,158 @@ class ThermalManager:
             log.warning("DetectionTracker failed: %s", e)
 
         # ── 5. Classification (throttled) ──────────────────────────
-        if detections and (self._frame_id % self._classify_every == 0):
-            # 5a. Drone classifier (Phase A — always runs when enabled)
-            drone_results = None
-            if self._classifier is not None:
+        run_classifiers = (self._frame_id % self._classify_every == 0)
+
+        # 5a. Drone classifier — ROI-based, only meaningful when heat
+        # detector produced blobs (drones are tiny hot points at range).
+        if run_classifiers and detections and self._classifier is not None:
+            try:
+                drone_results = self._classifier.classify(display, detections)
+                for det, res in zip(detections, drone_results):
+                    det.classification = res
+                self._last_classifications = drone_results
+            except Exception as e:
+                log.warning("Drone classifier failed: %s", e)
+
+        # 5b. H/V classifier (Phase B Ticket 1) — FULL-FRAME mode.
+        # Heat-blob ROIs are unreliable for people (warm bodies fragment
+        # into scattered spots) and useless for cars (often cold). So we
+        # run YOLO on the whole display frame at `classify_interval_frames`
+        # rate, feed results into a tiny persistence tracker, and merge
+        # CONFIRMED tracks into the detections list every frame.
+        if self._classifier_hv is not None:
+            from common.frames import (
+                BBox as _BBox,
+                ClassificationResult,
+                TargetClass,
+                ThermalDetection,
+            )
+
+            def _iou_xywh(ax0, ay0, aw, ah, bx0, by0, bw, bh):
+                ax1, ay1 = ax0 + aw, ay0 + ah
+                bx1, by1 = bx0 + bw, by0 + bh
+                ix0 = max(ax0, bx0); iy0 = max(ay0, by0)
+                ix1 = min(ax1, bx1); iy1 = min(ay1, by1)
+                iw = max(0, ix1 - ix0); ih = max(0, iy1 - iy0)
+                inter = iw * ih
+                if inter == 0:
+                    return 0.0
+                union = aw * ah + bw * bh - inter
+                return inter / float(union) if union > 0 else 0.0
+
+            # Only poll YOLO on classifier ticks; tracks coast between runs.
+            if run_classifiers:
                 try:
-                    drone_results = self._classifier.classify(display, detections)
-                    for det, res in zip(detections, drone_results):
-                        det.classification = res
-                    self._last_classifications = drone_results
-                except Exception as e:
-                    log.warning("Drone classifier failed: %s", e)
-
-            # 5b. H/V classifier (Phase B Ticket 1) — FULL-FRAME mode.
-            # Heat-blob ROIs are unreliable for people (warm bodies fragment
-            # into scattered spots) and useless for cars (often cold). So we
-            # run YOLO on the whole display frame and merge its detections
-            # with the heat blobs by IoU:
-            #   IoU > 0.3 → replace that blob's classification with the
-            #               YOLO label (purple/red).
-            #   no match → append as a NEW ThermalDetection so people/cars
-            #              still get a bbox even when no heat blob was
-            #              there to begin with.
-            if self._classifier_hv is not None:
-                try:
-                    hv_dets = self._classifier_hv.detect_full_frame(display)
-                    if hv_dets:
-                        from common.frames import (
-                            BBox as _BBox,
-                            ClassificationResult,
-                            TargetClass,
-                            ThermalDetection,
-                        )
-
-                        def _iou(a, b):
-                            ax0, ay0, aw, ah = a.x, a.y, a.w, a.h
-                            bx0, by0, bw, bh = b
-                            ax1, ay1 = ax0 + aw, ay0 + ah
-                            bx1, by1 = bx0 + bw, by0 + bh
-                            ix0 = max(ax0, bx0); iy0 = max(ay0, by0)
-                            ix1 = min(ax1, bx1); iy1 = min(ay1, by1)
-                            iw = max(0, ix1 - ix0); ih = max(0, iy1 - iy0)
-                            inter = iw * ih
-                            if inter == 0:
-                                return 0.0
-                            union = aw * ah + bw * bh - inter
-                            return inter / float(union) if union > 0 else 0.0
-
-                        IOU_MERGE = 0.30
-                        for hv in hv_dets:
-                            bx, by, bw, bh = hv["bbox"]
-                            try:
-                                tc = TargetClass(hv["class"])
-                            except ValueError:
-                                tc = TargetClass.UNKNOWN
-                            hv_conf = float(hv["conf"])
-
-                            # Find best-overlap heat detection
-                            best_i = -1
-                            best_iou = 0.0
-                            for i, det in enumerate(detections):
-                                iou = _iou(det.bbox, (bx, by, bw, bh))
-                                if iou > best_iou:
-                                    best_iou = iou
-                                    best_i = i
-
-                            if best_i >= 0 and best_iou >= IOU_MERGE:
-                                det = detections[best_i]
-                                drone_conf = (
-                                    det.classification.confidence
-                                    if det.classification is not None
-                                    else 0.0
-                                )
-                                if hv_conf > drone_conf:
-                                    det.classification = ClassificationResult(
-                                        target_class=tc,
-                                        confidence=hv_conf,
-                                        classifier_used="yolo_hv",
-                                    )
-                            else:
-                                # No heat blob here — add a new detection
-                                # with the YOLO bbox. Contrast is unknown;
-                                # use 0 so heat-based sorting puts it last.
-                                detections.append(ThermalDetection(
-                                    bbox=_BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
-                                    area_px=int(bw * bh),
-                                    contrast=0.0,
-                                    classification=ClassificationResult(
-                                        target_class=tc,
-                                        confidence=hv_conf,
-                                        classifier_used="yolo_hv",
-                                    ),
-                                ))
+                    raw_hv = self._classifier_hv.detect_full_frame(display)
                 except Exception as e:
                     log.warning("HV full-frame step failed: %s", e)
+                    raw_hv = []
+
+                # Size gate: drop sub-threshold boxes (warm chips, hand patches).
+                hv_dets = [
+                    d for d in raw_hv
+                    if (d["bbox"][2] * d["bbox"][3]) >= self._hv_min_bbox_px
+                ]
+                self._last_hv_dets = hv_dets
+
+                # Match each new det to an existing track (IoU >= 0.3).
+                matched = [False] * len(self._hv_tracks)
+                for hv in hv_dets:
+                    bx, by, bw, bh = hv["bbox"]
+                    best_t = -1
+                    best_iou = 0.0
+                    for ti, trk in enumerate(self._hv_tracks):
+                        if matched[ti]:
+                            continue
+                        if trk["class"] != hv["class"]:
+                            continue
+                        tb = trk["bbox"]
+                        iou = _iou_xywh(tb[0], tb[1], tb[2], tb[3], bx, by, bw, bh)
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_t = ti
+                    if best_t >= 0 and best_iou >= 0.30:
+                        trk = self._hv_tracks[best_t]
+                        # Light EMA on the bbox to reduce jitter.
+                        a = 0.5
+                        trk["bbox"] = (
+                            int(a * trk["bbox"][0] + (1 - a) * bx),
+                            int(a * trk["bbox"][1] + (1 - a) * by),
+                            int(a * trk["bbox"][2] + (1 - a) * bw),
+                            int(a * trk["bbox"][3] + (1 - a) * bh),
+                        )
+                        trk["conf"] = float(hv["conf"])
+                        trk["hits"] += 1
+                        trk["misses"] = 0
+                        matched[best_t] = True
+                    else:
+                        self._hv_tracks.append({
+                            "bbox": (int(bx), int(by), int(bw), int(bh)),
+                            "class": hv["class"],
+                            "conf": float(hv["conf"]),
+                            "hits": 1,
+                            "misses": 0,
+                        })
+
+                # Age unmatched tracks; drop if they exceed max_misses.
+                kept = []
+                for ti, trk in enumerate(self._hv_tracks):
+                    if ti < len(matched) and matched[ti]:
+                        kept.append(trk)
+                    else:
+                        trk["misses"] += 1
+                        if trk["misses"] <= self._hv_max_misses:
+                            kept.append(trk)
+                self._hv_tracks = kept
+
+            # Merge CONFIRMED h/v tracks into detections on EVERY frame
+            # (not just classifier ticks) so overlays don't flicker.
+            IOU_MERGE = 0.30
+            for trk in self._hv_tracks:
+                if trk["hits"] < self._hv_min_hits:
+                    continue
+                bx, by, bw, bh = trk["bbox"]
+                try:
+                    tc = TargetClass(trk["class"])
+                except ValueError:
+                    tc = TargetClass.UNKNOWN
+                hv_conf = trk["conf"]
+
+                best_i = -1
+                best_iou = 0.0
+                for i, det in enumerate(detections):
+                    iou = _iou_xywh(
+                        det.bbox.x, det.bbox.y, det.bbox.w, det.bbox.h,
+                        bx, by, bw, bh,
+                    )
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_i = i
+
+                if best_i >= 0 and best_iou >= IOU_MERGE:
+                    det = detections[best_i]
+                    drone_conf = (
+                        det.classification.confidence
+                        if det.classification is not None
+                        else 0.0
+                    )
+                    if hv_conf > drone_conf:
+                        det.classification = ClassificationResult(
+                            target_class=tc,
+                            confidence=hv_conf,
+                            classifier_used="yolo_hv",
+                        )
+                else:
+                    detections.append(ThermalDetection(
+                        bbox=_BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
+                        area_px=int(bw * bh),
+                        contrast=0.0,
+                        classification=ClassificationResult(
+                            target_class=tc,
+                            confidence=hv_conf,
+                            classifier_used="yolo_hv",
+                        ),
+                    ))
 
         # ── 6. Publish ─────────────────────────────────────────────
         tf = ThermalFrame(
