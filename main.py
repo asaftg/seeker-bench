@@ -76,15 +76,33 @@ def main() -> int:
     eo_enabled_in_cfg = bool(eo_cfg.get("enabled", True))
     if not args.no_eo and eo_enabled_in_cfg:
         eo_device = args.eo_device if args.eo_device is not None else eo_cfg.get("device_index", "auto")
+        # Wait briefly for thermal to finish opening its camera so we can
+        # exclude that index from EO's auto-probe. cv2/DirectShow does NOT
+        # reliably lock devices on Windows — without this, both managers
+        # race for index 0 and one ends up with a broken handle whose
+        # grabs return None, leaving both panels in DISCONNECTED.
+        thermal_idx: Optional[int] = None
+        if not args.fake_thermal:
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                src = getattr(thermal, "_source", None)
+                if src is not None:
+                    idx = getattr(src, "device_index", None)
+                    if isinstance(idx, int):
+                        thermal_idx = idx
+                        break
+                time.sleep(0.1)
+            if thermal_idx is not None:
+                log.info("Thermal opened on index %d — excluding from EO probe", thermal_idx)
+            else:
+                log.warning("Thermal not opened within 8s — EO probe may collide")
         try:
-            # No exclude_indices: cv2 device-locking handles collisions
-            # naturally — if thermal grabbed index 0, EO's auto-probe
-            # fails on 0 and moves to 1. User can override both via the
-            # GUI device-selector dropdowns.
+            excludes = [thermal_idx] if thermal_idx is not None else []
             eo = EOManager(
                 use_fake=args.fake_eo,
                 device_index=eo_device,
                 enable_classifier=not args.no_classifier,
+                exclude_indices=excludes,
             )
             eo.start()
         except Exception as e:
