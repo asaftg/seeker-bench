@@ -76,7 +76,7 @@ classifier:
   # Until that model exists the h/v classifier falls back to stock yolov8n.pt
   # (COCO person/car/truck/bus classes) — still useful, just less accurate on
   # thermal imagery than a fine-tuned model.
-  classifier_hv_enabled: false
+  classifier_hv_enabled: true
   classifier_hv_model: models/seeker_thermal_hv.pt
   classifier_hv_conf: 0.40
   classifier_hv_classes: [person, vehicle]

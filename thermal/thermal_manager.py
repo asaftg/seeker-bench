@@ -377,44 +377,88 @@ class ThermalManager:
                 except Exception as e:
                     log.warning("Drone classifier failed: %s", e)
 
-            # 5b. H/V classifier (Phase B Ticket 1 — only when enabled)
+            # 5b. H/V classifier (Phase B Ticket 1) — FULL-FRAME mode.
+            # Heat-blob ROIs are unreliable for people (warm bodies fragment
+            # into scattered spots) and useless for cars (often cold). So we
+            # run YOLO on the whole display frame and merge its detections
+            # with the heat blobs by IoU:
+            #   IoU > 0.3 → replace that blob's classification with the
+            #               YOLO label (purple/red).
+            #   no match → append as a NEW ThermalDetection so people/cars
+            #              still get a bbox even when no heat blob was
+            #              there to begin with.
             if self._classifier_hv is not None:
-                h, w = display.shape[:2]
-                pad = 16  # roi_padding_px
                 try:
-                    for i, det in enumerate(detections):
-                        x0 = max(0, det.bbox.x - pad)
-                        y0 = max(0, det.bbox.y - pad)
-                        x1 = min(w, det.bbox.x + det.bbox.w + pad)
-                        y1 = min(h, det.bbox.y + det.bbox.h + pad)
-                        roi = display[y0:y1, x0:x1]
-                        hv_result = self._classifier_hv.classify(roi)
-                        if hv_result is None:
-                            continue  # h/v saw nothing → keep drone result
-
-                        hv_conf = float(hv_result.get("conf", 0.0))
-                        hv_cls  = str(hv_result.get("class", "unknown"))
-
-                        # Merge: highest confidence wins; tie-break → drone
-                        drone_conf = (
-                            det.classification.confidence
-                            if det.classification is not None
-                            else 0.0
+                    hv_dets = self._classifier_hv.detect_full_frame(display)
+                    if hv_dets:
+                        from common.frames import (
+                            BBox as _BBox,
+                            ClassificationResult,
+                            TargetClass,
+                            ThermalDetection,
                         )
-                        if hv_conf > drone_conf:
-                            from common.frames import ClassificationResult, TargetClass
+
+                        def _iou(a, b):
+                            ax0, ay0, aw, ah = a.x, a.y, a.w, a.h
+                            bx0, by0, bw, bh = b
+                            ax1, ay1 = ax0 + aw, ay0 + ah
+                            bx1, by1 = bx0 + bw, by0 + bh
+                            ix0 = max(ax0, bx0); iy0 = max(ay0, by0)
+                            ix1 = min(ax1, bx1); iy1 = min(ay1, by1)
+                            iw = max(0, ix1 - ix0); ih = max(0, iy1 - iy0)
+                            inter = iw * ih
+                            if inter == 0:
+                                return 0.0
+                            union = aw * ah + bw * bh - inter
+                            return inter / float(union) if union > 0 else 0.0
+
+                        IOU_MERGE = 0.30
+                        for hv in hv_dets:
+                            bx, by, bw, bh = hv["bbox"]
                             try:
-                                tc = TargetClass(hv_cls)
+                                tc = TargetClass(hv["class"])
                             except ValueError:
                                 tc = TargetClass.UNKNOWN
-                            det.classification = ClassificationResult(
-                                target_class=tc,
-                                confidence=hv_conf,
-                                classifier_used="yolo_hv",
-                            )
-                        # If equal or lower → keep drone result (tie-break → drone)
+                            hv_conf = float(hv["conf"])
+
+                            # Find best-overlap heat detection
+                            best_i = -1
+                            best_iou = 0.0
+                            for i, det in enumerate(detections):
+                                iou = _iou(det.bbox, (bx, by, bw, bh))
+                                if iou > best_iou:
+                                    best_iou = iou
+                                    best_i = i
+
+                            if best_i >= 0 and best_iou >= IOU_MERGE:
+                                det = detections[best_i]
+                                drone_conf = (
+                                    det.classification.confidence
+                                    if det.classification is not None
+                                    else 0.0
+                                )
+                                if hv_conf > drone_conf:
+                                    det.classification = ClassificationResult(
+                                        target_class=tc,
+                                        confidence=hv_conf,
+                                        classifier_used="yolo_hv",
+                                    )
+                            else:
+                                # No heat blob here — add a new detection
+                                # with the YOLO bbox. Contrast is unknown;
+                                # use 0 so heat-based sorting puts it last.
+                                detections.append(ThermalDetection(
+                                    bbox=_BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
+                                    area_px=int(bw * bh),
+                                    contrast=0.0,
+                                    classification=ClassificationResult(
+                                        target_class=tc,
+                                        confidence=hv_conf,
+                                        classifier_used="yolo_hv",
+                                    ),
+                                ))
                 except Exception as e:
-                    log.warning("HV classifier step failed: %s", e)
+                    log.warning("HV full-frame step failed: %s", e)
 
         # ── 6. Publish ─────────────────────────────────────────────
         tf = ThermalFrame(

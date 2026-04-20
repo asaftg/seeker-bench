@@ -20,6 +20,11 @@ recordings/
 datasets/*/images/
 datasets/*/labels/
 datasets/**/*.zip
+# Raw third-party datasets — do not commit (large, upstream-owned)
+datasets/hit_uav/
+datasets/hit_uav_hv/
+datasets/llvip/
+datasets/seeker_hv/
 runs/
 
 # Model weights (auto-downloaded; large)

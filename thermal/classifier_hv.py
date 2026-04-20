@@ -132,6 +132,61 @@ class HumanVehicleClassifier:
         return self._model is not None
 
     # ------------------------------------------------------------------
+    def detect_full_frame(self, image: np.ndarray) -> list[Dict[str, object]]:
+        """Run YOLO on the entire frame and return ALL detections above threshold.
+
+        This is the primary detection path for humans and vehicles — unlike
+        ``classify()`` which takes a crop from the heat blob detector, this
+        method sees the whole image so it can find people/cars that produce
+        little thermal contrast (e.g. a person in a warm room, a cold car).
+
+        Parameters
+        ----------
+        image:
+            BGR uint8 display frame (typically the AGC-colormapped thermal image).
+
+        Returns
+        -------
+        List of dicts, one per detection::
+
+            {"bbox": (x, y, w, h), "class": str, "conf": float}
+
+        ``bbox`` is in pixel coordinates of ``image``.  Empty list when the
+        model is not loaded or nothing exceeds the confidence threshold.
+        """
+        if self._model is None or image is None or image.size == 0:
+            return []
+        try:
+            results = self._model.predict(image, conf=self.conf_threshold, verbose=False)
+        except Exception as e:
+            log.warning("HV full-frame inference failed: %s", e)
+            return []
+        if not results:
+            return []
+        r = results[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return []
+
+        out: list[Dict[str, object]] = []
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int)
+        names = r.names or {}
+        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
+            if self._is_finetuned:
+                class_name = names.get(int(cls_id), "unknown")
+            else:
+                class_name = self._coco_map.get(int(cls_id))
+                if class_name is None:
+                    continue
+            x = int(max(0, x1))
+            y = int(max(0, y1))
+            w = int(max(1, x2 - x1))
+            h = int(max(1, y2 - y1))
+            out.append({"bbox": (x, y, w, h), "class": class_name, "conf": float(conf)})
+        return out
+
+    # ------------------------------------------------------------------
     def classify(self, roi_image: np.ndarray) -> Optional[Dict[str, object]]:
         """Run inference on a single BGR ROI image.
 
