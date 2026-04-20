@@ -73,6 +73,15 @@ class WebcamCapture:
         self.actual_width: int = 0
         self.actual_height: int = 0
         self._cap: Optional[cv2.VideoCapture] = None
+        # Try DirectShow first (faster, honors resolution hints). Fall
+        # back to MSMF + "any backend" — some UVC webcams only surface
+        # on MSMF, others only on the default backend. This is the
+        # single biggest source of "camera not found" bugs on Windows.
+        self._backends: list[tuple[str, int]] = [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("MSMF",  cv2.CAP_MSMF),
+            ("ANY",   cv2.CAP_ANY),
+        ]
 
     # ───────────────────────── lifecycle ─────────────────────────
 
@@ -83,44 +92,52 @@ class WebcamCapture:
 
         candidates = self._candidate_indices()
         last_err: Optional[str] = None
-        for idx in candidates:
-            if idx in self.exclude_indices:
-                continue
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap.release()
-                last_err = f"index {idx} failed to open"
-                continue
+        for backend_name, backend_flag in self._backends:
+            for idx in candidates:
+                if idx in self.exclude_indices:
+                    continue
+                cap = cv2.VideoCapture(idx, backend_flag)
+                if not cap.isOpened():
+                    cap.release()
+                    last_err = f"[{backend_name}] index {idx} failed to open"
+                    continue
 
-            # Minimize driver queue so grab() gets the freshest frame.
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req_width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_height)
 
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_height)
+                ok, test = cap.read()
+                if not ok or test is None:
+                    cap.release()
+                    last_err = f"[{backend_name}] index {idx} opened but produces no frames"
+                    continue
 
-            ok, test = cap.read()
-            if not ok or test is None:
-                cap.release()
-                last_err = f"index {idx} opened but produces no frames"
-                continue
+                # Guard against DirectShow handing back a colliding handle
+                # to the thermal camera: if the frame matches thermal's
+                # 640x512, treat it as a mis-identification and keep probing.
+                h_test, w_test = (test.shape[0], test.shape[1]) if test.ndim == 3 else (0, 0)
+                if (w_test, h_test) == (640, 512) and idx in self.exclude_indices:
+                    cap.release()
+                    last_err = f"[{backend_name}] index {idx} returned thermal-shaped frame, skipping"
+                    continue
 
-            self._cap = cap
-            self.device_index = idx
-            if test.ndim == 3:
-                self.actual_height, self.actual_width = test.shape[:2]
-            log.info(
-                "WebcamCapture opened on index %d (requested %dx%d, got %dx%d)",
-                idx, self.req_width, self.req_height,
-                self.actual_width, self.actual_height,
-            )
-            return
+                self._cap = cap
+                self.device_index = idx
+                self.actual_height, self.actual_width = h_test, w_test
+                log.info(
+                    "WebcamCapture opened on index %d via %s (requested %dx%d, got %dx%d)",
+                    idx, backend_name, self.req_width, self.req_height,
+                    self.actual_width, self.actual_height,
+                )
+                return
 
         raise RuntimeError(
-            f"Could not open any EO camera (tried {candidates}, "
-            f"excluded {self.exclude_indices}). Last error: {last_err}."
+            f"Could not open any EO camera (tried {candidates} "
+            f"across DSHOW/MSMF/ANY, excluded {self.exclude_indices}). "
+            f"Last error: {last_err}."
         )
 
     def stop(self) -> None:
@@ -155,11 +172,11 @@ class WebcamCapture:
         if isinstance(self.requested_index, int):
             return [self.requested_index]
         if self.requested_index == "auto" or self.requested_index is None:
-            return [0, 1, 2, 3, 4]
+            return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         try:
             return [int(self.requested_index)]
         except (TypeError, ValueError):
-            return [0, 1, 2, 3, 4]
+            return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 # ───────────────────────────────────────────────────────────────

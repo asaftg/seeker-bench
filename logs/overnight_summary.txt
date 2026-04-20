@@ -1,0 +1,8 @@
+Seeker-01 overnight retrain summary
+==================================================
+h/v dataset: train=24210  val=4840 images
+h/v training succeeded: True
+drone training succeeded: False
+
+FLIR ADAS: picked up
+Full log: C:\Users\asaf.ruf.BLUERIVERTECH\Desktop\Seeker01\seeker_bench\logs\overnight_retrain.log

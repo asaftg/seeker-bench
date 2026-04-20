@@ -1,0 +1,7 @@
+Drone prep + train summary
+===========================
+train images: 29658
+val images:   28954
+prep ok:      True
+train ok:     True
+log:          C:\Users\asaf.ruf.BLUERIVERTECH\Desktop\Seeker01\seeker_bench\logs\drone_prep_and_train.log

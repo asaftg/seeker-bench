@@ -195,75 +195,6 @@ function sliderSetReal(el, real) {
   el.value = Math.max(min, Math.min(max, el.dataset.invert ? (min + max - real) : real));
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Camera device selectors — one in each panel header so the user can pick
-// which physical camera feeds Thermal and which feeds EO. Populated from
-// GET /api/devices/cameras at WS open.
-// ─────────────────────────────────────────────────────────────────────────
-async function loadCameraDevices() {
-  const thermalSel = $("thermal-device-sel");
-  const eoSel      = $("eo-device-sel");
-  if (!thermalSel && !eoSel) return;
-  try {
-    const r = await fetch("/api/devices/cameras");
-    const j = await r.json();
-    const cams = j.cameras || [];
-    const fill = (sel, activeIdx) => {
-      if (!sel) return;
-      sel.innerHTML = "";
-      // "auto" row
-      const a = document.createElement("option");
-      a.value = "auto";
-      a.textContent = "auto";
-      sel.appendChild(a);
-      for (const c of cams) {
-        const o = document.createElement("option");
-        o.value = String(c.index);
-        o.textContent = `#${c.index} ${c.width}x${c.height}`;
-        if (activeIdx != null && Number(activeIdx) === Number(c.index)) {
-          o.selected = true;
-        }
-        sel.appendChild(o);
-      }
-    };
-    fill(thermalSel, j.thermal_active);
-    fill(eoSel,      j.eo_active);
-  } catch (e) {
-    // Endpoint may return 503 if managers aren't ready yet — retry silently.
-  }
-}
-
-function wireDeviceSelector(selId, endpoint) {
-  const sel = $(selId);
-  if (!sel) return;
-  sel.addEventListener("change", () => {
-    const raw = sel.value;
-    const payload = { device_index: raw === "auto" ? "auto" : Number(raw) };
-    fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
-  });
-}
-wireDeviceSelector("thermal-device-sel", "/api/config/thermal");
-wireDeviceSelector("eo-device-sel",      "/api/config/eo");
-
-// Populate dropdowns immediately on page load — independent of the WS.
-// Retry every 3s until we get a non-empty camera list (covers the case
-// where managers are still warming up when the page first renders).
-(function primeCameraDevices() {
-  let tries = 0;
-  const tick = async () => {
-    tries += 1;
-    await loadCameraDevices();
-    const sel = $("thermal-device-sel") || $("eo-device-sel");
-    const hasCams = sel && sel.options.length > 1;
-    if (!hasCams && tries < 20) setTimeout(tick, 3000);
-  };
-  tick();
-})();
-
 async function loadDetectorConfig() {
   try {
     const r = await fetch("/api/config/heat_detector");
@@ -365,7 +296,6 @@ function connect() {
   ws.onopen = () => {
     if (wsStatus) wsStatus.textContent = "WS: connected";
     loadDetectorConfig();
-    loadCameraDevices();
   };
 
   ws.onclose = () => {
