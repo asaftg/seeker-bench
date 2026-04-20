@@ -1,7 +1,9 @@
 // Thermal view: renders the latest JPEG frame and overlays detections.
 // Phase B: uses the unified drawDetectionBox with class-aware colors.
+// Ticket 5: if a fused green box subsumes a raw detection, the raw box
+// is suppressed so we don't stack two boxes on the same target.
 
-import { drawDetectionBox } from "./overlays.js";
+import { drawDetectionBox, drawFusedBox, isSubsumedByFused } from "./overlays.js";
 
 export class ThermalView {
   constructor(canvasId, disconnectOverlayId) {
@@ -12,6 +14,7 @@ export class ThermalView {
     this._lastFrameW = 0;
     this._lastFrameH = 0;
     this._lastDetections = [];
+    this._lastFused = [];
     this._mainTargetId = null;
     if (this.img) {
       this.img.onload = () => this._draw();
@@ -29,8 +32,9 @@ export class ThermalView {
     if (this._lastFrameW > 0) this._draw();
   }
 
-  update(thermal, mainTargetId = null) {
+  update(thermal, mainTargetId = null, fused = []) {
     this._mainTargetId = mainTargetId;
+    this._lastFused = fused || [];
     if (!thermal || !thermal.connected) {
       if (this.overlay) this.overlay.classList.remove("hidden");
       this._clear();
@@ -64,7 +68,6 @@ export class ThermalView {
     const fh = this._lastFrameH || this.img.naturalHeight;
     if (!fw || !fh) return;
 
-    // Letterbox-fit the frame
     const scale = Math.min(cw / fw, ch / fh);
     const dw = fw * scale;
     const dh = fh * scale;
@@ -75,12 +78,23 @@ export class ThermalView {
       this.ctx.drawImage(this.img, dx, dy, dw, dh);
     }
 
+    // Collect fused bboxes that project into this panel.
+    const fusedBoxes = this._lastFused
+      .map(t => t.bbox_thermal)
+      .filter(Boolean);
+
+    // Raw detections: draw unless subsumed by a fused track.
     for (const det of this._lastDetections) {
-      // Main target override: green thick box when ID matches
+      if (isSubsumedByFused(det.bbox, fusedBoxes)) continue;
       const isMain = this._mainTargetId != null &&
                      det.track_id != null &&
                      String(det.track_id) === String(this._mainTargetId);
       drawDetectionBox(this.ctx, det, scale, dx, dy, isMain);
+    }
+
+    // Fused tracks: green box + centroid crosshair, drawn on top.
+    for (const trk of this._lastFused) {
+      drawFusedBox(this.ctx, trk.bbox_thermal, trk, scale, dx, dy);
     }
   }
 }

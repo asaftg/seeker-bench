@@ -13,7 +13,8 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from common.frames import EOFrame, ThermalFrame
+from common.frames import EOFrame, FusedTrack, ThermalFrame
+from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
 def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
@@ -155,17 +156,83 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
     }
 
 
-def fusion_to_wire() -> Dict[str, Any]:
-    """Phase A stub — no fusion yet (Ticket 5)."""
-    return {
-        "active": False,
-        "tracks": [],
-    }
+def fused_to_wire(
+    tracks: Optional[list],
+    tf: Optional[ThermalFrame],
+    ef: Optional[EOFrame],
+) -> list[Dict[str, Any]]:
+    """Serialize FusedTrack list with per-sensor pixel projections.
+
+    Each output dict carries:
+        id, target_class, confidence, sensors, primary,
+        az_deg, el_deg, ang_w_deg, ang_h_deg, hits,
+        bbox_thermal: {x,y,w,h} | None,   # projected into thermal pixels
+        bbox_eo:      {x,y,w,h} | None,   # projected into EO pixels
+
+    The GUI uses these to draw a single green bbox on each panel that
+    represents the fused target at the same world angle.
+    """
+    if not tracks:
+        return []
+
+    t_w = tf.agc8.shape[1] if (tf is not None and tf.connected and tf.agc8 is not None) else 0
+    t_h = tf.agc8.shape[0] if (tf is not None and tf.connected and tf.agc8 is not None) else 0
+    t_hfov = tf.hfov_deg if tf is not None else 75.0
+    t_vfov = tf.vfov_deg if tf is not None else 60.0
+
+    e_w = ef.bgr.shape[1] if (ef is not None and ef.connected and ef.bgr is not None) else 0
+    e_h = ef.bgr.shape[0] if (ef is not None and ef.connected and ef.bgr is not None) else 0
+    e_hfov = ef.hfov_deg if ef is not None else 11.05
+    e_vfov = ef.vfov_deg if ef is not None else 9.23
+
+    out: list[Dict[str, Any]] = []
+    for trk in tracks:
+        if not isinstance(trk, FusedTrack):
+            continue
+        # Thermal projection
+        bt = None
+        if t_w and t_h and angular_bbox_visible(
+            trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg, t_hfov, t_vfov
+        ):
+            x, y, w, h = angular_to_bbox(
+                trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg,
+                t_w, t_h, t_hfov, t_vfov,
+            )
+            if w > 0 and h > 0:
+                bt = {"x": x, "y": y, "w": w, "h": h}
+        # EO projection
+        be = None
+        if e_w and e_h and angular_bbox_visible(
+            trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg, e_hfov, e_vfov
+        ):
+            x, y, w, h = angular_to_bbox(
+                trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg,
+                e_w, e_h, e_hfov, e_vfov,
+            )
+            if w > 0 and h > 0:
+                be = {"x": x, "y": y, "w": w, "h": h}
+
+        out.append({
+            "id": trk.id,
+            "target_class": trk.target_class.value,
+            "confidence": round(float(trk.confidence), 3),
+            "sensors": list(trk.sensors),
+            "primary": trk.primary,
+            "az_deg": round(trk.az_deg, 3),
+            "el_deg": round(trk.el_deg, 3),
+            "ang_w_deg": round(trk.ang_w_deg, 3),
+            "ang_h_deg": round(trk.ang_h_deg, 3),
+            "hits": trk.hits,
+            "bbox_thermal": bt,
+            "bbox_eo": be,
+        })
+    return out
 
 
 def build_ws_message(
     tf=None,
     ef=None,
+    fused=None,
     jpeg_quality: int = 80,
     tracker_on: bool = True,
     nir_mode: str = "auto",
@@ -178,13 +245,24 @@ def build_ws_message(
     follow the schema defined in Ticket 2.  Absent hardware sends its stub.
     """
     import time as _time
+    fused_wire = fused_to_wire(fused, tf, ef)
+    # Pick a main target: highest-confidence multi-sensor track, else
+    # highest-confidence single-sensor track. This is the ID the GUI
+    # lights up in green at the top and the gimbal would track.
+    main_id = None
+    if fused_wire:
+        multi = [t for t in fused_wire if len(t["sensors"]) >= 2]
+        pool = multi if multi else fused_wire
+        best = max(pool, key=lambda t: (len(t["sensors"]), t["confidence"]))
+        main_id = best["id"]
     return {
         "ts": _time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
         "eo": eo_to_wire(ef, jpeg_quality=jpeg_quality),
         "radar": radar_to_wire(),
+        "fused": fused_wire,
         "tracks": [],
-        "main_target_id": None,
+        "main_target_id": main_id,
         "gimbal": {
             "pan": gimbal_pan,
             "tilt": gimbal_tilt,

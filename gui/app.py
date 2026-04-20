@@ -204,9 +204,11 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
                 try:
                     tf = BUS.get_latest(Topic.THERMAL)
                     ef = BUS.get_latest(Topic.EO)
+                    fused = BUS.get_latest(Topic.FUSED)
                     payload = build_ws_message(
                         tf=tf,
                         ef=ef,
+                        fused=fused,
                         jpeg_quality=jpeg_quality,
                         tracker_on=state["tracker_on"],
                         nir_mode=state["nir_mode"],

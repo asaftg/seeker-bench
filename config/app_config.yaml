@@ -133,7 +133,18 @@ radar:
   # real radar params added in Phase B
 
 fusion:
-  enabled: false                # Phase A: no fusion
+  # Cross-sensor fusion (Ticket 5). Reads Thermal + EO (+ Radar when
+  # it arrives) from the bus and emits global-ID tracks in angular
+  # space. EO is the primary sensor (its angles are trusted when
+  # both EO and Thermal see the same target). The GUI re-projects
+  # each fused track into every panel's pixel grid so the bbox is
+  # "the same bbox" across sensors.
+  enabled: true
+  rate_hz: 15                   # fusion tick rate (independent of sensors)
+  match_gate_deg: 0.7           # cross-sensor: max angular distance (deg) to fuse
+  track_match_gate_deg: 1.2     # per-tick: max angular distance to match existing track
+  min_hits: 1                   # ticks before a track is visible in the GUI
+  max_misses: 10                # ticks of no-observation before a track is dropped
 
 gui:
   host: 127.0.0.1

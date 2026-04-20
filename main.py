@@ -23,6 +23,7 @@ import uvicorn
 from common.config import load_config
 from common.logging_setup import configure, get_logger
 from eo.eo_manager import EOManager
+from fusion.fusion_manager import FusionManager
 from gui.app import create_app
 from thermal.thermal_manager import ThermalManager
 
@@ -109,6 +110,14 @@ def main() -> int:
             log.warning("EO manager failed to start: %s — continuing without EO", e)
             eo = None
 
+    # Start fusion manager — reads from the bus only, no hardware.
+    # Safe to run even if only one sensor is connected.
+    fusion: FusionManager | None = None
+    fusion_cfg = (cfg.get("fusion") or {})
+    if bool(fusion_cfg.get("enabled", True)):
+        fusion = FusionManager()
+        fusion.start()
+
     # Build FastAPI app. The managers are passed in so the runtime
     # config endpoints can mutate detector parameters live from the GUI.
     app = create_app(thermal_manager=thermal, eo_manager=eo)
@@ -128,6 +137,8 @@ def main() -> int:
 
     def _shutdown(*_):
         log.info("Shutdown signal received, stopping sensors")
+        if fusion is not None:
+            fusion.stop()
         if eo is not None:
             eo.stop()
         thermal.stop()
@@ -143,6 +154,8 @@ def main() -> int:
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
+        if fusion is not None:
+            fusion.stop()
         if eo is not None:
             eo.stop()
         thermal.stop()

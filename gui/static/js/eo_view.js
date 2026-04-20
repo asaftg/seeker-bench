@@ -1,8 +1,9 @@
 // EO view: renders the latest JPEG frame from the EO pipeline and overlays
-// person/vehicle detections. Clone of ThermalView with a different canvas
-// and no zoom sub-bar — the EO FOV is fixed by the lens.
+// person/vehicle detections. Same fusion-aware rendering as ThermalView:
+// raw detections subsumed by a fused track are suppressed so the green
+// fused box is the single box on that target.
 
-import { drawDetectionBox } from "./overlays.js";
+import { drawDetectionBox, drawFusedBox, isSubsumedByFused } from "./overlays.js";
 
 export class EOView {
   constructor(canvasId, disconnectOverlayId) {
@@ -13,6 +14,7 @@ export class EOView {
     this._lastFrameW = 0;
     this._lastFrameH = 0;
     this._lastDetections = [];
+    this._lastFused = [];
     this._mainTargetId = null;
     if (this.img) {
       this.img.onload = () => this._draw();
@@ -30,8 +32,9 @@ export class EOView {
     if (this._lastFrameW > 0) this._draw();
   }
 
-  update(eo, mainTargetId = null) {
+  update(eo, mainTargetId = null, fused = []) {
     this._mainTargetId = mainTargetId;
+    this._lastFused = fused || [];
     if (!eo || !eo.connected) {
       if (this.overlay) this.overlay.classList.remove("hidden");
       this._clear();
@@ -75,11 +78,20 @@ export class EOView {
       this.ctx.drawImage(this.img, dx, dy, dw, dh);
     }
 
+    const fusedBoxes = this._lastFused
+      .map(t => t.bbox_eo)
+      .filter(Boolean);
+
     for (const det of this._lastDetections) {
+      if (isSubsumedByFused(det.bbox, fusedBoxes)) continue;
       const isMain = this._mainTargetId != null &&
                      det.track_id != null &&
                      String(det.track_id) === String(this._mainTargetId);
       drawDetectionBox(this.ctx, det, scale, dx, dy, isMain);
+    }
+
+    for (const trk of this._lastFused) {
+      drawFusedBox(this.ctx, trk.bbox_eo, trk, scale, dx, dy);
     }
   }
 }

@@ -68,6 +68,66 @@ export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false) 
 }
 
 // ---------------------------------------------------------------------------
+// Fused track: green box representing a target confirmed by 2+ sensors.
+// Shown identically on every panel — the centroid is the world angle the
+// drone would fly toward. `track.bbox_{thermal,eo}` is pre-projected into
+// the panel's pixel space by the backend; we only need scale + offset.
+// ---------------------------------------------------------------------------
+export function drawFusedBox(ctx, bbox, track, scale, dx, dy) {
+  if (!bbox) return;
+  const x = dx + bbox.x * scale;
+  const y = dy + bbox.y * scale;
+  const w = bbox.w * scale;
+  const h = bbox.h * scale;
+
+  const cls = track.target_class;
+  const clsLabel = cls === "person" ? "HUMAN" : (cls || "TARGET").toUpperCase();
+  const conf = Math.round((track.confidence || 0) * 100);
+  const nSensors = (track.sensors || []).length;
+  const tag = nSensors >= 2 ? `${nSensors}×` : "";
+  const label = `${tag}#${track.id} ${clsLabel} ${conf}%`;
+
+  ctx.save();
+  ctx.strokeStyle = COLORS.main;
+  ctx.lineWidth = 3;
+  ctx.setLineDash([]);
+  ctx.strokeRect(x, y, w, h);
+  // Crosshair at centroid — this is the gimbal aim-point.
+  const cx = x + w / 2, cy = y + h / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, cy); ctx.lineTo(cx + 6, cy);
+  ctx.moveTo(cx, cy - 6); ctx.lineTo(cx, cy + 6);
+  ctx.stroke();
+  _drawLabel(ctx, label, x, y, COLORS.main);
+  ctx.restore();
+}
+
+// Returns true if a raw per-sensor detection is subsumed by any fused
+// bbox in the provided list. The GUI skips raw detections that match so
+// we don't stack a colored box underneath the fused green box.
+export function isSubsumedByFused(rawBBox, fusedBBoxes, iouMin = 0.30) {
+  if (!rawBBox || !fusedBBoxes || !fusedBBoxes.length) return false;
+  for (const fb of fusedBBoxes) {
+    if (!fb) continue;
+    const iou = _iou(rawBBox, fb);
+    if (iou >= iouMin) return true;
+  }
+  return false;
+}
+
+function _iou(a, b) {
+  const ax1 = a.x, ay1 = a.y, ax2 = a.x + a.w, ay2 = a.y + a.h;
+  const bx1 = b.x, by1 = b.y, bx2 = b.x + b.w, by2 = b.y + b.h;
+  const ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
+  const ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
+  const iw = Math.max(0, ix2 - ix1), ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  if (inter <= 0) return 0;
+  const union = a.w * a.h + b.w * b.h - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+// ---------------------------------------------------------------------------
 // Radar projected track (cyan dashed)
 // ---------------------------------------------------------------------------
 export function drawRadarBox(ctx, x, y, w, h, label) {

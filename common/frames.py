@@ -132,6 +132,36 @@ class EOFrame:
 
 
 # ───────────────────────────────────────────────────────────────
+# Fused tracks — Ticket 5 (cross-sensor fusion)
+# ───────────────────────────────────────────────────────────────
+
+@dataclass
+class FusedTrack:
+    """A single real-world target confirmed by one or more sensors.
+
+    All positions are expressed in *angular space* relative to the
+    boresight (az positive = right, el positive = up). We store
+    angles because thermal and EO have very different pixel grids
+    but a shared optical axis on the bench; angles are the sensor-
+    neutral coordinate.
+
+    The GUI layer re-projects (az, el, ang_w, ang_h) into each
+    sensor's pixel grid to draw the "same" bbox on every panel.
+    """
+    id: int
+    target_class: TargetClass
+    confidence: float                   # best conf across contributing sensors
+    sensors: List[str]                  # subset of ["eo", "thermal", "radar"]
+    primary: str                        # whichever sensor supplied angles
+    az_deg: float
+    el_deg: float
+    ang_w_deg: float
+    ang_h_deg: float
+    hits: int = 1
+    misses: int = 0
+
+
+# ───────────────────────────────────────────────────────────────
 # Radar frames (Phase A: stub shape only, real fields added in Phase B)
 # ───────────────────────────────────────────────────────────────
 

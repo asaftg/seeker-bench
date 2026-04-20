@@ -50,23 +50,31 @@ function updateMainTarget(msg) {
     return;
   }
 
-  // Find the track that matches main_target_id
-  const tracks = msg.tracks || [];
-  const t = tracks.find(t => String(t.id) === String(id));
+  // Prefer the fused track list (Ticket 5). Fall back to legacy `tracks`.
+  const fused = msg.fused || [];
+  const legacyTracks = msg.tracks || [];
+  const t = fused.find(t => String(t.id) === String(id))
+         || legacyTracks.find(t => String(t.id) === String(id));
 
-  cls.textContent = t ? (t.class || "UNKNOWN").toUpperCase() : "UNKNOWN";
+  const clsName = t ? (t.target_class || t.class || "UNKNOWN") : "UNKNOWN";
+  const clsLabel = clsName === "person" ? "HUMAN" : clsName.toUpperCase();
+  cls.textContent = clsLabel;
   cls.style.color = "var(--text)";
 
   let extra = "";
   if (t) {
-    if (t.id    != null) extra += `<span class="mt-val">ID ${t.id}</span>`;
-    if (t.range != null) extra += `<span class="mt-val">${t.range} m</span>`;
-    if (t.speed != null) extra += `<span class="mt-val">${t.speed} m/s</span>`;
-    if (t.confidence != null) extra += `<span class="mt-val">conf ${(t.confidence*100|0)}%</span>`;
-    const sensors = t.sensors || 1;
-    extra += `<span class="mt-badge">${sensors} sensor${sensors>1?"s":""}</span>`;
+    if (t.id != null) extra += `<span class="mt-val">ID ${t.id}</span>`;
+    if (t.az_deg != null && t.el_deg != null) {
+      extra += `<span class="mt-val">az ${t.az_deg.toFixed(2)}° el ${t.el_deg.toFixed(2)}°</span>`;
+    }
+    if (t.confidence != null) {
+      extra += `<span class="mt-val">conf ${(t.confidence*100|0)}%</span>`;
+    }
+    const sensors = (t.sensors && t.sensors.length) ? t.sensors.length : 1;
+    const sensorNames = (t.sensors || []).map(s => s.toUpperCase()).join("+") || "—";
+    extra += `<span class="mt-badge">${sensors}× ${sensorNames}</span>`;
   }
-  row.innerHTML = `<span class="mt-class" id="mt-class">${cls.textContent}</span>${extra}`;
+  row.innerHTML = `<span class="mt-class" id="mt-class">${clsLabel}</span>${extra}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -314,9 +322,12 @@ function connect() {
     let msg;
     try { msg = JSON.parse(ev.data); } catch(_) { return; }
 
+    // Fusion: single green bbox on every panel for confirmed targets.
+    const fused = msg.fused || [];
+
     // ── Thermal panel ──
     const thermal = msg.thermal || {};
-    thermalView.update(thermal, msg.main_target_id || null);
+    thermalView.update(thermal, msg.main_target_id || null, fused);
     syncZoomButtons(thermal.zoom_preset);
 
     const thermHz = $("thermal-hz");
@@ -328,7 +339,7 @@ function connect() {
 
     // ── EO panel ──
     const eo = msg.eo || {};
-    eoView.update(eo, msg.main_target_id || null);
+    eoView.update(eo, msg.main_target_id || null, fused);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
     const eoHz = $("eo-hz");
     if (eoHz) eoHz.textContent = eo.connected ? (_fps.current + " Hz") : "— Hz";
