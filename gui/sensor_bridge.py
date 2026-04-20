@@ -81,16 +81,61 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
 
 
 def radar_to_wire() -> Dict[str, Any]:
-    """Phase A: radar is always disconnected."""
+    """Phase A stub — radar always disconnected."""
     return {
         "connected": False,
+        "points": [],
+        "detections": [],
+        "profile": "automotive_default",
+    }
+
+
+def eo_to_wire() -> Dict[str, Any]:
+    """Phase B stub — EO camera not yet wired (Ticket 3)."""
+    return {
+        "connected": False,
+        "jpeg": None,
         "detections": [],
     }
 
 
 def fusion_to_wire() -> Dict[str, Any]:
-    """Phase A: no fusion."""
+    """Phase A stub — no fusion yet (Ticket 5)."""
     return {
         "active": False,
         "tracks": [],
+    }
+
+
+def build_ws_message(
+    tf=None,
+    jpeg_quality: int = 80,
+    tracker_on: bool = True,
+    nir_mode: str = "auto",
+    gimbal_pan: float = 0.0,
+    gimbal_tilt: float = 60.0,
+) -> Dict[str, Any]:
+    """Build the full Phase B WebSocket envelope.
+
+    Optional fields (eo, radar, tracks, main_target_id, gimbal, illuminator)
+    follow the schema defined in Ticket 2.  Absent hardware sends its stub.
+    """
+    import time as _time
+    return {
+        "ts": _time.time(),
+        "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
+        "eo": eo_to_wire(),
+        "radar": radar_to_wire(),
+        "tracks": [],
+        "main_target_id": None,
+        "gimbal": {
+            "pan": gimbal_pan,
+            "tilt": gimbal_tilt,
+            "mode": "auto" if tracker_on else "manual",
+        },
+        "illuminator": {
+            "state": nir_mode,
+            "duty": 0.20 if nir_mode == "auto" else (1.0 if nir_mode == "on" else 0.0),
+        },
+        "tracker_on": tracker_on,
     }

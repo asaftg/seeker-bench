@@ -26,7 +26,7 @@ from common.config import load_config
 from common.frame_bus import BUS
 from common.frames import Topic
 from common.logging_setup import get_logger
-from gui.sensor_bridge import fusion_to_wire, radar_to_wire, thermal_to_wire
+from gui.sensor_bridge import build_ws_message
 
 log = get_logger(__name__)
 
@@ -133,17 +133,66 @@ def create_app(thermal_manager=None) -> FastAPI:
         jpeg_quality = int(cfg.get("gui", {}).get("thermal_jpeg_quality", 80))
         period = 1.0 / max(1e-3, ws_fps)
 
+        # Per-connection mutable state (Phase B controls)
+        state = {
+            "tracker_on": True,
+            "nir_mode": "auto",
+            "gimbal_pan": 0.0,
+            "gimbal_tilt": 60.0,
+        }
+
         log.info("WebSocket client connected")
-        try:
+
+        async def _sender() -> None:
             while True:
                 tf = BUS.get_latest(Topic.THERMAL)
-                payload = {
-                    "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
-                    "radar":   radar_to_wire(),
-                    "fusion":  fusion_to_wire(),
-                }
+                payload = build_ws_message(
+                    tf=tf,
+                    jpeg_quality=jpeg_quality,
+                    tracker_on=state["tracker_on"],
+                    nir_mode=state["nir_mode"],
+                    gimbal_pan=state["gimbal_pan"],
+                    gimbal_tilt=state["gimbal_tilt"],
+                )
                 await ws.send_text(json.dumps(payload))
                 await asyncio.sleep(period)
+
+        async def _receiver() -> None:
+            async for raw in ws.iter_text():
+                try:
+                    cmd = json.loads(raw)
+                except Exception:
+                    continue
+                command = cmd.get("command")
+
+                if command == "tracker":
+                    new_state = str(cmd.get("state", "on")).lower() == "on"
+                    state["tracker_on"] = new_state
+                    # When tracker is turned off, disable auto-track on gimbal
+                    tm = app.state.thermal_manager
+                    if tm is not None and not new_state:
+                        pass  # gimbal auto-track disabled in Ticket 6
+                    log.info("Tracker toggled → %s", "ON" if new_state else "OFF")
+
+                elif command == "gimbal_manual":
+                    if not state["tracker_on"]:
+                        dp = float(cmd.get("delta_pan", 0))
+                        dt = float(cmd.get("delta_tilt", 0))
+                        state["gimbal_pan"]  = round(state["gimbal_pan"]  + dp, 1)
+                        state["gimbal_tilt"] = round(state["gimbal_tilt"] + dt, 1)
+                    log.debug("Gimbal manual delta pan=%.1f tilt=%.1f", dp if not state["tracker_on"] else 0, dt if not state["tracker_on"] else 0)
+
+                elif command == "nir":
+                    mode = str(cmd.get("mode", "auto")).lower()
+                    if mode in ("auto", "on", "off"):
+                        state["nir_mode"] = mode
+                    log.info("NIR mode → %s (no hardware — display only)", mode)
+
+                else:
+                    log.warning("Unknown WS command: %s", command)
+
+        try:
+            await asyncio.gather(_sender(), _receiver())
         except WebSocketDisconnect:
             log.info("WebSocket client disconnected")
         except Exception as e:

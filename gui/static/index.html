@@ -3,173 +3,201 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SEEKER-01 Bench Test</title>
+  <title>SEEKER-01 Bench · Phase B</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
 
-<!-- Top bar -->
+<!-- ─────────── TOP BAR ─────────── -->
 <div class="topbar">
   <div class="topbar-left">
-    <div class="logo">SEEKER<span>-01</span></div>
-    <div class="connection-pills">
-      <div id="pill-radar"   class="pill pill-disconnected"><span class="pill-dot"></span>RADAR</div>
-      <div id="pill-thermal" class="pill pill-disconnected"><span class="pill-dot"></span>THERMAL</div>
-      <div id="pill-fusion"  class="pill pill-disconnected"><span class="pill-dot"></span>FUSION</div>
-    </div>
+    <span class="brand">SEEKER-01 · <span class="brand-accent">BENCH</span></span>
+    <span class="subtitle">v2 · Phase B</span>
   </div>
-  <div class="topbar-right">
-    <span id="ws-status" class="ws-status">WS: connecting…</span>
+  <div class="pills">
+    <span id="pill-thermal" class="pill pill-off"><span class="dot"></span>THERMAL</span>
+    <span id="pill-eo"      class="pill pill-off"><span class="dot"></span>EO</span>
+    <span id="pill-radar"   class="pill pill-off"><span class="dot"></span>RADAR</span>
+    <span id="pill-gimbal"  class="pill pill-off"><span class="dot"></span>GIMBAL</span>
+    <span id="pill-nir"     class="pill pill-off"><span class="dot"></span>NIR</span>
+    <span id="pill-rec"     class="pill pill-off"><span class="dot"></span>REC</span>
   </div>
+  <span id="ws-status" class="ws-badge">WS: connecting…</span>
 </div>
 
-<!-- Tab bar -->
-<div class="tabbar">
-  <div class="tab active" data-tab="main">MAIN</div>
-  <div class="tab" data-tab="thermal">THERMAL</div>
-  <div class="tab" data-tab="engineering">ENGINEERING</div>
-</div>
+<div class="stage">
 
-<!-- Main dashboard -->
-<div class="page active" data-page="main">
-  <div class="dashboard-grid">
-    <div id="banner" class="detection-banner banner-scanning">
-      <span class="banner-icon">◯</span>
-      <span id="banner-text">SCANNING — NO HEAT DETECTED</span>
-    </div>
+  <!-- ─────────── LEGEND ─────────── -->
+  <div class="legend">
+    <span class="sw"><span class="swatch" style="background:#00e88f;"></span>Main target (2+ sensors)</span>
+    <span class="sw"><span class="swatch" style="background:#378ADD;"></span>Drone</span>
+    <span class="sw"><span class="swatch" style="background:#AFA9EC;"></span>Human</span>
+    <span class="sw"><span class="swatch" style="background:#E24B4A;"></span>Vehicle</span>
+    <span class="sw"><span class="swatch" style="background:#ff6b35;"></span>Heat / EO unclassified</span>
+    <span class="sw"><span class="swatch swatch-radar"></span>Radar track (projected)</span>
+  </div>
 
-    <!-- Thermal panel -->
-    <div class="sensor-panel">
-      <div class="panel-header">
-        <div class="panel-title"><span class="dot" style="background:var(--thermal-orange)"></span>THERMAL</div>
-        <div class="panel-controls">
-          <button class="panel-btn active" data-zoom="full">75°</button>
-          <button class="panel-btn" data-zoom="wide">37°</button>
-          <button class="panel-btn" data-zoom="mid">18°</button>
-          <button class="panel-btn" data-zoom="narrow">12°</button>
-        </div>
+  <!-- ─────────── ROW 1: sensors ─────────── -->
+  <div class="row-sensors">
+
+    <!-- THERMAL PANEL -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>THERMAL · Boson 640</span>
+        <span class="hz mono" id="thermal-hz">— Hz</span>
       </div>
+      <!-- zoom buttons inside panel header sub-row -->
       <div class="panel-subbar">
-        <label class="slider-row">
-          <span class="slider-label">SENSITIVITY</span>
-          <!-- Inverted: left = strictest (high k), right = most sensitive.
-               k = median + k*MAD threshold. Low k = catches faint blobs.
-               Useful range is ~2-20; beyond 20 nothing is ever detected. -->
-          <input id="thr-slider" type="range" min="2" max="20" step="0.5" value="14" data-invert="1">
-          <span class="slider-val" id="thr-val">8.0</span>
-          <span class="slider-unit">×MAD</span>
-        </label>
-        <label class="slider-row">
-          <span class="slider-label">MIN BLOB</span>
-          <input id="minarea-slider" type="range" min="3" max="500" step="1" value="420" data-invert="1">
-          <span class="slider-val" id="minarea-val">80</span>
-          <span class="slider-unit">px</span>
-        </label>
+        <button class="zoom-btn active" data-zoom="full">75°</button>
+        <button class="zoom-btn" data-zoom="wide">37°</button>
+        <button class="zoom-btn" data-zoom="mid">18°</button>
+        <button class="zoom-btn" data-zoom="narrow">12°</button>
+        <span class="fov-label" id="thermal-fov">75° HFOV</span>
       </div>
-      <div class="panel-body">
-        <canvas id="thermal-canvas" class="sensor-canvas"></canvas>
-        <div id="thermal-disconnected" class="disconnect-overlay hidden">THERMAL<br>DISCONNECTED</div>
+      <div class="panel-canvas">
+        <canvas id="thermal-canvas"></canvas>
+        <div id="thermal-disconnected" class="disconnected-overlay">
+          <span class="disc-icon">⚡</span>
+          <span>THERMAL · DISCONNECTED</span>
+        </div>
+        <div class="panel-overlay-tl" id="thermal-meta"></div>
+        <div class="panel-overlay-br" id="thermal-track-count"></div>
       </div>
     </div>
 
-    <!-- Radar panel (Phase A: disconnected placeholder) -->
-    <div class="sensor-panel">
-      <div class="panel-header">
-        <div class="panel-title"><span class="dot" style="background:var(--radar-cyan)"></span>RADAR</div>
+    <!-- EO PANEL -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>EO · IMX568 · 35mm NIR · 12°</span>
+        <span class="hz mono">— Hz</span>
       </div>
-      <div class="panel-body">
-        <canvas id="radar-canvas" class="sensor-canvas"></canvas>
-        <div class="disconnect-overlay">RADAR<br>DISCONNECTED</div>
+      <div class="panel-canvas">
+        <canvas id="eo-canvas"></canvas>
+        <div id="eo-disconnected" class="disconnected-overlay">
+          <span class="disc-icon">📷</span>
+          <span>EO · DISCONNECTED</span>
+        </div>
       </div>
     </div>
 
-    <!-- Status bar -->
-    <div class="status-bar">
-      <div class="status-card">
-        <div class="status-icon thermal">T</div>
-        <div>
-          <div class="status-label">THERMAL FPS</div>
-          <div class="status-value" id="stat-thermal-fps">—</div>
-        </div>
+    <!-- RADAR PANEL -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>RADAR · AWR2944P</span>
+        <span class="hz mono">— Hz</span>
       </div>
-      <div class="status-card">
-        <div class="status-icon thermal">D</div>
-        <div>
-          <div class="status-label">DETECTIONS</div>
-          <div class="status-value" id="stat-det-count">0</div>
-        </div>
-      </div>
-      <div class="status-card">
-        <div class="status-icon radar">R</div>
-        <div>
-          <div class="status-label">RADAR</div>
-          <div class="status-value" id="stat-radar">OFFLINE</div>
-        </div>
-      </div>
-      <div class="status-card">
-        <div class="status-icon fused">F</div>
-        <div>
-          <div class="status-label">FUSION</div>
-          <div class="status-value" id="stat-fusion">INACTIVE</div>
+      <div class="panel-canvas">
+        <canvas id="radar-canvas"></canvas>
+        <div id="radar-disconnected" class="disconnected-overlay">
+          <span class="disc-icon">📡</span>
+          <span>RADAR · DISCONNECTED</span>
         </div>
       </div>
     </div>
+
+  </div><!-- /.row-sensors -->
+
+  <!-- ─────────── ROW 2: main target + tracker + NIR ─────────── -->
+  <div class="row-main">
+
+    <!-- MAIN TARGET CARD -->
+    <div class="main-target-card" id="main-target-card">
+      <div class="mt-label">MAIN TARGET</div>
+      <div class="mt-row" id="mt-row">
+        <span class="mt-class" id="mt-class" style="color:var(--text-3);">NO LOCK</span>
+      </div>
+    </div>
+
+    <!-- TRACKER TOGGLE -->
+    <button class="big-btn" id="tracker-btn" title="Toggle auto-tracker on/off">
+      <span>TRACKER</span>
+      <span class="btn-state" id="tracker-state">● ON</span>
+    </button>
+
+    <!-- NIR ILLUMINATOR -->
+    <div class="nir-card">
+      <div class="nir-label">NIR ILLUMINATOR</div>
+      <div class="nir-buttons">
+        <button class="nir-btn active" data-nir="auto">AUTO</button>
+        <button class="nir-btn" data-nir="on">ON</button>
+        <button class="nir-btn" data-nir="off">OFF</button>
+      </div>
+      <div class="nir-hint" id="nir-hint">pulsed 20% duty (safe)</div>
+    </div>
+
+  </div><!-- /.row-main -->
+
+  <!-- ─────────── ROW 3: gimbal + radar profile + thermal tuning ─────────── -->
+  <div class="row-ctrl">
+
+    <!-- GIMBAL DPAD -->
+    <div class="ctrl-card">
+      <div class="ctrl-head">
+        <span class="ctrl-title">GIMBAL</span>
+        <span class="ctrl-val mono">pan <b id="gimbal-pan">—</b> · tilt <b id="gimbal-tilt">—</b></span>
+      </div>
+      <div class="dpad">
+        <button class="dpad-spacer"></button>
+        <button class="dpad-btn" id="dpad-up"   data-dp="0"  data-dt="5"  title="Tilt up">▲</button>
+        <button class="dpad-spacer"></button>
+        <button class="dpad-btn" id="dpad-left" data-dp="-5" data-dt="0"  title="Pan left">◀</button>
+        <button class="dpad-btn home" id="dpad-home" title="Go to home position">HOME</button>
+        <button class="dpad-btn" id="dpad-right" data-dp="5" data-dt="0"  title="Pan right">▶</button>
+        <button class="dpad-spacer"></button>
+        <button class="dpad-btn" id="dpad-down" data-dp="0"  data-dt="-5" title="Tilt down">▼</button>
+        <button class="dpad-spacer"></button>
+      </div>
+      <div class="gimbal-hint" id="gimbal-hint">manual disabled · tracker ON</div>
+    </div>
+
+    <!-- RADAR PROFILE -->
+    <div class="ctrl-card">
+      <div class="ctrl-head">
+        <span class="ctrl-title">RADAR PROFILE</span>
+      </div>
+      <select id="radar-profile-sel">
+        <option value="automotive_default">automotive_default</option>
+        <option value="pmm_extended">pmm_extended</option>
+        <option value="long_range_200m">long_range_200m</option>
+      </select>
+      <div style="margin-top:10px;">
+        <div class="stat-line">max range · 150 m</div>
+        <div class="stat-line">velocity res · 0.1 m/s</div>
+        <div class="stat-line">frame rate · 20 Hz</div>
+        <div class="stat-line">azimuth res · ±1°</div>
+      </div>
+      <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">Radar offline — profile applies on connect</div>
+    </div>
+
+    <!-- THERMAL TUNING -->
+    <div class="ctrl-card">
+      <div class="ctrl-head">
+        <span class="ctrl-title">THERMAL TUNING</span>
+      </div>
+      <div class="slider-row">
+        <label class="slider-label">SENSITIVITY</label>
+        <input id="thr-slider" type="range" min="2" max="20" step="0.5" value="14" data-invert="1">
+        <span class="slider-val" id="thr-val">—</span>
+      </div>
+      <div class="slider-row">
+        <label class="slider-label">MIN BLOB</label>
+        <input id="minarea-slider" type="range" min="3" max="500" step="1" value="80" data-invert="1">
+        <span class="slider-val" id="minarea-val">—</span>
+      </div>
+    </div>
+
+  </div><!-- /.row-ctrl -->
+
+  <!-- ─────────── STATUS BAR ─────────── -->
+  <div class="statusbar">
+    <span id="stat-left">ws — · thermal — Hz · eo — · radar —</span>
+    <span id="stat-mid">— tracks · main — · tracker ON · rec OFF</span>
+    <span id="stat-right">—</span>
   </div>
-</div>
 
-<!-- Thermal detail page -->
-<div class="page" data-page="thermal">
-  <div class="detail-grid">
-    <div class="sensor-panel">
-      <div class="panel-header">
-        <div class="panel-title"><span class="dot" style="background:var(--thermal-orange)"></span>LIVE FEED</div>
-      </div>
-      <div class="panel-body">
-        <canvas id="thermal-canvas-big" class="sensor-canvas"></canvas>
-        <div id="thermal-disconnected-big" class="disconnect-overlay hidden">THERMAL<br>DISCONNECTED</div>
-      </div>
-    </div>
-    <div class="sensor-panel">
-      <div class="panel-header">
-        <div class="panel-title">DETECTIONS</div>
-      </div>
-      <div class="panel-body panel-body-scroll">
-        <table class="det-table">
-          <thead><tr><th>#</th><th>BBOX</th><th>AREA</th><th>CONTRAST</th><th>CLASS</th><th>CONF</th></tr></thead>
-          <tbody id="det-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Engineering page -->
-<div class="page" data-page="engineering">
-  <div class="eng-grid">
-    <div class="sensor-panel">
-      <div class="panel-header"><div class="panel-title">TIMING</div></div>
-      <div class="panel-body" style="padding:14px">
-        <div class="timing-row"><span class="timing-label">WS frame rate</span><span class="timing-val" id="eng-ws-fps">—</span></div>
-        <div class="timing-row"><span class="timing-label">Thermal frame id</span><span class="timing-val" id="eng-frame-id">—</span></div>
-        <div class="timing-row"><span class="timing-label">Image size</span><span class="timing-val" id="eng-size">—</span></div>
-        <div class="timing-row"><span class="timing-label">HFOV / VFOV</span><span class="timing-val" id="eng-fov">—</span></div>
-        <div class="timing-row"><span class="timing-label">Zoom preset</span><span class="timing-val" id="eng-zoom">—</span></div>
-        <div class="timing-row"><span class="timing-label">Detections / frame</span><span class="timing-val" id="eng-det">—</span></div>
-        <div class="timing-row"><span class="timing-label">Classifier</span><span class="timing-val" id="eng-classifier">—</span></div>
-      </div>
-    </div>
-    <div class="sensor-panel">
-      <div class="panel-header"><div class="panel-title">CONNECTION</div></div>
-      <div class="panel-body" style="padding:14px">
-        <div class="timing-row"><span class="timing-label">WebSocket URL</span><span class="timing-val" id="eng-ws-url">—</span></div>
-        <div class="timing-row"><span class="timing-label">WebSocket state</span><span class="timing-val" id="eng-ws-state">—</span></div>
-        <div class="timing-row"><span class="timing-label">Last frame age</span><span class="timing-val" id="eng-age">—</span></div>
-      </div>
-    </div>
-  </div>
-</div>
+</div><!-- /.stage -->
 
 <script type="module" src="/static/js/main.js"></script>
 </body>
