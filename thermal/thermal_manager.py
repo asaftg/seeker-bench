@@ -26,6 +26,7 @@ from common.config import load_config
 from common.frame_bus import BUS
 from common.frames import BBox, ThermalFrame, Topic
 from common.logging_setup import get_logger
+from thermal.classifier_hv import HumanVehicleClassifier
 from thermal.detection_tracker import DetectionTracker, TrackerConfig
 from thermal.digital_zoom import PRESETS as ZOOM_PRESETS, center_crop
 from thermal.drone_classifier import Classifier
@@ -96,6 +97,22 @@ class ThermalManager:
             except Exception as e:  # defensive — classifier must never take down capture
                 log.warning("Classifier init failed: %s", e)
                 self._classifier = None
+
+        # ── Phase B: human + vehicle classifier (Ticket 1) ────────────
+        # Loaded only when classifier_hv_enabled: true in config.
+        # When disabled the pipeline is byte-identical to Phase A.
+        self._classifier_hv: Optional[HumanVehicleClassifier] = None
+        ccfg = cfg.get("classifier", {})
+        if enable_classifier and bool(ccfg.get("classifier_hv_enabled", False)):
+            try:
+                self._classifier_hv = HumanVehicleClassifier(
+                    model_path=str(ccfg.get("classifier_hv_model", "models/seeker_thermal_hv.pt")),
+                    conf_threshold=float(ccfg.get("classifier_hv_conf", 0.40)),
+                )
+                log.info("HV classifier loaded (active=%s)", self._classifier_hv.active)
+            except Exception as e:
+                log.warning("HV classifier init failed: %s — h/v disabled", e)
+                self._classifier_hv = None
 
         self._thcfg = cfg.get("thermal", {})
         self._classify_every = int((cfg.get("classifier", {}) or {}).get("classify_interval_frames", 5))
@@ -348,14 +365,56 @@ class ThermalManager:
             log.warning("DetectionTracker failed: %s", e)
 
         # ── 5. Classification (throttled) ──────────────────────────
-        if detections and self._classifier is not None and (self._frame_id % self._classify_every == 0):
-            try:
-                results = self._classifier.classify(display, detections)
-                for det, res in zip(detections, results):
-                    det.classification = res
-                self._last_classifications = results
-            except Exception as e:
-                log.warning("Classifier failed: %s", e)
+        if detections and (self._frame_id % self._classify_every == 0):
+            # 5a. Drone classifier (Phase A — always runs when enabled)
+            drone_results = None
+            if self._classifier is not None:
+                try:
+                    drone_results = self._classifier.classify(display, detections)
+                    for det, res in zip(detections, drone_results):
+                        det.classification = res
+                    self._last_classifications = drone_results
+                except Exception as e:
+                    log.warning("Drone classifier failed: %s", e)
+
+            # 5b. H/V classifier (Phase B Ticket 1 — only when enabled)
+            if self._classifier_hv is not None:
+                h, w = display.shape[:2]
+                pad = 16  # roi_padding_px
+                try:
+                    for i, det in enumerate(detections):
+                        x0 = max(0, det.bbox.x - pad)
+                        y0 = max(0, det.bbox.y - pad)
+                        x1 = min(w, det.bbox.x + det.bbox.w + pad)
+                        y1 = min(h, det.bbox.y + det.bbox.h + pad)
+                        roi = display[y0:y1, x0:x1]
+                        hv_result = self._classifier_hv.classify(roi)
+                        if hv_result is None:
+                            continue  # h/v saw nothing → keep drone result
+
+                        hv_conf = float(hv_result.get("conf", 0.0))
+                        hv_cls  = str(hv_result.get("class", "unknown"))
+
+                        # Merge: highest confidence wins; tie-break → drone
+                        drone_conf = (
+                            det.classification.confidence
+                            if det.classification is not None
+                            else 0.0
+                        )
+                        if hv_conf > drone_conf:
+                            from common.frames import ClassificationResult, TargetClass
+                            try:
+                                tc = TargetClass(hv_cls)
+                            except ValueError:
+                                tc = TargetClass.UNKNOWN
+                            det.classification = ClassificationResult(
+                                target_class=tc,
+                                confidence=hv_conf,
+                                classifier_used="yolo_hv",
+                            )
+                        # If equal or lower → keep drone result (tie-break → drone)
+                except Exception as e:
+                    log.warning("HV classifier step failed: %s", e)
 
         # ── 6. Publish ─────────────────────────────────────────────
         tf = ThermalFrame(

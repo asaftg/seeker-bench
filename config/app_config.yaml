@@ -69,6 +69,18 @@ classifier:
   class_to_target:
     0: drone
 
+  # ── Phase B — Human + Vehicle classifier (Ticket 1) ─────────────────────
+  # Set classifier_hv_enabled: true after running:
+  #   python scripts/train_yolo_hv.py --auto
+  # to produce models/seeker_thermal_hv.pt.
+  # Until that model exists the h/v classifier falls back to stock yolov8n.pt
+  # (COCO person/car/truck/bus classes) — still useful, just less accurate on
+  # thermal imagery than a fine-tuned model.
+  classifier_hv_enabled: false
+  classifier_hv_model: models/seeker_thermal_hv.pt
+  classifier_hv_conf: 0.40
+  classifier_hv_classes: [person, vehicle]
+
 radar:
   enabled: false                # Phase A: radar disconnected placeholder
   # real radar params added in Phase B

@@ -29,6 +29,9 @@ class TargetClass(str, Enum):
     DRONE   = "drone"     # field target (warm compact blob)
     BIRD    = "bird"      # reserved for later phases
     NOISE   = "noise"     # classifier rejected as false alarm
+    # Phase B — human+vehicle classifier (Ticket 1)
+    PERSON  = "person"    # human detected by h/v classifier
+    VEHICLE = "vehicle"   # vehicle detected by h/v classifier
 
 
 # ───────────────────────────────────────────────────────────────

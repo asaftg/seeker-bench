@@ -133,7 +133,73 @@ def main() -> int:
         except Exception as e:
             check("Classifier init", False, str(e))
 
-    # ── 7. Cleanup ─────────────────────────────────────
+    # ── 7. H/V Classifier (Ticket 1) ──────────────────
+    print("\n7. Human+Vehicle classifier (classifier_hv)...")
+    try:
+        import numpy as np
+        from thermal.classifier_hv import HumanVehicleClassifier
+
+        clf_hv = HumanVehicleClassifier(
+            model_path="models/seeker_thermal_hv.pt",   # may not exist yet → COCO fallback
+            conf_threshold=0.01,                        # very low so COCO fallback can return results
+        )
+        check("HumanVehicleClassifier instantiates", True)
+        check("HumanVehicleClassifier.active", clf_hv.active,
+              "ultralytics not available or model load failed")
+
+        if clf_hv.active:
+            # Test 1: blank image → should return None (nothing to detect)
+            blank = np.zeros((64, 64, 3), dtype=np.uint8)
+            result_blank = clf_hv.classify(blank)
+            check(
+                "blank image → None or low-conf result",
+                result_blank is None or float(result_blank.get("conf", 0)) < 0.5,
+                f"got {result_blank}",
+            )
+
+            # Test 2: person-like patch (medium grey rectangle, person shape)
+            person_roi = np.full((128, 64, 3), 120, dtype=np.uint8)
+            result_person = clf_hv.classify(person_roi)
+            # We can't guarantee the label on a synthetic patch, but the call
+            # must not raise and must return None or a valid dict
+            check(
+                "person-like ROI → valid output shape",
+                result_person is None or (
+                    isinstance(result_person, dict)
+                    and "class" in result_person
+                    and "conf" in result_person
+                ),
+                f"got {result_person}",
+            )
+
+            # Test 3: vehicle-like patch (wide dark rectangle)
+            vehicle_roi = np.full((64, 128, 3), 80, dtype=np.uint8)
+            result_vehicle = clf_hv.classify(vehicle_roi)
+            check(
+                "vehicle-like ROI → valid output shape",
+                result_vehicle is None or (
+                    isinstance(result_vehicle, dict)
+                    and "class" in result_vehicle
+                    and "conf" in result_vehicle
+                ),
+                f"got {result_vehicle}",
+            )
+
+    except Exception as e:
+        check("HV classifier tests", False, str(e))
+
+    # ── 8. TargetClass enum has PERSON + VEHICLE ────────
+    print("\n8. TargetClass enum (Phase B extensions)...")
+    try:
+        from common.frames import TargetClass
+        check("TargetClass.PERSON exists",  hasattr(TargetClass, "PERSON"))
+        check("TargetClass.VEHICLE exists", hasattr(TargetClass, "VEHICLE"))
+        check("TargetClass.PERSON value",   TargetClass.PERSON  == "person")
+        check("TargetClass.VEHICLE value",  TargetClass.VEHICLE == "vehicle")
+    except Exception as e:
+        check("TargetClass extensions", False, str(e))
+
+    # ── 9. Cleanup ─────────────────────────────────────
     tm.stop()
 
     # ── Summary ────────────────────────────────────────
