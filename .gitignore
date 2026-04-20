@@ -25,6 +25,11 @@ datasets/hit_uav/
 datasets/hit_uav_hv/
 datasets/llvip/
 datasets/seeker_hv/
+datasets/flir_adas_v2/
+datasets/m3fd/
+datasets/cvc14/
+datasets/antiuav/
+datasets/thermal_drone/
 runs/
 
 # Model weights (auto-downloaded; large)
