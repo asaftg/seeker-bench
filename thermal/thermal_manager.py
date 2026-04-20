@@ -111,7 +111,8 @@ class ThermalManager:
                 )
                 self._hv_min_bbox_px = int(ccfg.get("classifier_hv_min_bbox_px", 2500))
                 self._hv_min_hits = int(ccfg.get("classifier_hv_min_hits", 2))
-                self._hv_max_misses = int(ccfg.get("classifier_hv_max_misses", 3))
+                self._hv_max_misses = int(ccfg.get("classifier_hv_max_misses", 8))
+                self._hv_bbox_ema = float(ccfg.get("classifier_hv_bbox_ema", 0.15))
                 # Simple h/v persistence tracker: each entry is
                 # {bbox, class, conf, hits, misses}. We IoU-match each new
                 # YOLO det to the nearest cached track; a track must reach
@@ -453,8 +454,9 @@ class ThermalManager:
                             best_t = ti
                     if best_t >= 0 and best_iou >= 0.30:
                         trk = self._hv_tracks[best_t]
-                        # Light EMA on the bbox to reduce jitter.
-                        a = 0.5
+                        # EMA on the bbox to reduce jitter. Low a=snappy tracking,
+                        # high a=smoother but laggier. Tuned via classifier_hv_bbox_ema.
+                        a = self._hv_bbox_ema
                         trk["bbox"] = (
                             int(a * trk["bbox"][0] + (1 - a) * bx),
                             int(a * trk["bbox"][1] + (1 - a) * by),

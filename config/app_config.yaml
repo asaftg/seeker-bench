@@ -61,7 +61,7 @@ classifier:
   model_path: models/yolov8n.pt
   trained_model_path: models/seeker_thermal.pt   # preferred if exists
   conf_threshold: 0.40          # higher = fewer false DRONE labels; lower = catches faint drones
-  classify_interval_frames: 15  # YOLO runs every Nth frame; tracker keeps labels sticky between runs
+  classify_interval_frames: 1   # every frame. A4000+yolov8n = 117 Hz so this is free.
   roi_padding_px: 16
   # Model class-index → TargetClass mapping.
   # For the fine-tuned seeker_thermal.pt trained on thermal drone
@@ -86,7 +86,8 @@ classifier:
   # Temporal persistence: a h/v box must survive this many classifier
   # runs at IoU >= 0.3 before it's drawn. Kills single-frame flicker FPs.
   classifier_hv_min_hits: 2
-  classifier_hv_max_misses: 3
+  classifier_hv_max_misses: 8        # tolerate brief low-conf dips while walking
+  classifier_hv_bbox_ema: 0.15       # bbox smoothing: 0 = raw YOLO, 0.5 = heavy lag. Low = snappy.
 
 radar:
   enabled: false                # Phase A: radar disconnected placeholder
