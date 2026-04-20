@@ -172,6 +172,142 @@ def convert_sequence(seq: Path, split: str) -> tuple[int, int]:
     return n_img, n_box
 
 
+# ---------------------------------------------------------------------------
+# DUT Anti-UAV layout support: flat `img/` + `xml/` (or `annotations/`) dirs.
+# DUT typically ships as:
+#     DUT Anti-UAV/
+#         train/img/*.jpg
+#         train/xml/*.xml       (VOC, class=drone or UAV)
+#         val/img/*.jpg
+#         val/xml/*.xml
+#         test/img/*.jpg
+#         test/xml/*.xml
+# Also tolerates txt label files (one bbox per line, "x y w h" absolute px).
+# ---------------------------------------------------------------------------
+import cv2
+import xml.etree.ElementTree as ET
+
+
+def find_flat_pairs(root: Path) -> list[tuple[Path, Path, str]]:
+    """Return list of (img_dir, ann_dir, split_hint)."""
+    pairs = []
+    seen = set()
+    # Look for `img` dirs with a sibling annotations dir
+    for img_dir in root.rglob("img"):
+        if not img_dir.is_dir():
+            continue
+        parent = img_dir.parent
+        if parent in seen:
+            continue
+        ann_dir = None
+        for ann_name in ("xml", "annotations", "Annotations", "anno", "label", "labels"):
+            cand = parent / ann_name
+            if cand.is_dir():
+                ann_dir = cand
+                break
+        if ann_dir is None:
+            continue
+        # Infer split from parent dir name
+        split = "val" if any(tag in parent.name.lower() for tag in ("val", "test")) else "train"
+        pairs.append((img_dir, ann_dir, split))
+        seen.add(parent)
+    return pairs
+
+
+def parse_dut_ann(ann_path: Path, W: int, H: int) -> list[str]:
+    """Parse a DUT-style annotation file -> YOLO lines.  Accepts VOC XML or plain txt."""
+    lines: list[str] = []
+    if ann_path.suffix.lower() == ".xml":
+        try:
+            root = ET.parse(ann_path).getroot()
+        except Exception:
+            return []
+        # Try to pull width/height from XML if present (overrides passed W/H)
+        size = root.find("size")
+        if size is not None:
+            try:
+                W = int(float(size.find("width").text)) or W
+                H = int(float(size.find("height").text)) or H
+            except Exception:
+                pass
+        for obj in root.findall("object"):
+            bb = obj.find("bndbox")
+            if bb is None:
+                continue
+            try:
+                x1 = float(bb.find("xmin").text)
+                y1 = float(bb.find("ymin").text)
+                x2 = float(bb.find("xmax").text)
+                y2 = float(bb.find("ymax").text)
+            except Exception:
+                continue
+            cx = (x1 + x2) / 2.0 / W
+            cy = (y1 + y2) / 2.0 / H
+            w = (x2 - x1) / W
+            h = (y2 - y1) / H
+            if not (0 < w < 1 and 0 < h < 1 and 0 < cx < 1 and 0 < cy < 1):
+                continue
+            lines.append(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    else:
+        # txt: one box per line, whitespace-separated.
+        for ln in ann_path.read_text(errors="ignore").splitlines():
+            parts = ln.strip().split()
+            if len(parts) < 4:
+                continue
+            try:
+                nums = [float(p) for p in parts[:4]]
+            except ValueError:
+                continue
+            x, y, w, h = nums
+            if w <= 0 or h <= 0:
+                continue
+            cx = (x + w / 2.0) / W
+            cy = (y + h / 2.0) / H
+            nw = w / W
+            nh = h / H
+            if not (0 < nw < 1 and 0 < nh < 1 and 0 < cx < 1 and 0 < cy < 1):
+                continue
+            lines.append(f"0 {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+    return lines
+
+
+def convert_flat(img_dir: Path, ann_dir: Path, split: str) -> tuple[int, int]:
+    img_dst = DST / "images" / split
+    lbl_dst = DST / "labels" / split
+    img_dst.mkdir(parents=True, exist_ok=True)
+    lbl_dst.mkdir(parents=True, exist_ok=True)
+
+    n_img = n_box = 0
+    prefix = f"dut_{img_dir.parent.name}_"
+    for img_path in sorted(img_dir.iterdir()):
+        if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
+        stem = img_path.stem
+        # Try matching annotation: same stem, any supported extension
+        ann_path = None
+        for ext in (".xml", ".txt"):
+            cand = ann_dir / f"{stem}{ext}"
+            if cand.exists():
+                ann_path = cand
+                break
+        if ann_path is None:
+            continue
+        # Read image dims (needed for txt format; xml may override)
+        im = cv2.imread(str(img_path))
+        if im is None:
+            continue
+        H, W = im.shape[:2]
+        lines = parse_dut_ann(ann_path, W, H)
+        if not lines:
+            continue
+        out_name = f"{prefix}{stem}"
+        shutil.copy2(img_path, img_dst / f"{out_name}{img_path.suffix}")
+        (lbl_dst / f"{out_name}.txt").write_text("\n".join(lines) + "\n")
+        n_img += 1
+        n_box += len(lines)
+    return n_img, n_box
+
+
 def write_yaml():
     DST.mkdir(parents=True, exist_ok=True)
     yaml = DST / "data.yaml"
@@ -190,19 +326,29 @@ def main():
     if not EXTRACT.exists():
         print("[antiuav] nothing to prep")
         return
-    seqs = find_sequences(EXTRACT)
-    print(f"[antiuav] found {len(seqs)} sequences")
-    if not seqs:
-        return
 
     total_img = total_box = 0
+
+    # Path 1: sequence format (CVPR Anti-UAV, Anti-UAV410, Anti-UAV600)
+    seqs = find_sequences(EXTRACT)
+    print(f"[antiuav] sequences found: {len(seqs)}")
     for i, seq in enumerate(sorted(seqs)):
         split = "val" if (i % 10 == 0) else "train"
         ni, nb = convert_sequence(seq, split)
         total_img += ni
         total_box += nb
         if (i + 1) % 20 == 0:
-            print(f"[antiuav] progress: {i+1}/{len(seqs)} sequences  imgs={total_img}")
+            print(f"[antiuav] seq progress {i+1}/{len(seqs)}  total_imgs={total_img}")
+
+    # Path 2: flat img+annotations format (DUT Anti-UAV)
+    pairs = find_flat_pairs(EXTRACT)
+    print(f"[antiuav] flat img/ann pairs found: {len(pairs)}")
+    for img_dir, ann_dir, split in pairs:
+        ni, nb = convert_flat(img_dir, ann_dir, split)
+        print(f"[antiuav] flat {img_dir.parent.name}/{img_dir.name} -> {split}: imgs={ni} boxes={nb}")
+        total_img += ni
+        total_box += nb
+
     print(f"[antiuav] TOTAL images={total_img} boxes={total_box}")
     write_yaml()
 
