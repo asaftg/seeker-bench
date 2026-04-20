@@ -249,6 +249,21 @@ function wireDeviceSelector(selId, endpoint) {
 wireDeviceSelector("thermal-device-sel", "/api/config/thermal");
 wireDeviceSelector("eo-device-sel",      "/api/config/eo");
 
+// Populate dropdowns immediately on page load — independent of the WS.
+// Retry every 3s until we get a non-empty camera list (covers the case
+// where managers are still warming up when the page first renders).
+(function primeCameraDevices() {
+  let tries = 0;
+  const tick = async () => {
+    tries += 1;
+    await loadCameraDevices();
+    const sel = $("thermal-device-sel") || $("eo-device-sel");
+    const hasCams = sel && sel.options.length > 1;
+    if (!hasCams && tries < 20) setTimeout(tick, 3000);
+  };
+  tick();
+})();
+
 async function loadDetectorConfig() {
   try {
     const r = await fetch("/api/config/heat_detector");
