@@ -88,6 +88,9 @@ classifier:
   classifier_hv_min_hits: 2
   classifier_hv_max_misses: 8        # tolerate brief low-conf dips while walking
   classifier_hv_bbox_ema: 0.15       # bbox smoothing: 0 = raw YOLO, 0.5 = heavy lag. Low = snappy.
+  # Inference image size. auto = 960 on GPU (boosts detection range for
+  # distant/small targets), 640 on CPU. Int override allowed.
+  classifier_hv_imgsz: auto
 
 radar:
   enabled: false                # Phase A: radar disconnected placeholder

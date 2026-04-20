@@ -79,8 +79,13 @@ class HumanVehicleClassifier:
         fallback_model_path: str = "models/yolov8n.pt",
         conf_threshold: float = 0.40,
         classes: Optional[list] = None,
+        imgsz: int = 640,
     ) -> None:
         self.conf_threshold = conf_threshold
+        # Inference image size. Training was imgsz=640; running predict at 960
+        # upscales the input so small/distant targets get more pixels.
+        # Typical on A4000: 8ms @ 640 vs 14ms @ 960 — still ~70 Hz.
+        self.imgsz = int(imgsz)
         self._model = None
         self._is_finetuned = False
         self._coco_map: Dict[int, str] = {}
@@ -157,7 +162,7 @@ class HumanVehicleClassifier:
         if self._model is None or image is None or image.size == 0:
             return []
         try:
-            results = self._model.predict(image, conf=self.conf_threshold, verbose=False)
+            results = self._model.predict(image, conf=self.conf_threshold, imgsz=self.imgsz, verbose=False)
         except Exception as e:
             log.warning("HV full-frame inference failed: %s", e)
             return []

@@ -105,9 +105,20 @@ class ThermalManager:
         ccfg = cfg.get("classifier", {})
         if enable_classifier and bool(ccfg.get("classifier_hv_enabled", False)):
             try:
+                # imgsz: "auto" = 960 on GPU (better small-target range), 640 on CPU.
+                _raw_imgsz = ccfg.get("classifier_hv_imgsz", "auto")
+                if isinstance(_raw_imgsz, str) and _raw_imgsz.lower() == "auto":
+                    try:
+                        import torch
+                        _hv_imgsz = 960 if torch.cuda.is_available() else 640
+                    except Exception:
+                        _hv_imgsz = 640
+                else:
+                    _hv_imgsz = int(_raw_imgsz)
                 self._classifier_hv = HumanVehicleClassifier(
                     model_path=str(ccfg.get("classifier_hv_model", "models/seeker_thermal_hv.pt")),
                     conf_threshold=float(ccfg.get("classifier_hv_conf", 0.55)),
+                    imgsz=_hv_imgsz,
                 )
                 self._hv_min_bbox_px = int(ccfg.get("classifier_hv_min_bbox_px", 2500))
                 self._hv_min_hits = int(ccfg.get("classifier_hv_min_hits", 2))
