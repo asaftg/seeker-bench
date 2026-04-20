@@ -308,6 +308,89 @@ def convert_flat(img_dir: Path, ann_dir: Path, split: str) -> tuple[int, int]:
     return n_img, n_box
 
 
+def find_video_sequences(root: Path) -> list[tuple[Path, Path, str]]:
+    """Find (infrared.mp4, infrared.json, split) triples — Anti-UAV-RGBT layout.
+
+    Structure:
+        <root>/<split_dir>/<sequence_name>/infrared.mp4
+        <root>/<split_dir>/<sequence_name>/infrared.json
+    split_dir is test/train/val — used to decide our YOLO split.
+    """
+    out = []
+    for mp4 in root.rglob("infrared.mp4"):
+        js = mp4.parent / "infrared.json"
+        if not js.exists():
+            continue
+        # Derive split from whichever ancestor dir is named train/val/test
+        split = "train"
+        for anc in mp4.parents:
+            name = anc.name.lower()
+            if name in ("train",):
+                split = "train"; break
+            if name in ("val", "test"):
+                split = "val"; break
+        out.append((mp4, js, split))
+    return out
+
+
+def convert_video_sequence(mp4: Path, json_path: Path, split: str) -> tuple[int, int]:
+    data = load_json_robust(json_path)
+    if not data:
+        return 0, 0
+    exist = data.get("exist") or []
+    rects = data.get("gt_rect") or data.get("gt") or []
+    if not rects:
+        return 0, 0
+
+    cap = cv2.VideoCapture(str(mp4))
+    if not cap.isOpened():
+        print(f"[antiuav] video open failed: {mp4}")
+        return 0, 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    n_frames = min(total_frames, len(rects))
+    if n_frames == 0:
+        cap.release()
+        return 0, 0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+
+    img_dst = DST / "images" / split
+    lbl_dst = DST / "labels" / split
+    img_dst.mkdir(parents=True, exist_ok=True)
+    lbl_dst.mkdir(parents=True, exist_ok=True)
+
+    seq_name = mp4.parent.name
+    # Keep every 5th frame
+    n_img = n_box = 0
+    i = 0
+    while i < n_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if i % 5 == 0:
+            if not (exist and i < len(exist) and not exist[i]):
+                rect = rects[i] if i < len(rects) else None
+                if rect and len(rect) == 4:
+                    x, y, w, h = rect
+                    if w > 0 and h > 0 and W > 0 and H > 0:
+                        cx = (x + w / 2.0) / W
+                        cy = (y + h / 2.0) / H
+                        nw = w / W
+                        nh = h / H
+                        if 0 < cx < 1 and 0 < cy < 1 and 0 < nw < 1 and 0 < nh < 1:
+                            out_name = f"rgbt_{seq_name}_{i:06d}"
+                            cv2.imwrite(str(img_dst / f"{out_name}.jpg"), frame,
+                                        [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            (lbl_dst / f"{out_name}.txt").write_text(
+                                f"0 {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n"
+                            )
+                            n_img += 1
+                            n_box += 1
+        i += 1
+    cap.release()
+    return n_img, n_box
+
+
 def write_yaml():
     DST.mkdir(parents=True, exist_ok=True)
     yaml = DST / "data.yaml"
@@ -339,6 +422,16 @@ def main():
         total_box += nb
         if (i + 1) % 20 == 0:
             print(f"[antiuav] seq progress {i+1}/{len(seqs)}  total_imgs={total_img}")
+
+    # Path 1b: video-sequence format (Anti-UAV-RGBT: infrared.mp4 + infrared.json)
+    vids = find_video_sequences(EXTRACT)
+    print(f"[antiuav] video sequences found: {len(vids)}")
+    for i, (mp4, js, split) in enumerate(sorted(vids)):
+        ni, nb = convert_video_sequence(mp4, js, split)
+        total_img += ni
+        total_box += nb
+        if (i + 1) % 20 == 0:
+            print(f"[antiuav] video progress {i+1}/{len(vids)}  total_imgs={total_img}")
 
     # Path 2: flat img+annotations format (DUT Anti-UAV)
     pairs = find_flat_pairs(EXTRACT)
