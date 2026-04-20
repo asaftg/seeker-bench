@@ -131,7 +131,19 @@ class ThermalManager:
                 self._classifier_hv = None
 
         self._thcfg = cfg.get("thermal", {})
-        self._classify_every = int((cfg.get("classifier", {}) or {}).get("classify_interval_frames", 5))
+        # classify_interval_frames: "auto" adapts to hardware (1 on GPU, 6 on CPU).
+        _raw_interval = (cfg.get("classifier", {}) or {}).get("classify_interval_frames", "auto")
+        if isinstance(_raw_interval, str) and _raw_interval.lower() == "auto":
+            try:
+                import torch
+                _on_gpu = bool(torch.cuda.is_available())
+            except Exception:
+                _on_gpu = False
+            self._classify_every = 1 if _on_gpu else 6
+            log.info("classify_interval_frames=auto -> %d (%s)",
+                     self._classify_every, "gpu" if _on_gpu else "cpu")
+        else:
+            self._classify_every = int(_raw_interval)
         self._full_hfov = float(self._thcfg.get("hfov_deg", 75.0))
         self._full_vfov = float(self._thcfg.get("vfov_deg", 60.0))
         self._zoom_preset = str(self._thcfg.get("digital_zoom", {}).get("preset", "full"))
