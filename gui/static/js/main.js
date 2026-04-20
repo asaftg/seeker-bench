@@ -2,6 +2,7 @@
 // No framework, no browser storage APIs, no position:fixed.
 
 import { ThermalView } from "./thermal_view.js";
+import { EOView }      from "./eo_view.js";
 import { RadarView }   from "./radar_view.js";
 
 const $ = (id) => document.getElementById(id);
@@ -10,8 +11,8 @@ const $ = (id) => document.getElementById(id);
 // Views
 // ─────────────────────────────────────────────────────────────────────────
 const thermalView = new ThermalView("thermal-canvas", "thermal-disconnected");
-// EO and radar panels have their own disconnected overlays; canvas drawing
-// will be wired in Ticket 3 (EO) and Ticket 4 (Radar). For now they show DISCONNECTED.
+const eoView      = new EOView("eo-canvas", "eo-disconnected");
+// Radar panel canvas drawing will be wired in Ticket 4. For now it shows DISCONNECTED.
 
 // ─────────────────────────────────────────────────────────────────────────
 // UI state (local mirror; reconciled from WS on each frame)
@@ -194,6 +195,60 @@ function sliderSetReal(el, real) {
   el.value = Math.max(min, Math.min(max, el.dataset.invert ? (min + max - real) : real));
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Camera device selectors — one in each panel header so the user can pick
+// which physical camera feeds Thermal and which feeds EO. Populated from
+// GET /api/devices/cameras at WS open.
+// ─────────────────────────────────────────────────────────────────────────
+async function loadCameraDevices() {
+  const thermalSel = $("thermal-device-sel");
+  const eoSel      = $("eo-device-sel");
+  if (!thermalSel && !eoSel) return;
+  try {
+    const r = await fetch("/api/devices/cameras");
+    const j = await r.json();
+    const cams = j.cameras || [];
+    const fill = (sel, activeIdx) => {
+      if (!sel) return;
+      sel.innerHTML = "";
+      // "auto" row
+      const a = document.createElement("option");
+      a.value = "auto";
+      a.textContent = "auto";
+      sel.appendChild(a);
+      for (const c of cams) {
+        const o = document.createElement("option");
+        o.value = String(c.index);
+        o.textContent = `#${c.index} ${c.width}x${c.height}`;
+        if (activeIdx != null && Number(activeIdx) === Number(c.index)) {
+          o.selected = true;
+        }
+        sel.appendChild(o);
+      }
+    };
+    fill(thermalSel, j.thermal_active);
+    fill(eoSel,      j.eo_active);
+  } catch (e) {
+    // Endpoint may return 503 if managers aren't ready yet — retry silently.
+  }
+}
+
+function wireDeviceSelector(selId, endpoint) {
+  const sel = $(selId);
+  if (!sel) return;
+  sel.addEventListener("change", () => {
+    const raw = sel.value;
+    const payload = { device_index: raw === "auto" ? "auto" : Number(raw) };
+    fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  });
+}
+wireDeviceSelector("thermal-device-sel", "/api/config/thermal");
+wireDeviceSelector("eo-device-sel",      "/api/config/eo");
+
 async function loadDetectorConfig() {
   try {
     const r = await fetch("/api/config/heat_detector");
@@ -295,6 +350,7 @@ function connect() {
   ws.onopen = () => {
     if (wsStatus) wsStatus.textContent = "WS: connected";
     loadDetectorConfig();
+    loadCameraDevices();
   };
 
   ws.onclose = () => {
@@ -325,11 +381,16 @@ function connect() {
             thermal.connected ? "on" : "off",
             "THERMAL");
 
-    // ── EO panel ── (disconnected until Ticket 3)
+    // ── EO panel ──
     const eo = msg.eo || {};
-    const eoDisc = $("eo-disconnected");
-    if (eoDisc) eoDisc.classList.toggle("hidden", !!eo.connected);
+    eoView.update(eo, msg.main_target_id || null);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
+    const eoHz = $("eo-hz");
+    if (eoHz) eoHz.textContent = eo.connected ? (_fps.current + " Hz") : "— Hz";
+    const eoFovEl = $("eo-fov");
+    if (eoFovEl && eo.hfov_deg != null) {
+      eoFovEl.textContent = Number(eo.hfov_deg).toFixed(1) + "° HFOV";
+    }
 
     // ── Radar panel ── (disconnected until Ticket 4)
     const radar = msg.radar || {};

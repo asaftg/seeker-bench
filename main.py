@@ -22,6 +22,7 @@ import uvicorn
 
 from common.config import load_config
 from common.logging_setup import configure, get_logger
+from eo.eo_manager import EOManager
 from gui.app import create_app
 from thermal.thermal_manager import ThermalManager
 
@@ -29,11 +30,17 @@ from thermal.thermal_manager import ThermalManager
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Seeker-01 Bench Test")
     p.add_argument("--fake-thermal", action="store_true", help="Synthetic thermal source")
+    p.add_argument("--fake-eo", action="store_true", help="Synthetic EO (webcam) source")
+    p.add_argument("--no-eo", action="store_true", help="Disable EO pipeline entirely")
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
     p.add_argument("--host", default=None, help="GUI bind host")
     p.add_argument("--port", type=int, default=None, help="GUI bind port")
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser")
-    p.add_argument("--device", default="auto", help="Camera device index")
+    p.add_argument("--device", default="auto",
+                   help="Thermal camera device index (auto|0|1|...)")
+    p.add_argument("--eo-device", default=None,
+                   help="EO camera device index (auto|0|1|...). "
+                        "Defaults to config eo.device_index.")
     return p.parse_args()
 
 
@@ -50,7 +57,8 @@ def main() -> int:
     )
     log = get_logger(__name__)
     log.info("=" * 50)
-    log.info("Seeker-01 starting (fake_thermal=%s)", args.fake_thermal)
+    log.info("Seeker-01 starting (fake_thermal=%s fake_eo=%s no_eo=%s)",
+             args.fake_thermal, args.fake_eo, args.no_eo)
     log.info("=" * 50)
 
     # Start thermal manager
@@ -61,9 +69,31 @@ def main() -> int:
     )
     thermal.start()
 
-    # Build FastAPI app. The thermal manager is passed in so the runtime
+    # Start EO manager (optional). Disabling leaves the GUI's EO panel in
+    # DISCONNECTED state; rest of the app is unaffected.
+    eo: EOManager | None = None
+    eo_cfg = (cfg.get("eo") or {})
+    eo_enabled_in_cfg = bool(eo_cfg.get("enabled", True))
+    if not args.no_eo and eo_enabled_in_cfg:
+        eo_device = args.eo_device if args.eo_device is not None else eo_cfg.get("device_index", "auto")
+        try:
+            # No exclude_indices: cv2 device-locking handles collisions
+            # naturally — if thermal grabbed index 0, EO's auto-probe
+            # fails on 0 and moves to 1. User can override both via the
+            # GUI device-selector dropdowns.
+            eo = EOManager(
+                use_fake=args.fake_eo,
+                device_index=eo_device,
+                enable_classifier=not args.no_classifier,
+            )
+            eo.start()
+        except Exception as e:
+            log.warning("EO manager failed to start: %s — continuing without EO", e)
+            eo = None
+
+    # Build FastAPI app. The managers are passed in so the runtime
     # config endpoints can mutate detector parameters live from the GUI.
-    app = create_app(thermal_manager=thermal)
+    app = create_app(thermal_manager=thermal, eo_manager=eo)
 
     host = args.host or str(cfg.get("gui", {}).get("host", "127.0.0.1"))
     port = args.port or int(cfg.get("gui", {}).get("port", 8080))
@@ -80,6 +110,8 @@ def main() -> int:
 
     def _shutdown(*_):
         log.info("Shutdown signal received, stopping sensors")
+        if eo is not None:
+            eo.stop()
         thermal.stop()
         sys.exit(0)
 
@@ -93,6 +125,8 @@ def main() -> int:
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
+        if eo is not None:
+            eo.stop()
         thermal.stop()
 
     return 0

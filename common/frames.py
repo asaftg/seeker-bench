@@ -92,6 +92,46 @@ class ThermalFrame:
 
 
 # ───────────────────────────────────────────────────────────────
+# EO (visible / NIR RGB) frames — Ticket 3
+# ───────────────────────────────────────────────────────────────
+
+@dataclass
+class EODetection:
+    """A single YOLO detection in an EO frame (person / vehicle)."""
+    bbox: BBox
+    confidence: float
+    target_class: TargetClass   # PERSON | VEHICLE | UNKNOWN
+    track_id: Optional[int] = None
+
+
+@dataclass
+class EOFrame:
+    """A fully-processed EO (webcam) frame published on the bus.
+
+    Mirrors ThermalFrame but carries a BGR uint8 display image
+    instead of a raw16 thermal image.
+
+    `connected=False` is the "camera is gone" sentinel — the GUI
+    uses it to flip the EO status pill red without crashing.
+    """
+    timestamp: float
+    frame_id: int
+    connected: bool
+    bgr: Optional[np.ndarray] = None   # uint8, shape (H, W, 3)
+    detections: List[EODetection] = field(default_factory=list)
+
+    # IMX568 (2472x2064 @ 2.74um -> 6.77x5.65mm active) + Commonlands
+    # CIL350 (35mm EFL) — narrow telephoto.
+    # HFOV = 2*atan(6.77/2/35) ≈ 11.05°
+    # VFOV = 2*atan(5.65/2/35) ≈ 9.23°
+    # DFOV ≈ 14.4° (inside the 11mm image-circle spec).
+    # Per-pixel IFOV is ~7x finer than thermal's 75° — gimbal precision.
+    hfov_deg: float = 11.05
+    vfov_deg: float = 9.23
+    source_device: Optional[int] = None  # cv2 device index in use
+
+
+# ───────────────────────────────────────────────────────────────
 # Radar frames (Phase A: stub shape only, real fields added in Phase B)
 # ───────────────────────────────────────────────────────────────
 
@@ -110,5 +150,6 @@ class RadarFrame:
 
 class Topic:
     THERMAL = "thermal"
+    EO      = "eo"
     RADAR   = "radar"
     FUSED   = "fused"

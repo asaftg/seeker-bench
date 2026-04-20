@@ -199,6 +199,27 @@ class ThermalManager:
         log.info("zoom preset -> %s (tracker reset)", preset)
         return True
 
+    def set_device(self, new_index: int | str) -> None:
+        """Reopen thermal capture on a different cv2 device index at runtime.
+
+        Ticket 3: the GUI's camera-selector dropdown lets the user
+        reassign which physical camera is Thermal vs EO without
+        restarting the whole process. The capture loop will reopen on
+        the next iteration (avoids cross-thread cv2 calls).
+        """
+        log.info("Thermal set_device -> %s (was %s)", new_index, self.device_index)
+        self.device_index = new_index
+        if self._source is not None:
+            try:
+                self._source.stop()
+            except Exception:
+                pass
+            self._source = None
+        try:
+            self._tracker.reset()
+        except Exception:
+            pass
+
     # ───────────────────────── lifecycle ─────────────────────────
 
     def start(self) -> None:

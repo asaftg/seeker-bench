@@ -215,6 +215,26 @@ body {
   font-family: "JetBrains Mono", monospace;
   margin-left: auto;
 }
+.cam-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  font-size: 10px;
+  color: var(--text-3);
+  font-family: "JetBrains Mono", monospace;
+}
+.cam-selector label { text-transform: uppercase; letter-spacing: 0.05em; }
+.device-sel {
+  background: transparent;
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+  font: 10px "JetBrains Mono", monospace;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.device-sel:hover { border-color: var(--cyan); color: var(--text); }
 
 .panel-canvas {
   position: relative;

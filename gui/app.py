@@ -39,14 +39,16 @@ def _static_dir() -> Path:
     return base / "static"
 
 
-def create_app(thermal_manager=None) -> FastAPI:
+def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
     """Create the FastAPI app.
 
-    `thermal_manager` is optional — when provided, the runtime config
-    endpoints in this module can mutate detector parameters live.
+    `thermal_manager` and `eo_manager` are optional — when provided, the
+    runtime config endpoints in this module can mutate detector
+    parameters live and swap capture devices without restarting.
     """
     app = FastAPI(title="Seeker-01 Bench Test", version="0.1.0")
     app.state.thermal_manager = thermal_manager
+    app.state.eo_manager = eo_manager
 
     static_dir = _static_dir()
     if static_dir.exists():
@@ -99,7 +101,61 @@ def create_app(thermal_manager=None) -> FastAPI:
             ok = tm.set_zoom_preset(str(body["zoom_preset"]))
             if not ok:
                 return Response(status_code=400, content=f"unknown preset {body['zoom_preset']}")
-        return {"zoom_preset": tm._zoom_preset}
+        if "device_index" in body:
+            raw = body["device_index"]
+            try:
+                idx: int | str = int(raw)
+            except (TypeError, ValueError):
+                idx = str(raw)
+            tm.set_device(idx)
+            log.info("Thermal device_index -> %s", idx)
+        return {"zoom_preset": tm._zoom_preset, "device_index": tm.device_index}
+
+    @app.get("/api/devices/cameras")
+    def list_cameras():
+        """Enumerate working cv2 camera indices for the GUI selectors.
+
+        Uses the EO package's enumerate_cameras() because it does a safe
+        open+release probe. Returns thermal/EO currently-active indices
+        so the dropdowns can default to the right rows.
+        """
+        from eo.webcam_capture import enumerate_cameras
+        cams = enumerate_cameras(max_index=6)
+        tm = app.state.thermal_manager
+        em = app.state.eo_manager
+        thermal_idx = None
+        eo_idx = None
+        try:
+            if tm is not None and tm._source is not None:
+                thermal_idx = getattr(tm._source, "device_index", None)
+        except Exception:
+            pass
+        try:
+            if em is not None and em._source is not None:
+                eo_idx = getattr(em._source, "device_index", None)
+        except Exception:
+            pass
+        return {
+            "cameras": cams,
+            "thermal_active": thermal_idx,
+            "eo_active": eo_idx,
+        }
+
+    @app.post("/api/config/eo")
+    async def set_eo_config(request: Request):
+        em = app.state.eo_manager
+        if em is None:
+            return Response(status_code=503, content="EO manager not running")
+        body = await request.json()
+        if "device_index" in body:
+            raw = body["device_index"]
+            try:
+                idx: int | str = int(raw)
+            except (TypeError, ValueError):
+                idx = str(raw)
+            em.set_device(idx)
+            log.info("EO device_index -> %s", idx)
+        return {"device_index": em.device_index}
 
     @app.post("/api/config/heat_detector")
     async def set_heat_detector_config(request: Request):
@@ -146,8 +202,10 @@ def create_app(thermal_manager=None) -> FastAPI:
         async def _sender() -> None:
             while True:
                 tf = BUS.get_latest(Topic.THERMAL)
+                ef = BUS.get_latest(Topic.EO)
                 payload = build_ws_message(
                     tf=tf,
+                    ef=ef,
                     jpeg_quality=jpeg_quality,
                     tracker_on=state["tracker_on"],
                     nir_mode=state["nir_mode"],

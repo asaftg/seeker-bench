@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from common.frames import ThermalFrame
+from common.frames import EOFrame, ThermalFrame
 
 
 def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
@@ -90,12 +90,68 @@ def radar_to_wire() -> Dict[str, Any]:
     }
 
 
-def eo_to_wire() -> Dict[str, Any]:
-    """Phase B stub — EO camera not yet wired (Ticket 3)."""
+def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
+    """Serialize an EOFrame for the WebSocket.
+
+    Wire format matches ThermalFrame as closely as possible so the GUI
+    can share rendering code:
+
+        {connected, frame_id, timestamp, jpeg_b64, width, height,
+         hfov_deg, vfov_deg, source_device, detections: [...]}
+
+    Each detection is shaped like a thermal detection (bbox + classification)
+    so ``overlays.js::drawDetectionBox`` can render EO boxes with zero
+    case-specific code.
+    """
+    if ef is None or not ef.connected:
+        return {
+            "connected": False,
+            "frame_id": ef.frame_id if ef is not None else 0,
+            "timestamp": ef.timestamp if ef is not None else 0.0,
+            "jpeg_b64": None,
+            "width": 0,
+            "height": 0,
+            "hfov_deg": ef.hfov_deg if ef is not None else 11.05,
+            "vfov_deg": ef.vfov_deg if ef is not None else 9.23,
+            "source_device": None,
+            "detections": [],
+        }
+
+    jpeg_b64 = None
+    w, h = 0, 0
+    if ef.bgr is not None:
+        img = ef.bgr
+        h, w = img.shape[:2]
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+        if ok:
+            jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+
+    det_list = []
+    for det in ef.detections:
+        det_list.append({
+            "bbox": {
+                "x": det.bbox.x, "y": det.bbox.y,
+                "w": det.bbox.w, "h": det.bbox.h,
+            },
+            "track_id": det.track_id,
+            "classification": {
+                "target_class": det.target_class.value,
+                "confidence": round(float(det.confidence), 3),
+                "classifier_used": "yolo_eo",
+            },
+        })
+
     return {
-        "connected": False,
-        "jpeg": None,
-        "detections": [],
+        "connected": True,
+        "frame_id": ef.frame_id,
+        "timestamp": ef.timestamp,
+        "jpeg_b64": jpeg_b64,
+        "width": w,
+        "height": h,
+        "hfov_deg": ef.hfov_deg,
+        "vfov_deg": ef.vfov_deg,
+        "source_device": ef.source_device,
+        "detections": det_list,
     }
 
 
@@ -109,6 +165,7 @@ def fusion_to_wire() -> Dict[str, Any]:
 
 def build_ws_message(
     tf=None,
+    ef=None,
     jpeg_quality: int = 80,
     tracker_on: bool = True,
     nir_mode: str = "auto",
@@ -124,7 +181,7 @@ def build_ws_message(
     return {
         "ts": _time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
-        "eo": eo_to_wire(),
+        "eo": eo_to_wire(ef, jpeg_quality=jpeg_quality),
         "radar": radar_to_wire(),
         "tracks": [],
         "main_target_id": None,

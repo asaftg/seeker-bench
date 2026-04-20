@@ -92,6 +92,36 @@ classifier:
   # distant/small targets), 640 on CPU. Int override allowed.
   classifier_hv_imgsz: auto
 
+eo:
+  # Electro-optical pipeline — emulates Leopard LI-USB30-IMX568-GMSL2-105H
+  # (IMX568, 2472×2064 @ 2.74µm → 6.77×5.65mm sensor) + Commonlands
+  # CIL350-F2.4-M12ANIR (35mm EFL, F/2.4, NIR). Yields ~11.05° HFOV,
+  # ~9.23° VFOV — narrow telephoto, ~7x finer per-pixel IFOV than thermal.
+  enabled: true
+  device_index: auto            # auto | 0 | 1 | 2 ...
+  skip_builtin_webcam: false    # set true on laptops to skip index 0
+  target_fps: 30
+  resolution: [1920, 1080]      # webcam will negotiate closest supported
+
+  # Optics (don't change unless swapping lens/sensor)
+  hfov_deg: 11.05
+  vfov_deg: 9.23
+
+  classifier:
+    enabled: true
+    # EO currently forces COCO fallback (person/car/truck/bus/motorcycle)
+    # until a dedicated EO model exists. TODO: train EO drone detector.
+    model: models/yolov8n.pt
+    conf_threshold: 0.45
+    classes: [person, vehicle]
+    include_drone: false        # TODO: enable after EO drone fine-tune
+    imgsz: auto                 # auto = 960 GPU / 640 CPU
+    classify_interval_frames: auto  # auto = 1 GPU / 4 CPU
+    min_bbox_px: 1500
+    min_hits: 2
+    max_misses: 8
+    bbox_ema: 0.2
+
 radar:
   enabled: false                # Phase A: radar disconnected placeholder
   # real radar params added in Phase B
