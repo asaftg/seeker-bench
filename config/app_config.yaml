@@ -115,8 +115,14 @@ eo:
     conf_threshold: 0.45
     classes: [person, vehicle]
     include_drone: false        # TODO: enable after EO drone fine-tune
-    imgsz: auto                 # auto = 960 GPU / 640 CPU
-    classify_interval_frames: auto  # auto = 1 GPU / 4 CPU
+    # EO runs on full-color 1920x1080, so imgsz=640 already captures
+    # plenty of detail for person/vehicle detection without the 2x
+    # inference cost of 960. Override to 960 if you need more recall
+    # at long range.
+    imgsz: 640
+    # Run YOLO every 2nd frame on GPU (tracks coast in between, no
+    # flicker) so publish rate roughly doubles. "auto" = 2 GPU / 4 CPU.
+    classify_interval_frames: auto
     min_bbox_px: 1500
     min_hits: 2
     max_misses: 8

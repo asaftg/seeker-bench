@@ -91,7 +91,9 @@ class EOManager:
                 _on_gpu = bool(torch.cuda.is_available())
             except Exception:
                 _on_gpu = False
-            self._classify_every = 1 if _on_gpu else 4
+            # GPU: every-other-frame is fast enough AND keeps publish
+            # rate close to webcam native. CPU: every 4th.
+            self._classify_every = 2 if _on_gpu else 4
             log.info("eo classify_interval_frames=auto -> %d (%s)",
                      self._classify_every, "gpu" if _on_gpu else "cpu")
         else:
@@ -102,11 +104,9 @@ class EOManager:
             # imgsz: "auto" -> 960 on GPU, 640 on CPU (parity with thermal HV)
             _raw_imgsz = ccfg.get("imgsz", "auto")
             if isinstance(_raw_imgsz, str) and _raw_imgsz.lower() == "auto":
-                try:
-                    import torch
-                    _imgsz = 960 if torch.cuda.is_available() else 640
-                except Exception:
-                    _imgsz = 640
+                # EO frames are already rich RGB at 1920x1080 — 640 is
+                # plenty for H/V detection at this FOV and keeps fps up.
+                _imgsz = 640
             else:
                 _imgsz = int(_raw_imgsz)
             try:
