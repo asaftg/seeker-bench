@@ -78,6 +78,17 @@ class EOClassifier:
             return []
         return self._hv.detect_full_frame(bgr_image)
 
+    def track(self, bgr_image: np.ndarray) -> list[dict]:
+        """Run YOLO+ByteTrack on a full BGR frame.
+
+        Returns the same shape as ``detect()`` plus a stable ``track_id``
+        per object. Prefer this over ``detect()`` when the caller needs
+        cross-frame identity (which is always, for overlays).
+        """
+        if bgr_image is None or bgr_image.size == 0:
+            return []
+        return self._hv.track_full_frame(bgr_image)
+
 
 # ---------------------------------------------------------------------------
 # TODO(ticket-3-followup): EO drone detection.

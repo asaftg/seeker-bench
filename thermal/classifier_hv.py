@@ -192,6 +192,88 @@ class HumanVehicleClassifier:
         return out
 
     # ------------------------------------------------------------------
+    def track_full_frame(self, image: np.ndarray) -> list[Dict[str, object]]:
+        """Run YOLO **with ByteTrack** on the full frame.
+
+        Same return contract as ``detect_full_frame`` plus a stable
+        ``track_id`` per object. ByteTrack lives inside ultralytics
+        (``model.track(persist=True, tracker='bytetrack.yaml')``) and
+        does two things we previously hand-rolled badly:
+
+        - **Kalman motion model** — coasts each track between YOLO hits
+          so fast camera pans / brief classifier misses don't spawn a
+          new ID every frame.
+        - **Low-confidence association** — detections below ``conf`` are
+          still matched to existing tracks (but not used to birth new
+          ones). A motion-blurred car that drops from 0.8 to 0.3 conf
+          keeps its ID instead of flickering off.
+
+        If tracking fails (e.g. ``lap`` package missing, model type
+        incompatible), falls back to ``detect_full_frame`` and emits
+        ``track_id=-1`` so callers can still render bboxes — they just
+        won't have stable IDs that frame.
+
+        See "Future work" in README for BoT-SORT (camera-motion
+        compensated) upgrade path.
+        """
+        if self._model is None or image is None or image.size == 0:
+            return []
+        try:
+            results = self._model.track(
+                image,
+                persist=True,                  # keep tracker state across calls
+                tracker="bytetrack.yaml",      # shipped by ultralytics
+                conf=self.conf_threshold,
+                imgsz=self.imgsz,
+                verbose=False,
+            )
+        except Exception as e:
+            # Most common cause: `lap` package missing or an older
+            # ultralytics build. Fall back so the pipeline still runs.
+            log.warning("HV track() failed (%s) — falling back to predict()", e)
+            return [
+                {**d, "track_id": -1}
+                for d in self.detect_full_frame(image)
+            ]
+        if not results:
+            return []
+        r = results[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return []
+
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        clss = r.boxes.cls.cpu().numpy().astype(int)
+        # track.id is None on the very first frame before ByteTrack
+        # assigns IDs. Treat those as "unconfirmed" with id=-1 so the
+        # downstream tracker can filter by track_id != -1 if it wants.
+        if r.boxes.id is None:
+            ids = [-1] * len(xyxy)
+        else:
+            ids = r.boxes.id.cpu().numpy().astype(int).tolist()
+        names = r.names or {}
+
+        out: list[Dict[str, object]] = []
+        for (x1, y1, x2, y2), conf, cls_id, tid in zip(xyxy, confs, clss, ids):
+            if self._is_finetuned:
+                class_name = names.get(int(cls_id), "unknown")
+            else:
+                class_name = self._coco_map.get(int(cls_id))
+                if class_name is None:
+                    continue
+            x = int(max(0, x1))
+            y = int(max(0, y1))
+            w = int(max(1, x2 - x1))
+            h = int(max(1, y2 - y1))
+            out.append({
+                "bbox": (x, y, w, h),
+                "class": class_name,
+                "conf": float(conf),
+                "track_id": int(tid),
+            })
+        return out
+
+    # ------------------------------------------------------------------
     def classify(self, roi_image: np.ndarray) -> Optional[Dict[str, object]]:
         """Run inference on a single BGR ROI image.
 

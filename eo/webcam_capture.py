@@ -92,26 +92,54 @@ class WebcamCapture:
 
         candidates = self._candidate_indices()
         last_err: Optional[str] = None
+        # Every cv2 call on a flaky device can throw "Unknown C++
+        # exception" — not just .set()/.read() but .release() and even
+        # .isOpened(). Wrap them all. Treat any exception as "try the
+        # next backend/index".
+        def _safe(fn, *args, default=None):
+            try:
+                return fn(*args)
+            except Exception:
+                return default
+
         for backend_name, backend_flag in self._backends:
             for idx in candidates:
                 if idx in self.exclude_indices:
                     continue
-                cap = cv2.VideoCapture(idx, backend_flag)
-                if not cap.isOpened():
-                    cap.release()
+                try:
+                    cap = cv2.VideoCapture(idx, backend_flag)
+                except Exception as e:
+                    last_err = f"[{backend_name}] idx {idx} VideoCapture ctor threw {e!r}"
+                    continue
+
+                if not _safe(cap.isOpened, default=False):
+                    _safe(cap.release)
                     last_err = f"[{backend_name}] index {idx} failed to open"
                     continue
 
-                try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req_width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_height)
+                _safe(cap.set, cv2.CAP_PROP_BUFFERSIZE, 1)
+                # CAP_PROP_FRAME_* can raise "Unknown C++ exception" on
+                # Windows when the device is in a weird state — e.g.
+                # right after a failed DirectShow probe on another index
+                # left the bus stale. Silently fall back to the device's
+                # native resolution; the probe below still rejects if
+                # the frame is unusable.
+                if _safe(cap.set, cv2.CAP_PROP_FRAME_WIDTH,  self.req_width)  is None:
+                    log.info("[%s] idx %d CAP_PROP_FRAME_WIDTH set threw — using native",
+                             backend_name, idx)
+                if _safe(cap.set, cv2.CAP_PROP_FRAME_HEIGHT, self.req_height) is None:
+                    log.info("[%s] idx %d CAP_PROP_FRAME_HEIGHT set threw — using native",
+                             backend_name, idx)
 
-                ok, test = cap.read()
+                try:
+                    ok, test = cap.read()
+                except Exception as e:
+                    _safe(cap.release)
+                    last_err = f"[{backend_name}] idx {idx} read threw {e!r}"
+                    log.info("%s — skipping", last_err)
+                    continue
                 if not ok or test is None:
-                    cap.release()
+                    _safe(cap.release)
                     last_err = f"[{backend_name}] index {idx} opened but produces no frames"
                     continue
 
@@ -120,7 +148,7 @@ class WebcamCapture:
                 # 640x512, treat it as a mis-identification and keep probing.
                 h_test, w_test = (test.shape[0], test.shape[1]) if test.ndim == 3 else (0, 0)
                 if (w_test, h_test) == (640, 512) and idx in self.exclude_indices:
-                    cap.release()
+                    _safe(cap.release)
                     last_err = f"[{backend_name}] index {idx} returned thermal-shaped frame, skipping"
                     continue
 

@@ -50,6 +50,10 @@ heat_detector:
   # a confirmed blob survives up to `max_misses` frames of missing
   # detections before being dropped.
   tracker:
+    # This is the *heat-blob* tracker (classical CV), not the H/V one —
+    # the H/V classifier runs its own ByteTrack now. Heat blobs still
+    # use hand-rolled greedy IoU because they're small, noisy, and
+    # appear/disappear rapidly (not a good fit for Kalman priors).
     enabled: true
     max_dist_px: 40             # max centroid distance (px) to match across frames
     min_hits: 5                 # consecutive frames before a box is shown
@@ -85,8 +89,11 @@ classifier:
   classifier_hv_min_bbox_px: 2500    # ~50x50 minimum area
   # Temporal persistence: a h/v box must survive this many classifier
   # runs at IoU >= 0.3 before it's drawn. Kills single-frame flicker FPs.
+  # ByteTrack owns persistence now, so these knobs are mostly defanged;
+  # the merge code still reads min_hits but ByteTrack-confirmed tracks
+  # arrive pre-confirmed so min_hits=1 is effectively the operative value.
   classifier_hv_min_hits: 2
-  classifier_hv_max_misses: 8        # tolerate brief low-conf dips while walking
+  classifier_hv_max_misses: 8        # unused with ByteTrack; kept for config compat
   classifier_hv_bbox_ema: 0.15       # bbox smoothing: 0 = raw YOLO, 0.5 = heavy lag. Low = snappy.
   # Inference image size. auto = 960 on GPU (boosts detection range for
   # distant/small targets), 640 on CPU. Int override allowed.
@@ -139,6 +146,9 @@ eo:
     # flicker) so publish rate roughly doubles. "auto" = 2 GPU / 4 CPU.
     classify_interval_frames: auto
     min_bbox_px: 1500
+    # ByteTrack (ultralytics model.track) owns persistence on the EO
+    # side now. These knobs are unused but kept for config compat; tune
+    # ByteTrack itself via its yaml if needed (see Future Work in README).
     min_hits: 2
     max_misses: 8
     bbox_ema: 0.2
@@ -161,7 +171,10 @@ fusion:
                                 # (cameras are coplanar <5cm apart so parallax ~= 0°;
                                 #  looser gate prevents small bbox jitter spawning dup IDs)
   min_hits: 1                   # ticks before a track is visible in the GUI
-  max_misses: 10                # ticks of no-observation before a track is dropped
+  max_misses: 15                # ticks of no-observation before a track is dropped
+                                # (~1s at 15Hz). ByteTrack (per-sensor) already
+                                # coasts through brief dropouts via Kalman, so
+                                # fusion's grace can stay short.
 
 gimbal:
   # Pan/tilt via Pololu Micro Maestro 6-Channel (Ticket 4).
@@ -177,6 +190,20 @@ gimbal:
   # so 56° is the natural middle.
   home_pan_deg: 0.0
   home_tilt_deg: 56.0
+
+  # Are the cameras rigidly mounted on the gimbal, or stationary next
+  # to it on the bench?
+  #
+  # false (bench / current setup): cameras on tripod, gimbal is its own
+  #   rig. Fused az/el is an absolute bench-frame bearing, so the gimbal
+  #   commands `pan = home_pan + az`, `tilt = home_tilt + el`. Flipping
+  #   this from true→false is what stopped the gimbal from slewing into
+  #   its limits on every TRACK press.
+  #
+  # true (flight / real mission): cameras rotate with the gimbal, az/el
+  #   is measured off-boresight and shrinks to zero as the gimbal
+  #   centers the target, so the command integrates: `pan += az`.
+  cameras_on_gimbal: false
 
   # Software safety envelope & slew rate. Mechanical tilt range is
   # user-specified as 22..90°; we hard-clamp so no command (manual

@@ -172,7 +172,9 @@ class EOManager:
         self._stop = threading.Event()
         self._source: Optional[_CaptureLike] = None
         self._frame_id = 0
-        self._tracks: list[dict] = []
+        # Last ByteTrack detection list; republished every frame between
+        # classifier ticks so overlays don't flicker.
+        self._last_dets: list[dict] = []
 
         # Hand-off from capture to process thread (same pattern as thermal)
         self._latest_cond = threading.Condition()
@@ -252,6 +254,12 @@ class EOManager:
         except RuntimeError as e:
             log.warning("EO source open failed: %s", e)
             return None
+        except Exception as e:
+            # cv2.error is NOT a RuntimeError. Without this, an OpenCV
+            # "Unknown C++ exception" from a flaky webcam bus kills the
+            # EOCapture thread instead of retrying.
+            log.warning("EO source open threw %r — will retry", e)
+            return None
 
     # ───────────────────────── main loops ────────────────────────────
     def _capture_loop(self) -> None:
@@ -305,15 +313,25 @@ class EOManager:
         self._frame_id += 1
         ts = time.time()
 
-        # 1. YOLO (throttled). Tracks coast between runs so bboxes
-        #    don't flicker off on non-classifier frames.
+        # 1. YOLO + ByteTrack (throttled).
+        #
+        # The hand-rolled IoU-matching tracker that used to live here was
+        # ripped out in favour of ByteTrack (Ultralytics' built-in via
+        # model.track(persist=True)). Kalman motion predictions + low-
+        # confidence association mean IDs stay stable through fast pans,
+        # brief occlusions, and motion blur — the exact failure mode
+        # that was spamming the GUI with new #IDs every second.
+        #
+        # Tracks coast between YOLO ticks using the last-known ByteTrack
+        # state (we just republish the last detection list until the
+        # next classifier frame), so bboxes don't flicker off.
         run_classifier = (
             self._classifier is not None
             and (self._frame_id % self._classify_every == 0)
         )
         if run_classifier:
             try:
-                raw = self._classifier.detect(frame)
+                raw = self._classifier.track(frame)
             except Exception as e:
                 log.warning("EO inference failed: %s", e)
                 raw = []
@@ -321,27 +339,33 @@ class EOManager:
             dets = [d for d in raw
                     if (d["bbox"][2] * d["bbox"][3]) >= self._min_bbox_px]
             # NMS within class — YOLO sometimes fires 2-3 overlapping
-            # boxes on one vehicle. Without this, each overlap spawns a
-            # duplicate track_id, which fusion then can't dedup.
+            # boxes on one vehicle. ByteTrack would also assign those
+            # different IDs, so dedup BEFORE publishing.
             dets = _nms_same_class(dets, iou_thresh=0.45)
-            self._update_tracks(dets)
+            self._last_dets = dets
 
-        # 2. Build EODetection list from CONFIRMED tracks every frame
-        #    so overlays hold steady between YOLO ticks.
+        # 2. Republish last detection list every frame so overlays hold
+        #    steady between YOLO ticks. ByteTrack's internal Kalman
+        #    makes the coasting visually correct even at low classify
+        #    rates because when a fresh tick lands, the new bbox lines
+        #    up with where the track predicted it would be.
         out_dets: list[EODetection] = []
-        for trk in self._tracks:
-            if trk["hits"] < self._min_hits:
-                continue
-            bx, by, bw, bh = trk["bbox"]
+        for d in getattr(self, "_last_dets", []):
+            bx, by, bw, bh = d["bbox"]
             try:
-                tc = TargetClass(trk["class"])
+                tc = TargetClass(d["class"])
             except ValueError:
                 tc = TargetClass.UNKNOWN
+            tid = int(d.get("track_id", -1))
+            if tid < 0:
+                # ByteTrack hasn't confirmed this detection yet
+                # (first frame after spawn). Skip to avoid flicker.
+                continue
             out_dets.append(EODetection(
                 bbox=BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
-                confidence=float(trk["conf"]),
+                confidence=float(d["conf"]),
                 target_class=tc,
-                track_id=int(trk["id"]),
+                track_id=tid,
             ))
 
         dev_idx = getattr(self._source, "device_index", None) if self._source else None
@@ -356,72 +380,6 @@ class EOManager:
             source_device=dev_idx,
         )
         BUS.publish(Topic.EO, ef)
-
-    # ───────────────────────── persistence tracker ───────────────────
-    def _update_tracks(self, dets: list[dict]) -> None:
-        """Tiny IoU-matching tracker with hits/misses + bbox EMA.
-
-        Mirrors the HV tracker in thermal_manager. Each detection either
-        updates an existing track (IoU >= 0.3, same class) or spawns a
-        new one. Unmatched tracks age out after max_misses.
-        """
-        IOU_MATCH = 0.30
-        # Snapshot the count BEFORE the dets loop — we append new
-        # tracks to self._tracks inside the loop on unmatched dets,
-        # and `matched` must only cover the pre-existing tracks. (The
-        # newly-appended entries haven't been matched yet by definition.)
-        n_existing = len(self._tracks)
-        matched = [False] * n_existing
-        for d in dets:
-            bx, by, bw, bh = d["bbox"]
-            best_t = -1
-            best_iou = 0.0
-            for ti in range(n_existing):
-                trk = self._tracks[ti]
-                if matched[ti] or trk["class"] != d["class"]:
-                    continue
-                tb = trk["bbox"]
-                iou = _iou_xywh(tb[0], tb[1], tb[2], tb[3], bx, by, bw, bh)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_t = ti
-            if best_t >= 0 and best_iou >= IOU_MATCH:
-                trk = self._tracks[best_t]
-                a = self._bbox_ema
-                trk["bbox"] = (
-                    int(a * trk["bbox"][0] + (1 - a) * bx),
-                    int(a * trk["bbox"][1] + (1 - a) * by),
-                    int(a * trk["bbox"][2] + (1 - a) * bw),
-                    int(a * trk["bbox"][3] + (1 - a) * bh),
-                )
-                trk["conf"] = float(d["conf"])
-                trk["hits"] += 1
-                trk["misses"] = 0
-                matched[best_t] = True
-            else:
-                self._tracks.append({
-                    "id": self._next_track_id(),
-                    "bbox": (int(bx), int(by), int(bw), int(bh)),
-                    "class": d["class"],
-                    "conf": float(d["conf"]),
-                    "hits": 1,
-                    "misses": 0,
-                })
-
-        kept = []
-        for ti, trk in enumerate(self._tracks):
-            if ti < len(matched) and matched[ti]:
-                kept.append(trk)
-            else:
-                trk["misses"] += 1
-                if trk["misses"] <= self._max_misses:
-                    kept.append(trk)
-        self._tracks = kept
-
-    _track_id_counter: int = 0
-    def _next_track_id(self) -> int:
-        self._track_id_counter += 1
-        return self._track_id_counter
 
     # ───────────────────────── disconnected sentinel ─────────────────
     def _publish_disconnected(self) -> None:

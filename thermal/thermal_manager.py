@@ -465,10 +465,18 @@ class ThermalManager:
                 union = aw * ah + bw * bh - inter
                 return inter / float(union) if union > 0 else 0.0
 
-            # Only poll YOLO on classifier ticks; tracks coast between runs.
+            # Only poll YOLO on classifier ticks. The hand-rolled
+            # IoU+EMA tracker that used to live here was ripped out in
+            # favour of ByteTrack (Ultralytics' model.track(persist=True)).
+            # ByteTrack's Kalman filter coasts each object across missed
+            # frames and associates low-confidence detections to existing
+            # tracks, so fast pans / motion blur no longer respawn a new
+            # ID every tick. Between classifier runs we republish the
+            # last detection list; ByteTrack state lives inside the
+            # ultralytics model and updates on the next call.
             if run_classifiers:
                 try:
-                    raw_hv = self._classifier_hv.detect_full_frame(display)
+                    raw_hv = self._classifier_hv.track_full_frame(display)
                 except Exception as e:
                     log.warning("HV full-frame step failed: %s", e)
                     raw_hv = []
@@ -480,60 +488,24 @@ class ThermalManager:
                 ]
                 self._last_hv_dets = hv_dets
 
-                # Match each new det to an existing track (IoU >= 0.3).
-                # Snapshot count before the loop — unmatched dets append
-                # new tracks below, and `matched` only covers pre-existing.
-                n_existing = len(self._hv_tracks)
-                matched = [False] * n_existing
-                for hv in hv_dets:
-                    bx, by, bw, bh = hv["bbox"]
-                    best_t = -1
-                    best_iou = 0.0
-                    for ti in range(n_existing):
-                        trk = self._hv_tracks[ti]
-                        if matched[ti]:
-                            continue
-                        if trk["class"] != hv["class"]:
-                            continue
-                        tb = trk["bbox"]
-                        iou = _iou_xywh(tb[0], tb[1], tb[2], tb[3], bx, by, bw, bh)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_t = ti
-                    if best_t >= 0 and best_iou >= 0.30:
-                        trk = self._hv_tracks[best_t]
-                        # EMA on the bbox to reduce jitter. Low a=snappy tracking,
-                        # high a=smoother but laggier. Tuned via classifier_hv_bbox_ema.
-                        a = self._hv_bbox_ema
-                        trk["bbox"] = (
-                            int(a * trk["bbox"][0] + (1 - a) * bx),
-                            int(a * trk["bbox"][1] + (1 - a) * by),
-                            int(a * trk["bbox"][2] + (1 - a) * bw),
-                            int(a * trk["bbox"][3] + (1 - a) * bh),
-                        )
-                        trk["conf"] = float(hv["conf"])
-                        trk["hits"] += 1
-                        trk["misses"] = 0
-                        matched[best_t] = True
-                    else:
-                        self._hv_tracks.append({
-                            "bbox": (int(bx), int(by), int(bw), int(bh)),
-                            "class": hv["class"],
-                            "conf": float(hv["conf"]),
-                            "hits": 1,
-                            "misses": 0,
-                        })
-
-                # Age unmatched tracks; drop if they exceed max_misses.
-                kept = []
-                for ti, trk in enumerate(self._hv_tracks):
-                    if ti < len(matched) and matched[ti]:
-                        kept.append(trk)
-                    else:
-                        trk["misses"] += 1
-                        if trk["misses"] <= self._hv_max_misses:
-                            kept.append(trk)
-                self._hv_tracks = kept
+                # ByteTrack owns track IDs + persistence now. Rebuild
+                # the `_hv_tracks` shape the downstream merge code
+                # expects — one entry per ByteTrack ID present this
+                # tick, hits=min_hits so confirmation logic below still
+                # fires. Unconfirmed tracks (track_id=-1 on first frame)
+                # are dropped so we don't flicker labels.
+                self._hv_tracks = [
+                    {
+                        "id": int(d["track_id"]),
+                        "bbox": tuple(int(v) for v in d["bbox"]),
+                        "class": d["class"],
+                        "conf": float(d["conf"]),
+                        "hits": self._hv_min_hits,     # ByteTrack already confirmed
+                        "misses": 0,
+                    }
+                    for d in hv_dets
+                    if int(d.get("track_id", -1)) >= 0
+                ]
 
             # Merge CONFIRMED h/v tracks into detections on EVERY frame
             # (not just classifier ticks) so overlays don't flicker.

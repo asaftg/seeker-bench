@@ -34,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fake-thermal", action="store_true", help="Synthetic thermal source")
     p.add_argument("--fake-eo", action="store_true", help="Synthetic EO (webcam) source")
     p.add_argument("--no-eo", action="store_true", help="Disable EO pipeline entirely")
+    p.add_argument("--no-thermal", action="store_true",
+                   help="Disable thermal pipeline entirely (EO-only mode). "
+                        "Also skips the 4-index DirectShow probe that can "
+                        "leave webcams in a flaky state on Windows.")
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
     p.add_argument("--no-gimbal", action="store_true", help="Disable gimbal (Maestro servo controller)")
     p.add_argument("--host", default=None, help="GUI bind host")
@@ -64,13 +68,19 @@ def main() -> int:
              args.fake_thermal, args.fake_eo, args.no_eo)
     log.info("=" * 50)
 
-    # Start thermal manager
-    thermal = ThermalManager(
-        use_fake=args.fake_thermal,
-        device_index=args.device,
-        enable_classifier=not args.no_classifier,
-    )
-    thermal.start()
+    # Start thermal manager (unless --no-thermal). Skipping it avoids the
+    # DirectShow 4-index probe that can leave the webcam in a flaky state
+    # on Windows, so EO-only runs start cleanly.
+    thermal: ThermalManager | None = None
+    if not args.no_thermal:
+        thermal = ThermalManager(
+            use_fake=args.fake_thermal,
+            device_index=args.device,
+            enable_classifier=not args.no_classifier,
+        )
+        thermal.start()
+    else:
+        log.info("Thermal disabled (--no-thermal): skipping ThermalManager")
 
     # Start EO manager (optional). Disabling leaves the GUI's EO panel in
     # DISCONNECTED state; rest of the app is unaffected.
@@ -85,7 +95,7 @@ def main() -> int:
         # race for index 0 and one ends up with a broken handle whose
         # grabs return None, leaving both panels in DISCONNECTED.
         thermal_idx: Optional[int] = None
-        if not args.fake_thermal:
+        if thermal is not None and not args.fake_thermal:
             deadline = time.time() + 8.0
             while time.time() < deadline:
                 src = getattr(thermal, "_source", None)
@@ -157,7 +167,8 @@ def main() -> int:
             fusion.stop()
         if eo is not None:
             eo.stop()
-        thermal.stop()
+        if thermal is not None:
+            thermal.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
@@ -176,7 +187,8 @@ def main() -> int:
             fusion.stop()
         if eo is not None:
             eo.stop()
-        thermal.stop()
+        if thermal is not None:
+            thermal.stop()
 
     return 0
 
