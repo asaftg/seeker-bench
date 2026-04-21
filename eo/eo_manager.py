@@ -35,6 +35,35 @@ class _CaptureLike(Protocol):
 
 
 # ── internal track struct for the persistence tracker ─────────────────
+def _nms_same_class(dets: list[dict], iou_thresh: float = 0.45) -> list[dict]:
+    """Greedy per-class NMS on raw YOLO detections.
+
+    YOLO's own NMS sometimes leaves overlapping boxes when two anchors
+    fire on the same object at different scales. One box per target
+    matters here because downstream trackers key on IoU — a stray
+    overlap becomes a duplicate track.
+    """
+    by_class: dict[str, list[dict]] = {}
+    for d in dets:
+        by_class.setdefault(d["class"], []).append(d)
+    kept: list[dict] = []
+    for cls, group in by_class.items():
+        group.sort(key=lambda d: d["conf"], reverse=True)
+        survivors: list[dict] = []
+        for d in group:
+            bx, by, bw, bh = d["bbox"]
+            dup = False
+            for s in survivors:
+                sx, sy, sw, sh = s["bbox"]
+                if _iou_xywh(sx, sy, sw, sh, bx, by, bw, bh) >= iou_thresh:
+                    dup = True
+                    break
+            if not dup:
+                survivors.append(d)
+        kept.extend(survivors)
+    return kept
+
+
 def _iou_xywh(ax0, ay0, aw, ah, bx0, by0, bw, bh) -> float:
     ax1, ay1 = ax0 + aw, ay0 + ah
     bx1, by1 = bx0 + bw, by0 + bh
@@ -73,6 +102,23 @@ class EOManager:
         self._target_fps = float(ecfg.get("target_fps", 30))
         self._hfov = float(ecfg.get("hfov_deg", 11.05))
         self._vfov = float(ecfg.get("vfov_deg", 9.23))
+
+        # Test-webcam FOV override. The real IMX568 + 35mm is ~11° HFOV;
+        # a generic webcam is ~60-70°. If fusion is told the wrong FOV,
+        # pixel → angle math is wrong and cross-sensor association fails.
+        _profile_name = str(ecfg.get("test_webcam", "none")).lower()
+        _profiles = ecfg.get("test_webcam_profiles", {}) or {}
+        if _profile_name and _profile_name != "none" and _profile_name in _profiles:
+            p = _profiles[_profile_name] or {}
+            ph = p.get("hfov_deg")
+            pv = p.get("vfov_deg")
+            if ph is not None and pv is not None:
+                log.info(
+                    "EO test_webcam='%s' overriding FOV %.2f°×%.2f° -> %.2f°×%.2f°",
+                    _profile_name, self._hfov, self._vfov, float(ph), float(pv),
+                )
+                self._hfov = float(ph)
+                self._vfov = float(pv)
 
         # Persistence tracker knobs — same pattern as the thermal HV tracker.
         self._conf_threshold = float(ccfg.get("conf_threshold", 0.40))
@@ -274,6 +320,10 @@ class EOManager:
             # Size gate drops tiny boxes (usually reflections / clutter).
             dets = [d for d in raw
                     if (d["bbox"][2] * d["bbox"][3]) >= self._min_bbox_px]
+            # NMS within class — YOLO sometimes fires 2-3 overlapping
+            # boxes on one vehicle. Without this, each overlap spawns a
+            # duplicate track_id, which fusion then can't dedup.
+            dets = _nms_same_class(dets, iou_thresh=0.45)
             self._update_tracks(dets)
 
         # 2. Build EODetection list from CONFIRMED tracks every frame

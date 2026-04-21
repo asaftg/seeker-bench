@@ -229,32 +229,53 @@ def fused_to_wire(
     return out
 
 
+def track_score(t: Dict[str, Any]) -> float:
+    """Ranking score for the GUI's top-N target list.
+
+    Sensor count dominates (a 2-sensor fused track is *much* more
+    trustworthy than any single-sensor one), confidence breaks ties.
+    With this scheme, sorting desc puts 2-sensor high-conf at the top,
+    then 1-sensor high-conf, then low-conf single-sensor.
+    """
+    return float(len(t.get("sensors", []))) + float(t.get("confidence", 0.0))
+
+
 def build_ws_message(
     tf=None,
     ef=None,
     fused=None,
     jpeg_quality: int = 80,
-    tracker_on: bool = True,
     nir_mode: str = "auto",
     gimbal_pan: float = 0.0,
     gimbal_tilt: float = 60.0,
+    tracked_target_id: Optional[int] = None,
+    top_n: int = 5,
 ) -> Dict[str, Any]:
-    """Build the full Phase B WebSocket envelope.
+    """Build the full WebSocket envelope.
 
-    Optional fields (eo, radar, tracks, main_target_id, gimbal, illuminator)
-    follow the schema defined in Ticket 2.  Absent hardware sends its stub.
+    ``tracked_target_id`` is the user's current TRACK selection from
+    the targets list. If it's still alive in the fused list it becomes
+    ``main_target_id`` (green highlight + gimbal auto-track target);
+    otherwise ``main_target_id`` is None and the gimbal stays manual.
     """
     import time as _time
     fused_wire = fused_to_wire(fused, tf, ef)
-    # Pick a main target: highest-confidence multi-sensor track, else
-    # highest-confidence single-sensor track. This is the ID the GUI
-    # lights up in green at the top and the gimbal would track.
-    main_id = None
-    if fused_wire:
-        multi = [t for t in fused_wire if len(t["sensors"]) >= 2]
-        pool = multi if multi else fused_wire
-        best = max(pool, key=lambda t: (len(t["sensors"]), t["confidence"]))
-        main_id = best["id"]
+
+    # Ranked target list — highest score first.
+    top_targets = sorted(fused_wire, key=track_score, reverse=True)[: max(0, int(top_n))]
+
+    # Main target = user's tracked ID, but ONLY if it's still in the
+    # fused list this tick. Otherwise the lock drops (GUI clears the
+    # row, gimbal logic treats this as "no target → manual").
+    main_id: Optional[int] = None
+    if tracked_target_id is not None:
+        for t in fused_wire:
+            if int(t["id"]) == int(tracked_target_id):
+                main_id = int(tracked_target_id)
+                break
+
+    gimbal_mode = "auto" if main_id is not None else "manual"
+
     return {
         "ts": _time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
@@ -262,15 +283,16 @@ def build_ws_message(
         "radar": radar_to_wire(),
         "fused": fused_wire,
         "tracks": [],
+        "top_targets": top_targets,
         "main_target_id": main_id,
+        "tracked_target_id": tracked_target_id,
         "gimbal": {
             "pan": gimbal_pan,
             "tilt": gimbal_tilt,
-            "mode": "auto" if tracker_on else "manual",
+            "mode": gimbal_mode,
         },
         "illuminator": {
             "state": nir_mode,
             "duty": 0.20 if nir_mode == "auto" else (1.0 if nir_mode == "on" else 0.0),
         },
-        "tracker_on": tracker_on,
     }

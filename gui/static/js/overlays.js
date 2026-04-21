@@ -20,7 +20,7 @@ export const COLORS = {
 // ---------------------------------------------------------------------------
 // Classify-aware box: picks color by class, allows main-target override
 // ---------------------------------------------------------------------------
-export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false) {
+export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false, fusedId = null) {
   const b = det.bbox;
   const x = dx + b.x * scale;
   const y = dy + b.y * scale;
@@ -51,11 +51,16 @@ export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false) 
     lineWidth = 2;
   }
 
+  // Prefix with fusion ID when this raw det has been matched to a
+  // fused track, so the label lines up with the IDs in the targets
+  // list. No prefix if not fused yet — avoids lying about a lock that
+  // hasn't happened.
+  const idPrefix = (fusedId != null) ? `#${fusedId} ` : "";
   if (conf != null && cls && cls !== "unknown") {
     const clsLabel = cls === "person" ? "HUMAN" : cls.toUpperCase();
-    label = `${clsLabel} ${(conf * 100) | 0}%`;
+    label = `${idPrefix}${clsLabel} ${(conf * 100) | 0}%`;
   } else {
-    label = `HEAT Δ${det.contrast}`;
+    label = `${idPrefix}HEAT Δ${det.contrast}`;
   }
 
   ctx.save();
@@ -102,17 +107,72 @@ export function drawFusedBox(ctx, bbox, track, scale, dx, dy) {
   ctx.restore();
 }
 
-// Returns true if a raw per-sensor detection is subsumed by any fused
-// bbox in the provided list. The GUI skips raw detections that match so
-// we don't stack a colored box underneath the fused green box.
-export function isSubsumedByFused(rawBBox, fusedBBoxes, iouMin = 0.30) {
-  if (!rawBBox || !fusedBBoxes || !fusedBBoxes.length) return false;
-  for (const fb of fusedBBoxes) {
+// ---------------------------------------------------------------------------
+// Projected (cross-sensor, unconfirmed) box.
+// Used when a fused track has only 1 sensor and we're rendering the OTHER
+// panel: shows the user "something is over here per the other sensor" but
+// makes it visually obvious the local sensor hasn't confirmed yet.
+// Dashed class-colored box (not green — green is reserved for 2+ sensors).
+// ---------------------------------------------------------------------------
+export function drawProjectedBox(ctx, bbox, track, scale, dx, dy) {
+  if (!bbox) return;
+  const x = dx + bbox.x * scale;
+  const y = dy + bbox.y * scale;
+  const w = bbox.w * scale;
+  const h = bbox.h * scale;
+
+  const cls = track.target_class;
+  const color =
+    cls === "drone"   ? COLORS.drone   :
+    cls === "person"  ? COLORS.person  :
+    cls === "vehicle" ? COLORS.vehicle : COLORS.heat;
+  const clsLabel = cls === "person" ? "HUMAN" : (cls || "TARGET").toUpperCase();
+  const srcSensor = (track.sensors && track.sensors[0]) || "?";
+  const label = `#${track.id} ${clsLabel} ← ${srcSensor.toUpperCase()}`;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeRect(x, y, w, h);
+  _drawLabel(ctx, label, x, y, color);
+  ctx.restore();
+}
+
+// Returns true if a raw per-sensor detection is subsumed by any track
+// in ``fusedTracks`` with >= 2 sensors (green-box tracks only — single-
+// sensor tracks never have a green box, so they must never suppress the
+// raw detection underneath). ``sideKey`` is "bbox_thermal" or "bbox_eo".
+export function isSubsumedByFused(rawBBox, fusedTracks, sideKey, iouMin = 0.15) {
+  if (!rawBBox || !fusedTracks || !fusedTracks.length) return false;
+  for (const t of fusedTracks) {
+    if (!t) continue;
+    if (!t.sensors || t.sensors.length < 2) continue;
+    const fb = t[sideKey];
     if (!fb) continue;
-    const iou = _iou(rawBBox, fb);
-    if (iou >= iouMin) return true;
+    if (_iou(rawBBox, fb) >= iouMin) return true;
   }
   return false;
+}
+
+// Best fused ID for a raw detection on a given side, or null. Matching
+// is greedy IoU on the side-specific projected bbox. Used to stamp raw
+// detection labels with the same fusion ID shown in the targets list.
+export function fusedIdForDet(rawBBox, fusedTracks, sideKey, iouMin = 0.20) {
+  if (!rawBBox || !fusedTracks || !fusedTracks.length) return null;
+  let bestId = null;
+  let bestIou = iouMin;
+  for (const t of fusedTracks) {
+    if (!t) continue;
+    const fb = t[sideKey];
+    if (!fb) continue;
+    const iou = _iou(rawBBox, fb);
+    if (iou >= bestIou) {
+      bestIou = iou;
+      bestId  = t.id;
+    }
+  }
+  return bestId;
 }
 
 function _iou(a, b) {

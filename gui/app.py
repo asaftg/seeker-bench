@@ -189,12 +189,15 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
         jpeg_quality = int(cfg.get("gui", {}).get("thermal_jpeg_quality", 80))
         period = 1.0 / max(1e-3, ws_fps)
 
-        # Per-connection mutable state (Phase B controls)
+        # Per-connection mutable state.
+        #   tracked_target_id: the fused-track ID the user pressed TRACK
+        #     on in the targets list. None = gimbal is manual.
+        #   nir_mode / gimbal_*: pass-through to the wire payload.
         state = {
-            "tracker_on": True,
             "nir_mode": "auto",
             "gimbal_pan": 0.0,
             "gimbal_tilt": 60.0,
+            "tracked_target_id": None,  # int | None
         }
 
         log.info("WebSocket client connected")
@@ -210,10 +213,10 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
                         ef=ef,
                         fused=fused,
                         jpeg_quality=jpeg_quality,
-                        tracker_on=state["tracker_on"],
                         nir_mode=state["nir_mode"],
                         gimbal_pan=state["gimbal_pan"],
                         gimbal_tilt=state["gimbal_tilt"],
+                        tracked_target_id=state["tracked_target_id"],
                     )
                     # `default=str` is a safety net for numpy scalars that
                     # slip through the dataclass contracts — better to ship
@@ -245,22 +248,32 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
                     continue
                 command = cmd.get("command")
 
-                if command == "tracker":
-                    new_state = str(cmd.get("state", "on")).lower() == "on"
-                    state["tracker_on"] = new_state
-                    # When tracker is turned off, disable auto-track on gimbal
-                    tm = app.state.thermal_manager
-                    if tm is not None and not new_state:
-                        pass  # gimbal auto-track disabled in Ticket 6
-                    log.info("Tracker toggled → %s", "ON" if new_state else "OFF")
+                if command == "track":
+                    # Toggle a TRACK lock on a specific fused-track ID.
+                    # `track_id: null` clears the lock (back to manual).
+                    raw = cmd.get("track_id", None)
+                    if raw is None:
+                        state["tracked_target_id"] = None
+                        log.info("Track lock cleared → manual gimbal")
+                    else:
+                        try:
+                            state["tracked_target_id"] = int(raw)
+                            log.info("Track lock → fused-id %d", state["tracked_target_id"])
+                        except (TypeError, ValueError):
+                            log.warning("Bad track_id payload: %r", raw)
 
                 elif command == "gimbal_manual":
-                    if not state["tracker_on"]:
-                        dp = float(cmd.get("delta_pan", 0))
-                        dt = float(cmd.get("delta_tilt", 0))
-                        state["gimbal_pan"]  = round(state["gimbal_pan"]  + dp, 1)
-                        state["gimbal_tilt"] = round(state["gimbal_tilt"] + dt, 1)
-                    log.debug("Gimbal manual delta pan=%.1f tilt=%.1f", dp if not state["tracker_on"] else 0, dt if not state["tracker_on"] else 0)
+                    # Manual dpad is always allowed — if the user is
+                    # nudging, treat it as an implicit release of any
+                    # active track lock.
+                    if state["tracked_target_id"] is not None:
+                        log.info("Manual gimbal input — releasing track lock")
+                        state["tracked_target_id"] = None
+                    dp = float(cmd.get("delta_pan", 0))
+                    dt = float(cmd.get("delta_tilt", 0))
+                    state["gimbal_pan"]  = round(state["gimbal_pan"]  + dp, 1)
+                    state["gimbal_tilt"] = round(state["gimbal_tilt"] + dt, 1)
+                    log.debug("Gimbal manual delta pan=%.1f tilt=%.1f", dp, dt)
 
                 elif command == "nir":
                     mode = str(cmd.get("mode", "auto")).lower()

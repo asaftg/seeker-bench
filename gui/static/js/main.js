@@ -17,10 +17,10 @@ const eoView      = new EOView("eo-canvas", "eo-disconnected");
 // ─────────────────────────────────────────────────────────────────────────
 // UI state (local mirror; reconciled from WS on each frame)
 // ─────────────────────────────────────────────────────────────────────────
-let _trackerOn  = true;
-let _nirMode    = "auto";   // "auto" | "on" | "off"
-let _gimbalPan  = null;
-let _gimbalTilt = null;
+let _nirMode          = "auto";   // "auto" | "on" | "off"
+let _gimbalPan        = null;
+let _gimbalTilt       = null;
+let _trackedTargetId  = null;     // null = manual; int = user pressed TRACK
 
 // ─────────────────────────────────────────────────────────────────────────
 // Connection pills
@@ -34,73 +34,94 @@ function setPill(id, state, label) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Main-target card
+// Targets list (top 5) — each row has a TRACK toggle button.
+// Pressing TRACK on a row sends {command:"track", track_id:N} to the
+// backend. Pressing it again (or clicking another row's TRACK) clears
+// and replaces the lock. When no row is tracked, gimbal stays manual.
 // ─────────────────────────────────────────────────────────────────────────
-function updateMainTarget(msg) {
-  const id   = msg.main_target_id;
-  const row  = $("mt-row");
-  const cls  = $("mt-class");
-  if (!row || !cls) return;
+const _CLASS_COLORS = {
+  drone:   "#378ADD",
+  person:  "#AFA9EC",
+  vehicle: "#E24B4A",
+  unknown: "#ff6b35",
+};
 
-  if (!id) {
-    cls.textContent = "NO LOCK";
-    cls.style.color = "var(--text-3)";
-    // Clear extra cells
-    row.innerHTML = `<span class="mt-class" id="mt-class" style="color:var(--text-3);">NO LOCK</span>`;
+function _clsLabel(cls) {
+  if (!cls) return "TARGET";
+  if (cls === "person") return "HUMAN";
+  return cls.toUpperCase();
+}
+
+function renderTargets(msg) {
+  const list = $("targets-list");
+  const lockState = $("targets-lock-state");
+  if (!list) return;
+
+  const top = msg.top_targets || [];
+  // Reconcile local tracked id with backend truth (it drops the lock
+  // if the ID disappears from the fused list).
+  const backendTracked = (msg.tracked_target_id != null)
+    ? Number(msg.tracked_target_id) : null;
+  if (backendTracked !== _trackedTargetId) {
+    _trackedTargetId = backendTracked;
+  }
+
+  if (lockState) {
+    if (_trackedTargetId != null) {
+      lockState.textContent = `lock · #${_trackedTargetId} · gimbal AUTO`;
+      lockState.style.color = "var(--fused-green, #00e88f)";
+    } else {
+      lockState.textContent = "no lock · gimbal manual";
+      lockState.style.color = "var(--text-3)";
+    }
+  }
+
+  if (!top.length) {
+    list.innerHTML = `<div class="targets-empty">no fused targets</div>`;
     return;
   }
 
-  // Prefer the fused track list (Ticket 5). Fall back to legacy `tracks`.
-  const fused = msg.fused || [];
-  const legacyTracks = msg.tracks || [];
-  const t = fused.find(t => String(t.id) === String(id))
-         || legacyTracks.find(t => String(t.id) === String(id));
+  const rows = top.map(t => {
+    const cls = t.target_class || "unknown";
+    const label = _clsLabel(cls);
+    const color = _CLASS_COLORS[cls] || _CLASS_COLORS.unknown;
+    const nSensors = (t.sensors || []).length;
+    const sensorsTxt = (t.sensors || []).map(s => s.toUpperCase()).join("+") || "—";
+    const conf = (t.confidence != null) ? `${(t.confidence * 100) | 0}%` : "—";
+    const az = (t.az_deg != null) ? `${t.az_deg.toFixed(1)}°` : "—";
+    const el = (t.el_deg != null) ? `${t.el_deg.toFixed(1)}°` : "—";
+    const tracked = (_trackedTargetId != null) && (Number(t.id) === _trackedTargetId);
+    const confirmed = nSensors >= 2;
 
-  const clsName = t ? (t.target_class || t.class || "UNKNOWN") : "UNKNOWN";
-  const clsLabel = clsName === "person" ? "HUMAN" : clsName.toUpperCase();
-  cls.textContent = clsLabel;
-  cls.style.color = "var(--text)";
+    return `
+      <div class="target-row ${tracked ? "tracked" : ""} ${confirmed ? "confirmed" : "single"}"
+           data-id="${t.id}">
+        <span class="tr-id">#${t.id}</span>
+        <span class="tr-cls" style="color:${color}">${label}</span>
+        <span class="tr-sensors ${confirmed ? "multi" : "solo"}">${nSensors}× ${sensorsTxt}</span>
+        <span class="tr-conf">${conf}</span>
+        <span class="tr-angle mono">${az}, ${el}</span>
+        <button class="tr-btn ${tracked ? "active" : ""}" data-track-id="${t.id}">
+          ${tracked ? "TRACKING" : "TRACK"}
+        </button>
+      </div>
+    `;
+  }).join("");
 
-  let extra = "";
-  if (t) {
-    if (t.id != null) extra += `<span class="mt-val">ID ${t.id}</span>`;
-    if (t.az_deg != null && t.el_deg != null) {
-      extra += `<span class="mt-val">az ${t.az_deg.toFixed(2)}° el ${t.el_deg.toFixed(2)}°</span>`;
-    }
-    if (t.confidence != null) {
-      extra += `<span class="mt-val">conf ${(t.confidence*100|0)}%</span>`;
-    }
-    const sensors = (t.sensors && t.sensors.length) ? t.sensors.length : 1;
-    const sensorNames = (t.sensors || []).map(s => s.toUpperCase()).join("+") || "—";
-    extra += `<span class="mt-badge">${sensors}× ${sensorNames}</span>`;
-  }
-  row.innerHTML = `<span class="mt-class" id="mt-class">${clsLabel}</span>${extra}`;
-}
+  list.innerHTML = rows;
 
-// ─────────────────────────────────────────────────────────────────────────
-// Tracker button
-// ─────────────────────────────────────────────────────────────────────────
-const trackerBtn = $("tracker-btn");
-if (trackerBtn) {
-  trackerBtn.addEventListener("click", () => {
-    _trackerOn = !_trackerOn;
-    syncTrackerUI();
-    wsSend({ command: "tracker", state: _trackerOn ? "on" : "off" });
+  // Wire up the TRACK buttons. Re-binding every frame is fine — <10 rows.
+  list.querySelectorAll(".tr-btn").forEach(btn => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const raw = btn.dataset.trackId;
+      const id = raw != null ? Number(raw) : null;
+      const isCurrent = (_trackedTargetId != null) && (_trackedTargetId === id);
+      const nextId = isCurrent ? null : id;
+      _trackedTargetId = nextId;
+      wsSend({ command: "track", track_id: nextId });
+    });
   });
-}
-
-function syncTrackerUI() {
-  if (!trackerBtn) return;
-  const stateEl = $("tracker-state");
-  trackerBtn.classList.toggle("off", !_trackerOn);
-  if (stateEl) stateEl.textContent = _trackerOn ? "● ON" : "○ OFF";
-
-  // Enable / disable gimbal dpad
-  document.querySelectorAll(".dpad-btn").forEach(b => {
-    b.disabled = _trackerOn;   // manual only when tracker is OFF
-  });
-  const hint = $("gimbal-hint");
-  if (hint) hint.textContent = _trackerOn ? "manual disabled · tracker ON" : "manual enabled · use arrows";
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -140,9 +161,10 @@ function syncNirUI(mode) {
 // ─────────────────────────────────────────────────────────────────────────
 // Gimbal dpad
 // ─────────────────────────────────────────────────────────────────────────
+// Dpad is always live now — backend releases any active track lock
+// as soon as the user nudges manually.
 document.querySelectorAll(".dpad-btn[data-dp]").forEach(btn => {
   btn.addEventListener("click", () => {
-    if (btn.disabled) return;
     const dp = parseFloat(btn.dataset.dp || 0);
     const dt = parseFloat(btn.dataset.dt || 0);
     wsSend({ command: "gimbal_manual", delta_pan: dp, delta_tilt: dt });
@@ -152,7 +174,6 @@ document.querySelectorAll(".dpad-btn[data-dp]").forEach(btn => {
 const homeBtn = $("dpad-home");
 if (homeBtn) {
   homeBtn.addEventListener("click", () => {
-    if (homeBtn.disabled) return;
     wsSend({ command: "gimbal_manual", delta_pan: -(_gimbalPan || 0), delta_tilt: 60 - (_gimbalTilt || 60) });
   });
 }
@@ -280,8 +301,9 @@ function updateStatusBar(msg) {
   const mid   = $("stat-mid");
   if (left) left.textContent =
     `ws ${_fps.current} Hz · thermal ${_fps.current} Hz · eo — · radar —`;
+  const lock = (_trackedTargetId != null) ? `#${_trackedTargetId} AUTO` : "manual";
   if (mid) mid.textContent =
-    `${det} det · ${tracks} tracks · main ${mainId} · tracker ${_trackerOn ? "ON" : "OFF"} · rec OFF`;
+    `${det} det · ${tracks} tracks · main ${mainId} · gimbal ${lock} · rec OFF`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -347,6 +369,18 @@ function connect() {
     if (eoFovEl && eo.hfov_deg != null) {
       eoFovEl.textContent = Number(eo.hfov_deg).toFixed(1) + "° HFOV";
     }
+    // Keep the panel title honest: the hardcoded "IMX568 35mm 11°"
+    // becomes "TEST WEBCAM 67°" when running on a test webcam so the
+    // displayed FOV matches what fusion is actually using.
+    const eoTitle = $("eo-title");
+    if (eoTitle && eo.hfov_deg != null) {
+      const hfov = Number(eo.hfov_deg);
+      if (hfov > 20) {
+        eoTitle.textContent = `EO · TEST WEBCAM · ${hfov.toFixed(0)}°`;
+      } else {
+        eoTitle.textContent = `EO · IMX568 · 35mm NIR · ${hfov.toFixed(1)}°`;
+      }
+    }
 
     // ── Radar panel ── (disconnected until Ticket 4)
     const radar = msg.radar || {};
@@ -374,14 +408,8 @@ function connect() {
               mode === "auto" ? "GIMBAL AUTO" : "GIMBAL");
     }
 
-    // ── Tracker state from backend ──
-    if (msg.tracker_on !== undefined && msg.tracker_on !== _trackerOn) {
-      _trackerOn = msg.tracker_on;
-      syncTrackerUI();
-    }
-
-    // ── Main target card ──
-    updateMainTarget(msg);
+    // ── Targets list (top 5 with TRACK buttons) ──
+    renderTargets(msg);
 
     // ── Status bar ──
     updateStatusBar(msg);
@@ -391,6 +419,5 @@ function connect() {
 // ─────────────────────────────────────────────────────────────────────────
 // Boot
 // ─────────────────────────────────────────────────────────────────────────
-syncTrackerUI();
 syncNirUI(_nirMode);
 connect();

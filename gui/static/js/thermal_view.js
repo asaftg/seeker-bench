@@ -3,7 +3,15 @@
 // Ticket 5: if a fused green box subsumes a raw detection, the raw box
 // is suppressed so we don't stack two boxes on the same target.
 
-import { drawDetectionBox, drawFusedBox, isSubsumedByFused } from "./overlays.js";
+import {
+  drawDetectionBox,
+  drawFusedBox,
+  drawProjectedBox,
+  isSubsumedByFused,
+  fusedIdForDet,
+} from "./overlays.js";
+
+const PANEL_SENSOR = "thermal";
 
 export class ThermalView {
   constructor(canvasId, disconnectOverlayId) {
@@ -78,23 +86,34 @@ export class ThermalView {
       this.ctx.drawImage(this.img, dx, dy, dw, dh);
     }
 
-    // Collect fused bboxes that project into this panel.
-    const fusedBoxes = this._lastFused
-      .map(t => t.bbox_thermal)
-      .filter(Boolean);
-
-    // Raw detections: draw unless subsumed by a fused track.
+    // Raw detections — suppressed only when a 2+ sensor fused box is
+    // about to be drawn on top (handled inside isSubsumedByFused).
     for (const det of this._lastDetections) {
-      if (isSubsumedByFused(det.bbox, fusedBoxes)) continue;
+      if (isSubsumedByFused(det.bbox, this._lastFused, "bbox_thermal")) continue;
+      const fusedId = fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal");
       const isMain = this._mainTargetId != null &&
-                     det.track_id != null &&
-                     String(det.track_id) === String(this._mainTargetId);
-      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain);
+                     fusedId != null &&
+                     String(fusedId) === String(this._mainTargetId);
+      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain, fusedId);
     }
 
-    // Fused tracks: green box + centroid crosshair, drawn on top.
+    // Fused overlay rules:
+    //   >=2 sensors → solid green box on every panel (the "confirmed" lock).
+    //   =1 sensor   → nothing on the detecting panel (raw already drawn),
+    //                 dashed class-colored box on the OTHER panel showing
+    //                 the projected location ("another sensor says so").
     for (const trk of this._lastFused) {
-      drawFusedBox(this.ctx, trk.bbox_thermal, trk, scale, dx, dy);
+      const nSensors = (trk.sensors || []).length;
+      const bbox = trk.bbox_thermal;
+      if (!bbox) continue;
+      if (nSensors >= 2) {
+        drawFusedBox(this.ctx, bbox, trk, scale, dx, dy);
+      } else {
+        const detectedHere = (trk.sensors || []).includes(PANEL_SENSOR);
+        if (!detectedHere) {
+          drawProjectedBox(this.ctx, bbox, trk, scale, dx, dy);
+        }
+      }
     }
   }
 }

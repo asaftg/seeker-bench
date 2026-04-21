@@ -27,7 +27,6 @@ stop and restart at will.
 """
 from __future__ import annotations
 
-import math
 import threading
 import time
 from typing import Optional, Tuple
@@ -42,7 +41,7 @@ from common.frames import (
     Topic,
 )
 from common.logging_setup import get_logger
-from fusion.angular import bbox_to_angular
+from fusion.angular import angular_iou, bbox_to_angular
 
 log = get_logger(__name__)
 
@@ -63,7 +62,7 @@ class FusionManager:
         self,
         rate_hz: float = 15.0,
         match_gate_deg: float = 0.7,
-        track_match_gate_deg: float = 1.2,
+        track_match_gate_deg: float = 2.0,
         min_hits: int = 1,
         max_misses: int = 10,
     ) -> None:
@@ -131,17 +130,24 @@ class FusionManager:
         # persistent tracker.
         candidates: list[dict] = []
         used_t = [False] * len(thermal_obs)
+        # Cross-sensor association now uses angular IoU: two observations
+        # of the same class with bbox overlap >= XSENSOR_IOU are the same
+        # real target. IoU is robust to the "big foreground target eats
+        # small background target" bug that plagued center-distance
+        # gates, because a small bbox inside a big bbox has IoU ≈ 0.
+        XSENSOR_IOU = 0.15  # loose — FOV estimates & parallax can shift centers
         for e in eo_obs:
-            best_i, best_d = -1, math.inf
+            best_i, best_iou = -1, 0.0
             for i, t in enumerate(thermal_obs):
                 if used_t[i] or t["class"] != e["class"]:
                     continue
-                d = math.hypot(e["az"] - t["az"], e["el"] - t["el"])
-                if d < best_d:
-                    best_d, best_i = d, i
-            gate = max(self.match_gate_deg,
-                       max(e["ang_w"], e["ang_h"]) * 0.8)
-            if best_i >= 0 and best_d < gate:
+                iou = angular_iou(
+                    e["az"], e["el"], e["ang_w"], e["ang_h"],
+                    t["az"], t["el"], t["ang_w"], t["ang_h"],
+                )
+                if iou > best_iou:
+                    best_iou, best_i = iou, i
+            if best_i >= 0 and best_iou >= XSENSOR_IOU:
                 t = thermal_obs[best_i]
                 used_t[best_i] = True
                 candidates.append({
@@ -173,7 +179,18 @@ class FusionManager:
                 "conf":    t["conf"],
             })
 
+        # Collapse near-duplicate candidates within this tick before
+        # they hit the persistence tracker. Without this, two YOLO
+        # boxes on the same car (one per sensor, or two from EO) each
+        # become a candidate, and greedy track matching means only one
+        # claims the existing track — the other spawns a duplicate.
+        candidates = self._dedup_candidates(candidates)
+
         self._update_tracks(candidates)
+        # Final safety net: merge any fusion tracks that now overlap in
+        # angular space with another track of the same class. The elder
+        # (more hits, then lower id) keeps its ID; the younger is dropped.
+        self._merge_overlapping_tracks()
         self._publish()
 
     # ───────────────────────── observation builders ──────────────
@@ -222,17 +239,22 @@ class FusionManager:
     # ───────────────────────── persistence tracker ───────────────
     def _update_tracks(self, candidates: list[dict]) -> None:
         matched = [False] * len(self._tracks)
+        # IoU-based matching tolerates EMA drift: even if the track's
+        # smoothed bbox drifts, a new observation that clearly overlaps
+        # the track still matches, so we don't spawn a duplicate ID.
+        TRACK_IOU = 0.15
         for c in candidates:
-            best_i, best_d = -1, math.inf
+            best_i, best_iou = -1, 0.0
             for i, trk in enumerate(self._tracks):
                 if matched[i] or trk["class"] != c["class"]:
                     continue
-                d = math.hypot(c["az"] - trk["az"], c["el"] - trk["el"])
-                if d < best_d:
-                    best_d, best_i = d, i
-            gate = max(self.track_match_gate_deg,
-                       max(c["ang_w"], c["ang_h"]) * 1.2)
-            if best_i >= 0 and best_d < gate:
+                iou = angular_iou(
+                    c["az"], c["el"], c["ang_w"], c["ang_h"],
+                    trk["az"], trk["el"], trk["ang_w"], trk["ang_h"],
+                )
+                if iou > best_iou:
+                    best_iou, best_i = iou, i
+            if best_i >= 0 and best_iou >= TRACK_IOU:
                 trk = self._tracks[best_i]
                 a = 0.4  # EMA
                 trk["az"]    = a * trk["az"]    + (1 - a) * c["az"]
@@ -278,6 +300,103 @@ class FusionManager:
                 if trk["misses"] <= self.max_misses:
                     kept.append(trk)
         self._tracks = kept
+
+    # ───────────────────────── dedup helpers ─────────────────────
+    def _dedup_candidates(self, cands: list[dict]) -> list[dict]:
+        """Merge same-class candidates whose angular centers are within
+        gate of each other. Keeps the richer one (more sensors, then
+        higher conf). Cameras are boresight-aligned <5cm apart so two
+        candidates on one real target should land nearly on top of each
+        other in (az, el)."""
+        if len(cands) <= 1:
+            return cands
+        # Sort so the "winners" are visited first: more sensors first,
+        # then higher confidence. Losers merge into winners.
+        order = sorted(
+            range(len(cands)),
+            key=lambda i: (len(cands[i]["sensors"]), cands[i]["conf"]),
+            reverse=True,
+        )
+        used = [False] * len(cands)
+        out: list[dict] = []
+        for i in order:
+            if used[i]:
+                continue
+            w = dict(cands[i])
+            w["sensors"] = list(w["sensors"])
+            used[i] = True
+            # Gate: generous — anything roughly co-angular & same class
+            # is the same real-world target given our geometry.
+            # Within-tick dedup: strict IoU threshold. Must really
+            # overlap — don't collapse neighbors that merely classify
+            # the same.
+            DEDUP_IOU = 0.35
+            for j in order:
+                if used[j] or cands[j]["class"] != w["class"]:
+                    continue
+                c = cands[j]
+                iou = angular_iou(
+                    w["az"], w["el"], w["ang_w"], w["ang_h"],
+                    c["az"], c["el"], c["ang_w"], c["ang_h"],
+                )
+                if iou >= DEDUP_IOU:
+                    used[j] = True
+                    for s in c["sensors"]:
+                        if s not in w["sensors"]:
+                            w["sensors"].append(s)
+                    # If merging brings in a thermal hit, promote to
+                    # 2-sensor. Primary stays EO if EO was present.
+                    if "eo" in w["sensors"]:
+                        w["primary"] = "eo"
+                    w["conf"] = max(w["conf"], c["conf"])
+            out.append(w)
+        return out
+
+    def _merge_overlapping_tracks(self) -> None:
+        """Collapse fusion tracks that now live on top of each other.
+
+        Scans all track pairs of the same class; if angular centers are
+        within gate, keeps the elder (more hits, then lower id) and
+        drops the other. Runs once per tick — cheap, O(N²) where N is
+        typically <10.
+        """
+        if len(self._tracks) <= 1:
+            return
+        # Elder first: more hits, then lower id.
+        order = sorted(
+            range(len(self._tracks)),
+            key=lambda i: (self._tracks[i]["hits"], -self._tracks[i]["id"]),
+            reverse=True,
+        )
+        drop = [False] * len(self._tracks)
+        for oi, i in enumerate(order):
+            if drop[i]:
+                continue
+            a = self._tracks[i]
+            for j in order[oi + 1:]:
+                if drop[j]:
+                    continue
+                b = self._tracks[j]
+                if a["class"] != b["class"]:
+                    continue
+                # IoU-based merge: two live tracks collapse only when
+                # their angular bboxes substantially overlap. A small
+                # distant same-class track sitting inside a big track's
+                # bbox has IoU ≈ 0, so it's safe.
+                MERGE_IOU = 0.35
+                iou = angular_iou(
+                    a["az"], a["el"], a["ang_w"], a["ang_h"],
+                    b["az"], b["el"], b["ang_w"], b["ang_h"],
+                )
+                if iou >= MERGE_IOU:
+                    # Fold b into a: union the sensor sets, bump hits.
+                    for s in b["sensors_ever"]:
+                        if s not in a["sensors_ever"]:
+                            a["sensors_ever"].append(s)
+                    a["conf"] = max(a["conf"], b["conf"])
+                    drop[j] = True
+        if any(drop):
+            self._tracks = [t for k, t in enumerate(self._tracks) if not drop[k]]
 
     # ───────────────────────── publish ───────────────────────────
     def _publish(self) -> None:

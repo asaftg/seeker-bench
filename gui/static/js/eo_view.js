@@ -3,7 +3,15 @@
 // raw detections subsumed by a fused track are suppressed so the green
 // fused box is the single box on that target.
 
-import { drawDetectionBox, drawFusedBox, isSubsumedByFused } from "./overlays.js";
+import {
+  drawDetectionBox,
+  drawFusedBox,
+  drawProjectedBox,
+  isSubsumedByFused,
+  fusedIdForDet,
+} from "./overlays.js";
+
+const PANEL_SENSOR = "eo";
 
 export class EOView {
   constructor(canvasId, disconnectOverlayId) {
@@ -78,20 +86,29 @@ export class EOView {
       this.ctx.drawImage(this.img, dx, dy, dw, dh);
     }
 
-    const fusedBoxes = this._lastFused
-      .map(t => t.bbox_eo)
-      .filter(Boolean);
-
+    // Raw detections — suppressed only by 2+ sensor fused overlays.
     for (const det of this._lastDetections) {
-      if (isSubsumedByFused(det.bbox, fusedBoxes)) continue;
+      if (isSubsumedByFused(det.bbox, this._lastFused, "bbox_eo")) continue;
+      const fusedId = fusedIdForDet(det.bbox, this._lastFused, "bbox_eo");
       const isMain = this._mainTargetId != null &&
-                     det.track_id != null &&
-                     String(det.track_id) === String(this._mainTargetId);
-      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain);
+                     fusedId != null &&
+                     String(fusedId) === String(this._mainTargetId);
+      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain, fusedId);
     }
 
+    // Fused overlay rules — mirror of thermal_view.
     for (const trk of this._lastFused) {
-      drawFusedBox(this.ctx, trk.bbox_eo, trk, scale, dx, dy);
+      const nSensors = (trk.sensors || []).length;
+      const bbox = trk.bbox_eo;
+      if (!bbox) continue;
+      if (nSensors >= 2) {
+        drawFusedBox(this.ctx, bbox, trk, scale, dx, dy);
+      } else {
+        const detectedHere = (trk.sensors || []).includes(PANEL_SENSOR);
+        if (!detectedHere) {
+          drawProjectedBox(this.ctx, bbox, trk, scale, dx, dy);
+        }
+      }
     }
   }
 }

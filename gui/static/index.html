@@ -69,7 +69,7 @@
     <!-- EO PANEL -->
     <div class="panel">
       <div class="panel-head">
-        <span>EO · IMX568 · 35mm NIR · 11°</span>
+        <span id="eo-title">EO · IMX568 · 35mm NIR · 11°</span>
         <span class="hz mono" id="eo-hz">— Hz</span>
       </div>
       <div class="panel-subbar">
@@ -101,22 +101,22 @@
 
   </div><!-- /.row-sensors -->
 
-  <!-- ─────────── ROW 2: main target + tracker + NIR ─────────── -->
+  <!-- ─────────── ROW 2: target list + NIR ─────────── -->
   <div class="row-main">
 
-    <!-- MAIN TARGET CARD -->
-    <div class="main-target-card" id="main-target-card">
-      <div class="mt-label">MAIN TARGET</div>
-      <div class="mt-row" id="mt-row">
-        <span class="mt-class" id="mt-class" style="color:var(--text-3);">NO LOCK</span>
+    <!-- TOP TARGETS LIST — ranked by sensor-count + confidence.
+         Each row has a TRACK button that tells the gimbal to auto-
+         track that fused ID. Only one target can be tracked at a time.
+         When nothing is tracked, the gimbal is manual (dpad below). -->
+    <div class="targets-card" id="targets-card">
+      <div class="targets-head">
+        <span class="targets-label">TARGETS · TOP 5</span>
+        <span class="targets-sub" id="targets-lock-state">no lock · gimbal manual</span>
+      </div>
+      <div class="targets-list" id="targets-list">
+        <div class="targets-empty">no fused targets</div>
       </div>
     </div>
-
-    <!-- TRACKER TOGGLE -->
-    <button class="big-btn" id="tracker-btn" title="Toggle auto-tracker on/off">
-      <span>TRACKER</span>
-      <span class="btn-state" id="tracker-state">● ON</span>
-    </button>
 
     <!-- NIR ILLUMINATOR -->
     <div class="nir-card">
@@ -151,7 +151,7 @@
         <button class="dpad-btn" id="dpad-down" data-dp="0"  data-dt="-5" title="Tilt down">▼</button>
         <button class="dpad-spacer"></button>
       </div>
-      <div class="gimbal-hint" id="gimbal-hint">manual disabled · tracker ON</div>
+      <div class="gimbal-hint" id="gimbal-hint">manual · press TRACK on a target to lock</div>
     </div>
 
     <!-- RADAR PROFILE -->

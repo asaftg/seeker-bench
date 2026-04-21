@@ -72,6 +72,41 @@ def angular_to_bbox(
     return int(x), int(y), int(w), int(h)
 
 
+def angular_iou(
+    az_a: float, el_a: float, w_a: float, h_a: float,
+    az_b: float, el_b: float, w_b: float, h_b: float,
+) -> float:
+    """Intersection-over-Union of two axis-aligned bboxes in (az, el) space.
+
+    Treats each (az_center, el_center, ang_w, ang_h) as a rectangle in
+    angular space. Useful as the association metric across sensors and
+    across ticks: a small target inside a big target's bbox has IoU≈0
+    (tiny intersection, huge union), so the big one doesn't false-merge
+    distant same-class neighbors.
+    """
+    ax1 = az_a - w_a / 2.0
+    ax2 = az_a + w_a / 2.0
+    ay1 = el_a - h_a / 2.0
+    ay2 = el_a + h_a / 2.0
+    bx1 = az_b - w_b / 2.0
+    bx2 = az_b + w_b / 2.0
+    by1 = el_b - h_b / 2.0
+    by2 = el_b + h_b / 2.0
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, w_a) * max(0.0, h_a)
+    area_b = max(0.0, w_b) * max(0.0, h_b)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
 def angular_bbox_visible(
     az_deg: float, el_deg: float,
     ang_w_deg: float, ang_h_deg: float,

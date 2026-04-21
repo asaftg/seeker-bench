@@ -103,9 +103,24 @@ eo:
   target_fps: 30
   resolution: [1920, 1080]      # webcam will negotiate closest supported
 
-  # Optics (don't change unless swapping lens/sensor)
+  # Optics. IMX568 + Commonlands CIL350 35mm is 11.05° H × 9.23° V.
+  # If you're running a test webcam instead of the real sensor, set
+  # `test_webcam` below and these get overridden at startup. Don't edit
+  # these two lines directly — they describe the real mission hardware.
   hfov_deg: 11.05
   vfov_deg: 9.23
+
+  # Test mode: when running with a generic webcam in place of the real
+  # IMX568 + 35mm lens, we need to tell fusion the *actual* FOV the
+  # webcam sees — otherwise cross-sensor angular matching is broken.
+  # Pick the profile matching your webcam (or add one). `none` uses the
+  # real-hardware optics above.
+  test_webcam: insta360_link       # none | insta360_link | logitech_c920 | generic_60
+  test_webcam_profiles:
+    none:            { hfov_deg: null, vfov_deg: null }
+    insta360_link:   { hfov_deg: 67.0, vfov_deg: 41.0 }   # CINSABNB, 79.5° DFOV @ 16:9
+    logitech_c920:   { hfov_deg: 70.4, vfov_deg: 43.3 }   # 78° DFOV @ 16:9
+    generic_60:      { hfov_deg: 60.0, vfov_deg: 36.9 }   # typical laptop cam
 
   classifier:
     enabled: true
@@ -142,7 +157,9 @@ fusion:
   enabled: true
   rate_hz: 15                   # fusion tick rate (independent of sensors)
   match_gate_deg: 0.7           # cross-sensor: max angular distance (deg) to fuse
-  track_match_gate_deg: 1.2     # per-tick: max angular distance to match existing track
+  track_match_gate_deg: 2.0     # per-tick: max angular distance to match existing track
+                                # (cameras are coplanar <5cm apart so parallax ~= 0°;
+                                #  looser gate prevents small bbox jitter spawning dup IDs)
   min_hits: 1                   # ticks before a track is visible in the GUI
   max_misses: 10                # ticks of no-observation before a track is dropped
 

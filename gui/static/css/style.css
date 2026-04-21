@@ -286,11 +286,118 @@ body {
 }
 
 
-/* ─────────── ROW 2: main target + tracker + NIR ─────────── */
+/* ─────────── ROW 2: target list + NIR ─────────── */
 .row-main {
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr;
+  grid-template-columns: 3fr 1fr;
   gap: 10px;
+}
+
+/* Targets card — ranked top-N with per-row TRACK button */
+.targets-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.targets-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.targets-label {
+  font-size: 10.5px;
+  color: var(--text-2);
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.targets-sub {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.targets-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.targets-empty {
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 8px 2px;
+}
+.target-row {
+  display: grid;
+  grid-template-columns: 42px 1fr 120px 52px 112px 92px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid transparent;
+  font-size: 12px;
+}
+.target-row.confirmed {
+  background: rgba(0, 232, 143, 0.06);
+  border-color: rgba(0, 232, 143, 0.25);
+}
+.target-row.tracked {
+  background: rgba(0, 232, 143, 0.18);
+  border-color: var(--green);
+}
+.tr-id {
+  font-family: "JetBrains Mono", monospace;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.tr-cls {
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}
+.tr-sensors {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-align: center;
+  white-space: nowrap;
+}
+.tr-sensors.multi {
+  background: var(--green-dim);
+  color: var(--green);
+}
+.tr-sensors.solo {
+  background: rgba(255,255,255,0.06);
+  color: var(--text-3);
+}
+.tr-conf {
+  font-family: "JetBrains Mono", monospace;
+  text-align: right;
+  color: var(--text-2);
+}
+.tr-angle {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.tr-btn {
+  background: rgba(0, 232, 143, 0.10);
+  border: 1px solid var(--green);
+  color: var(--green);
+  border-radius: 6px;
+  padding: 5px 0;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  cursor: pointer;
+  font-size: 11px;
+  text-transform: uppercase;
+  transition: background 0.12s;
+}
+.tr-btn:hover { background: rgba(0, 232, 143, 0.22); }
+.tr-btn.active {
+  background: var(--green);
+  color: #001a0f;
 }
 
 .main-target-card {
