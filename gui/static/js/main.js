@@ -19,7 +19,8 @@ const eoView      = new EOView("eo-canvas", "eo-disconnected");
 // container itself is permanent, so delegation is reliable.
 (() => {
   const list = document.getElementById("targets-list");
-  if (!list) return;
+  if (!list) { console.warn("[track] targets-list not found at load"); return; }
+  console.log("[track] delegated click listener installed on #targets-list");
   list.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".tr-btn");
     if (!btn || !list.contains(btn)) return;
@@ -29,6 +30,7 @@ const eoView      = new EOView("eo-canvas", "eo-disconnected");
     const isCurrent = (_trackedTargetId != null) && (_trackedTargetId === id);
     const nextId = isCurrent ? null : id;
     _trackedTargetId = nextId;
+    console.log("[track] click id=", id, "→ send", nextId);
     wsSend({ command: "track", track_id: nextId });
   });
 })();

@@ -93,6 +93,23 @@ class BosonCapture:
                     last_err = f"index {idx} opened but produces no frames"
                     continue
 
+            # Reject non-Boson devices. The ADK is 640×512 (5:4 aspect, ~1.25).
+            # Any webcam is 16:9 at 720p+/1080p (~1.78). If we're in auto-probe
+            # mode and got a webcam-shaped frame, skip to the next index so
+            # the Insta360 can't impersonate the thermal camera.
+            if isinstance(self.requested_index, str) and self.requested_index == "auto":
+                fh, fw = test.shape[:2]
+                aspect = fw / max(1, fh)
+                # Boson 640 = 640×512 (1.25); Boson 320 = 320×256 (1.25).
+                # Everything ≥ 1.5 is a webcam. Also reject anything wider
+                # than 800 px — Boson never exceeds 640.
+                if aspect >= 1.5 or fw > 800:
+                    cap.release()
+                    last_err = (f"index {idx} is a webcam ({fw}x{fh}, aspect "
+                                f"{aspect:.2f}) not a FLIR Boson — skipping")
+                    log.info(last_err)
+                    continue
+
             self._cap = cap
             self.device_index = idx
             self.raw16_available = raw16_ok

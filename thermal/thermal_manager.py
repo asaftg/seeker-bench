@@ -481,12 +481,16 @@ class ThermalManager:
                 self._last_hv_dets = hv_dets
 
                 # Match each new det to an existing track (IoU >= 0.3).
-                matched = [False] * len(self._hv_tracks)
+                # Snapshot count before the loop — unmatched dets append
+                # new tracks below, and `matched` only covers pre-existing.
+                n_existing = len(self._hv_tracks)
+                matched = [False] * n_existing
                 for hv in hv_dets:
                     bx, by, bw, bh = hv["bbox"]
                     best_t = -1
                     best_iou = 0.0
-                    for ti, trk in enumerate(self._hv_tracks):
+                    for ti in range(n_existing):
+                        trk = self._hv_tracks[ti]
                         if matched[ti]:
                             continue
                         if trk["class"] != hv["class"]:
