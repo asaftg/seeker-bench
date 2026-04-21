@@ -198,14 +198,14 @@ gimbal:
     max_deg:  90.0
     us_at_min_deg:  500.0
     us_at_max_deg: 2500.0
-    invert: false
+    invert: true        # servo mounted so +pan goes right
   tilt_calibration:
     channel: 1
     min_deg:  0.0
     max_deg: 22.0
     us_at_min_deg: 1500.0
     us_at_max_deg: 2000.0
-    invert: false
+    invert: true        # servo mounted so +tilt goes up
 
 gui:
   host: 127.0.0.1

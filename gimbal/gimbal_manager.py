@@ -107,6 +107,13 @@ class GimbalManager:
         # Track-lock state
         self._tracked_id: Optional[int] = None
 
+        # How many consecutive ticks to tolerate a tracked ID being
+        # missing from the fused list before dropping the lock. At
+        # 20 Hz, 20 ticks ≈ 1 s of grace — enough to survive a
+        # classifier hiccup without losing the target.
+        self._track_grace_ticks = int(gcfg.get("track_grace_ticks", 20))
+        self._track_miss = 0
+
         # Thread
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
@@ -212,21 +219,41 @@ class GimbalManager:
                         trk = t
                         break
             if trk is not None:
-                # az/el are already in sensor-boresight degrees. Pan
-                # maps to az directly. Tilt maps to el but offset by
-                # the home tilt (since 0 in tilt = horizon, the drone
-                # camera's "el=0" is approximately at home_tilt mech-
-                # anically). Simple enough for bench; a real mount
-                # will want a mount-calibration transform.
-                sp_pan  = manual_pan  + float(trk.az_deg)   # relative to manual pan park
-                sp_tilt = self._home_tilt + float(trk.el_deg)
+                # Cameras are rigidly mounted on the gimbal, so the
+                # camera boresight angle = current gimbal pan/tilt.
+                # Target az/el is how far off-boresight the target is.
+                # To center: new angle = current + off-boresight error.
+                cur_pan, cur_tilt = self._controller.current
+                sp_pan  = cur_pan  + float(trk.az_deg)
+                sp_tilt = cur_tilt + float(trk.el_deg)
                 mode = "auto"
-            else:
-                # Tracked ID vanished — drop the lock, stay put.
-                err = f"tracked id #{tracked_id} lost"
+                self._track_miss = 0
+                # Keep the manual park position synced so that when
+                # the user releases track, the servo stays where the
+                # tracker put it instead of snapping back.
                 with self._lock:
-                    if self._tracked_id == tracked_id:
-                        self._tracked_id = None
+                    self._manual_pan  = cur_pan
+                    self._manual_tilt = cur_tilt
+            else:
+                # Tracked ID not in this tick's fused list. Don't
+                # drop the lock on the first miss — fusion hiccups
+                # happen; tolerate `track_grace_ticks` of them before
+                # giving up. While we wait, hold the last commanded
+                # position.
+                self._track_miss += 1
+                mode = "auto"
+                if self._track_miss >= self._track_grace_ticks:
+                    err = f"tracked id #{tracked_id} lost after {self._track_miss} ticks"
+                    log.info("Dropping track lock on #%d (lost)", tracked_id)
+                    with self._lock:
+                        if self._tracked_id == tracked_id:
+                            self._tracked_id = None
+                    self._track_miss = 0
+                    mode = "manual"
+                # Hold current position while waiting
+                sp_pan, sp_tilt = self._controller.current
+        else:
+            self._track_miss = 0
 
         # Slew + clamp
         cmd_pan, cmd_tilt = self._controller.step(sp_pan, sp_tilt)
