@@ -12,6 +12,26 @@ const $ = (id) => document.getElementById(id);
 // ─────────────────────────────────────────────────────────────────────────
 const thermalView = new ThermalView("thermal-canvas", "thermal-disconnected");
 const eoView      = new EOView("eo-canvas", "eo-disconnected");
+
+// Delegated TRACK button handler — bound ONCE on the list container.
+// The list's innerHTML gets rewritten every WS frame (~20Hz), so any
+// per-button listener would race the rewrite and lose its click. The
+// container itself is permanent, so delegation is reliable.
+(() => {
+  const list = document.getElementById("targets-list");
+  if (!list) return;
+  list.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".tr-btn");
+    if (!btn || !list.contains(btn)) return;
+    ev.stopPropagation();
+    const raw = btn.dataset.trackId;
+    const id = raw != null ? Number(raw) : null;
+    const isCurrent = (_trackedTargetId != null) && (_trackedTargetId === id);
+    const nextId = isCurrent ? null : id;
+    _trackedTargetId = nextId;
+    wsSend({ command: "track", track_id: nextId });
+  });
+})();
 // Radar panel canvas drawing will be wired in Ticket 4. For now it shows DISCONNECTED.
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -109,19 +129,10 @@ function renderTargets(msg) {
   }).join("");
 
   list.innerHTML = rows;
-
-  // Wire up the TRACK buttons. Re-binding every frame is fine — <10 rows.
-  list.querySelectorAll(".tr-btn").forEach(btn => {
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      const raw = btn.dataset.trackId;
-      const id = raw != null ? Number(raw) : null;
-      const isCurrent = (_trackedTargetId != null) && (_trackedTargetId === id);
-      const nextId = isCurrent ? null : id;
-      _trackedTargetId = nextId;
-      wsSend({ command: "track", track_id: nextId });
-    });
-  });
+  // NOTE: TRACK button clicks are handled by a single delegated
+  // listener bound ONCE on the list container (see below). Re-binding
+  // per-button here would race the 20Hz innerHTML rewrite — the button
+  // the user clicked on often gets destroyed before its handler fires.
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -238,14 +238,18 @@ class FusionManager:
 
     # ───────────────────────── persistence tracker ───────────────
     def _update_tracks(self, candidates: list[dict]) -> None:
-        matched = [False] * len(self._tracks)
+        # Snapshot the count BEFORE iterating — unmatched candidates
+        # append new tracks below, and `matched` only covers pre-existing.
+        n_existing = len(self._tracks)
+        matched = [False] * n_existing
         # IoU-based matching tolerates EMA drift: even if the track's
         # smoothed bbox drifts, a new observation that clearly overlaps
         # the track still matches, so we don't spawn a duplicate ID.
         TRACK_IOU = 0.15
         for c in candidates:
             best_i, best_iou = -1, 0.0
-            for i, trk in enumerate(self._tracks):
+            for i in range(n_existing):
+                trk = self._tracks[i]
                 if matched[i] or trk["class"] != c["class"]:
                     continue
                 iou = angular_iou(

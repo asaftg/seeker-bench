@@ -366,12 +366,18 @@ class EOManager:
         new one. Unmatched tracks age out after max_misses.
         """
         IOU_MATCH = 0.30
-        matched = [False] * len(self._tracks)
+        # Snapshot the count BEFORE the dets loop — we append new
+        # tracks to self._tracks inside the loop on unmatched dets,
+        # and `matched` must only cover the pre-existing tracks. (The
+        # newly-appended entries haven't been matched yet by definition.)
+        n_existing = len(self._tracks)
+        matched = [False] * n_existing
         for d in dets:
             bx, by, bw, bh = d["bbox"]
             best_t = -1
             best_iou = 0.0
-            for ti, trk in enumerate(self._tracks):
+            for ti in range(n_existing):
+                trk = self._tracks[ti]
                 if matched[ti] or trk["class"] != d["class"]:
                     continue
                 tb = trk["bbox"]
