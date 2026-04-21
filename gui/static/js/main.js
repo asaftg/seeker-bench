@@ -174,7 +174,8 @@ document.querySelectorAll(".dpad-btn[data-dp]").forEach(btn => {
 const homeBtn = $("dpad-home");
 if (homeBtn) {
   homeBtn.addEventListener("click", () => {
-    wsSend({ command: "gimbal_manual", delta_pan: -(_gimbalPan || 0), delta_tilt: 60 - (_gimbalTilt || 60) });
+    // Backend knows the configured home pose — don't compute it client-side.
+    wsSend({ command: "gimbal_home" });
   });
 }
 

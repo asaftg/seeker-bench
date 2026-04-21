@@ -39,7 +39,7 @@ def _static_dir() -> Path:
     return base / "static"
 
 
-def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
+def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> FastAPI:
     """Create the FastAPI app.
 
     `thermal_manager` and `eo_manager` are optional — when provided, the
@@ -49,6 +49,7 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
     app = FastAPI(title="Seeker-01 Bench Test", version="0.1.0")
     app.state.thermal_manager = thermal_manager
     app.state.eo_manager = eo_manager
+    app.state.gimbal_manager = gimbal_manager
 
     static_dir = _static_dir()
     if static_dir.exists():
@@ -195,10 +196,9 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
         #   nir_mode / gimbal_*: pass-through to the wire payload.
         state = {
             "nir_mode": "auto",
-            "gimbal_pan": 0.0,
-            "gimbal_tilt": 60.0,
-            "tracked_target_id": None,  # int | None
+            "tracked_target_id": None,  # int | None (mirror of gimbal_manager lock)
         }
+        gm = app.state.gimbal_manager
 
         log.info("WebSocket client connected")
 
@@ -208,14 +208,14 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
                     tf = BUS.get_latest(Topic.THERMAL)
                     ef = BUS.get_latest(Topic.EO)
                     fused = BUS.get_latest(Topic.FUSED)
+                    gstate = BUS.get_latest(Topic.GIMBAL)
                     payload = build_ws_message(
                         tf=tf,
                         ef=ef,
                         fused=fused,
+                        gstate=gstate,
                         jpeg_quality=jpeg_quality,
                         nir_mode=state["nir_mode"],
-                        gimbal_pan=state["gimbal_pan"],
-                        gimbal_tilt=state["gimbal_tilt"],
                         tracked_target_id=state["tracked_target_id"],
                     )
                     # `default=str` is a safety net for numpy scalars that
@@ -254,26 +254,34 @@ def create_app(thermal_manager=None, eo_manager=None) -> FastAPI:
                     raw = cmd.get("track_id", None)
                     if raw is None:
                         state["tracked_target_id"] = None
+                        if gm is not None: gm.set_track_target(None)
                         log.info("Track lock cleared → manual gimbal")
                     else:
                         try:
-                            state["tracked_target_id"] = int(raw)
-                            log.info("Track lock → fused-id %d", state["tracked_target_id"])
+                            tid = int(raw)
+                            state["tracked_target_id"] = tid
+                            if gm is not None: gm.set_track_target(tid)
+                            log.info("Track lock → fused-id %d", tid)
                         except (TypeError, ValueError):
                             log.warning("Bad track_id payload: %r", raw)
 
                 elif command == "gimbal_manual":
-                    # Manual dpad is always allowed — if the user is
-                    # nudging, treat it as an implicit release of any
-                    # active track lock.
+                    # Manual dpad always wins — releases any track lock.
                     if state["tracked_target_id"] is not None:
                         log.info("Manual gimbal input — releasing track lock")
                         state["tracked_target_id"] = None
                     dp = float(cmd.get("delta_pan", 0))
                     dt = float(cmd.get("delta_tilt", 0))
-                    state["gimbal_pan"]  = round(state["gimbal_pan"]  + dp, 1)
-                    state["gimbal_tilt"] = round(state["gimbal_tilt"] + dt, 1)
+                    if gm is not None:
+                        gm.set_manual_delta(dp, dt)
                     log.debug("Gimbal manual delta pan=%.1f tilt=%.1f", dp, dt)
+
+                elif command == "gimbal_home":
+                    if state["tracked_target_id"] is not None:
+                        state["tracked_target_id"] = None
+                    if gm is not None:
+                        gm.set_home()
+                    log.info("Gimbal home")
 
                 elif command == "nir":
                     mode = str(cmd.get("mode", "auto")).lower()

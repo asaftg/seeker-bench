@@ -183,3 +183,33 @@ class Topic:
     EO      = "eo"
     RADAR   = "radar"
     FUSED   = "fused"
+    GIMBAL  = "gimbal"
+
+
+# ───────────────────────────────────────────────────────────────
+# Gimbal — Ticket 4 (pan/tilt servo controller)
+# ───────────────────────────────────────────────────────────────
+
+@dataclass
+class GimbalState:
+    """Latest state of the pan/tilt gimbal.
+
+    Angles are in degrees in the sensor frame:
+        pan_deg  — positive = right of boresight, 0 = centered
+        tilt_deg — positive = up from horizon,    0 = horizontal
+                   (mechanical range typically 0..22° on this rig)
+
+    ``mode`` is "auto" when the gimbal is tracking a fused-track ID
+    the user pressed TRACK on, "manual" otherwise. ``connected`` is
+    False when the Maestro USB device isn't present — the rest of
+    the app keeps running, the GUI just disables the dpad.
+    """
+    timestamp: float
+    connected: bool
+    pan_deg: float
+    tilt_deg: float
+    mode: str = "manual"          # "manual" | "auto"
+    target_pan_deg: float = 0.0   # commanded setpoint (may lag actual)
+    target_tilt_deg: float = 0.0
+    tracked_target_id: Optional[int] = None
+    error: Optional[str] = None   # last error string, or None

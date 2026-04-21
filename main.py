@@ -24,6 +24,7 @@ from common.config import load_config
 from common.logging_setup import configure, get_logger
 from eo.eo_manager import EOManager
 from fusion.fusion_manager import FusionManager
+from gimbal.gimbal_manager import GimbalManager
 from gui.app import create_app
 from thermal.thermal_manager import ThermalManager
 
@@ -34,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fake-eo", action="store_true", help="Synthetic EO (webcam) source")
     p.add_argument("--no-eo", action="store_true", help="Disable EO pipeline entirely")
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
+    p.add_argument("--no-gimbal", action="store_true", help="Disable gimbal (Maestro servo controller)")
     p.add_argument("--host", default=None, help="GUI bind host")
     p.add_argument("--port", type=int, default=None, help="GUI bind port")
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser")
@@ -118,9 +120,21 @@ def main() -> int:
         fusion = FusionManager()
         fusion.start()
 
+    # Start gimbal manager — optional. Degrades gracefully if the
+    # Maestro isn't plugged in (publishes connected=false state).
+    gimbal: GimbalManager | None = None
+    gimbal_cfg = (cfg.get("gimbal") or {})
+    if not args.no_gimbal and bool(gimbal_cfg.get("enabled", True)):
+        try:
+            gimbal = GimbalManager()
+            gimbal.start()
+        except Exception as e:
+            log.warning("Gimbal manager failed to start: %s — continuing without gimbal", e)
+            gimbal = None
+
     # Build FastAPI app. The managers are passed in so the runtime
     # config endpoints can mutate detector parameters live from the GUI.
-    app = create_app(thermal_manager=thermal, eo_manager=eo)
+    app = create_app(thermal_manager=thermal, eo_manager=eo, gimbal_manager=gimbal)
 
     host = args.host or str(cfg.get("gui", {}).get("host", "127.0.0.1"))
     port = args.port or int(cfg.get("gui", {}).get("port", 8080))
@@ -137,6 +151,8 @@ def main() -> int:
 
     def _shutdown(*_):
         log.info("Shutdown signal received, stopping sensors")
+        if gimbal is not None:
+            gimbal.stop()
         if fusion is not None:
             fusion.stop()
         if eo is not None:
@@ -154,6 +170,8 @@ def main() -> int:
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
+        if gimbal is not None:
+            gimbal.stop()
         if fusion is not None:
             fusion.stop()
         if eo is not None:

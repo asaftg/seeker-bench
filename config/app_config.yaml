@@ -163,6 +163,50 @@ fusion:
   min_hits: 1                   # ticks before a track is visible in the GUI
   max_misses: 10                # ticks of no-observation before a track is dropped
 
+gimbal:
+  # Pan/tilt via Pololu Micro Maestro 6-Channel (Ticket 4).
+  # Port is auto-detected via USB VID=0x1FFB — set `port: COM5` to
+  # force a specific one. When no Maestro is present the manager
+  # still runs but publishes connected=false; GUI greys the dpad.
+  enabled: true
+  port: null                    # null = auto-detect Pololu VID
+  rate_hz: 20                   # command/publish loop rate
+
+  # Home / rest pose. tilt convention: 0° = horizon, +° = up.
+  # Mechanical range is 0..22° tilt, so 11° is the natural middle.
+  home_pan_deg: 0.0
+  home_tilt_deg: 11.0
+
+  # Software safety envelope & slew rate. The mechanical range on
+  # the tilt axis is user-specified as 0..22°; we hard-clamp to it
+  # here so no command (manual or auto-track) can exceed the limits.
+  limits:
+    pan_min_deg: -90.0
+    pan_max_deg:  90.0
+    tilt_min_deg:  0.0
+    tilt_max_deg: 22.0
+    pan_slew_deg_per_s:  120.0
+    tilt_slew_deg_per_s:  60.0
+
+  # Linear angle→µs calibration per servo. These are starting-point
+  # values for a generic 25 kg hobby servo (500..2500 µs full swing).
+  # Run `python -m scripts.gimbal_calibrate` to refine them against
+  # the actual mount, then paste the output back here.
+  pan_calibration:
+    channel: 0
+    min_deg: -90.0
+    max_deg:  90.0
+    us_at_min_deg:  500.0
+    us_at_max_deg: 2500.0
+    invert: false
+  tilt_calibration:
+    channel: 1
+    min_deg:  0.0
+    max_deg: 22.0
+    us_at_min_deg: 1500.0
+    us_at_max_deg: 2000.0
+    invert: false
+
 gui:
   host: 127.0.0.1
   port: 8080

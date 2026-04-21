@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from common.frames import EOFrame, FusedTrack, ThermalFrame
+from common.frames import EOFrame, FusedTrack, GimbalState, ThermalFrame
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
@@ -244,10 +244,9 @@ def build_ws_message(
     tf=None,
     ef=None,
     fused=None,
+    gstate: Optional[GimbalState] = None,
     jpeg_quality: int = 80,
     nir_mode: str = "auto",
-    gimbal_pan: float = 0.0,
-    gimbal_tilt: float = 60.0,
     tracked_target_id: Optional[int] = None,
     top_n: int = 5,
 ) -> Dict[str, Any]:
@@ -274,7 +273,31 @@ def build_ws_message(
                 main_id = int(tracked_target_id)
                 break
 
-    gimbal_mode = "auto" if main_id is not None else "manual"
+    # Gimbal state — prefer the real GimbalManager state published on
+    # the bus. Fall back to a disconnected stub so the GUI never sees
+    # missing fields.
+    if isinstance(gstate, GimbalState):
+        gimbal_payload = {
+            "pan": round(float(gstate.pan_deg), 2),
+            "tilt": round(float(gstate.tilt_deg), 2),
+            "mode": gstate.mode if main_id is None or gstate.mode == "auto" else "auto",
+            "connected": bool(gstate.connected),
+            "tracked_target_id": gstate.tracked_target_id,
+            "target_pan":  round(float(gstate.target_pan_deg), 2),
+            "target_tilt": round(float(gstate.target_tilt_deg), 2),
+            "error": gstate.error,
+        }
+    else:
+        gimbal_payload = {
+            "pan": 0.0,
+            "tilt": 0.0,
+            "mode": "auto" if main_id is not None else "manual",
+            "connected": False,
+            "tracked_target_id": tracked_target_id,
+            "target_pan": 0.0,
+            "target_tilt": 0.0,
+            "error": None,
+        }
 
     return {
         "ts": _time.time(),
@@ -286,11 +309,7 @@ def build_ws_message(
         "top_targets": top_targets,
         "main_target_id": main_id,
         "tracked_target_id": tracked_target_id,
-        "gimbal": {
-            "pan": gimbal_pan,
-            "tilt": gimbal_tilt,
-            "mode": gimbal_mode,
-        },
+        "gimbal": gimbal_payload,
         "illuminator": {
             "state": nir_mode,
             "duty": 0.20 if nir_mode == "auto" else (1.0 if nir_mode == "on" else 0.0),
