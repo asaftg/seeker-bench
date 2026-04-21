@@ -74,14 +74,49 @@ function _clsLabel(cls) {
   return cls.toUpperCase();
 }
 
-function renderTargets(msg) {
+// Fixed 5-slot list: build rows ONCE, then mutate text/classes in place.
+// Rewriting innerHTML at 20Hz would destroy the TRACK button the user
+// is hovering/clicking every 50ms — that's what caused the flicker +
+// missed clicks. Stable DOM nodes = stable hover, stable clicks.
+const SLOTS = 5;
+let _rowNodes = null;   // [{row, id, cls, sensors, conf, angle, btn}, ...]
+
+function _buildRowNodes() {
   const list = $("targets-list");
+  if (!list) return null;
+  list.innerHTML = "";
+  const nodes = [];
+  for (let i = 0; i < SLOTS; i++) {
+    const row = document.createElement("div");
+    row.className = "target-row placeholder";
+    row.innerHTML = `
+      <span class="tr-id">—</span>
+      <span class="tr-cls">—</span>
+      <span class="tr-sensors">—</span>
+      <span class="tr-conf">—</span>
+      <span class="tr-angle mono">—</span>
+      <button class="tr-btn" data-track-id="">TRACK</button>
+    `;
+    list.appendChild(row);
+    nodes.push({
+      row,
+      id:      row.children[0],
+      cls:     row.children[1],
+      sensors: row.children[2],
+      conf:    row.children[3],
+      angle:   row.children[4],
+      btn:     row.children[5],
+    });
+  }
+  return nodes;
+}
+
+function renderTargets(msg) {
   const lockState = $("targets-lock-state");
-  if (!list) return;
+  if (!_rowNodes) _rowNodes = _buildRowNodes();
+  if (!_rowNodes) return;
 
   const top = msg.top_targets || [];
-  // Reconcile local tracked id with backend truth (it drops the lock
-  // if the ID disappears from the fused list).
   const backendTracked = (msg.tracked_target_id != null)
     ? Number(msg.tracked_target_id) : null;
   if (backendTracked !== _trackedTargetId) {
@@ -98,12 +133,27 @@ function renderTargets(msg) {
     }
   }
 
-  if (!top.length) {
-    list.innerHTML = `<div class="targets-empty">no fused targets</div>`;
-    return;
-  }
+  for (let i = 0; i < SLOTS; i++) {
+    const t = top[i] || null;
+    const n = _rowNodes[i];
 
-  const rows = top.map(t => {
+    if (t == null) {
+      // Placeholder — keep row height, hide button, dim.
+      if (n.row.className !== "target-row placeholder") {
+        n.row.className = "target-row placeholder";
+      }
+      n.id.textContent      = "—";
+      n.cls.textContent     = "—";
+      n.cls.style.color     = "";
+      n.sensors.textContent = "—";
+      n.sensors.className   = "tr-sensors";
+      n.conf.textContent    = "—";
+      n.angle.textContent   = "—";
+      n.btn.dataset.trackId = "";
+      // Don't touch btn text/class — visibility:hidden handles it via CSS.
+      continue;
+    }
+
     const cls = t.target_class || "unknown";
     const label = _clsLabel(cls);
     const color = _CLASS_COLORS[cls] || _CLASS_COLORS.unknown;
@@ -112,29 +162,33 @@ function renderTargets(msg) {
     const conf = (t.confidence != null) ? `${(t.confidence * 100) | 0}%` : "—";
     const az = (t.az_deg != null) ? `${t.az_deg.toFixed(1)}°` : "—";
     const el = (t.el_deg != null) ? `${t.el_deg.toFixed(1)}°` : "—";
-    const tracked = (_trackedTargetId != null) && (Number(t.id) === _trackedTargetId);
+    const tracked   = (_trackedTargetId != null) && (Number(t.id) === _trackedTargetId);
     const confirmed = nSensors >= 2;
 
-    return `
-      <div class="target-row ${tracked ? "tracked" : ""} ${confirmed ? "confirmed" : "single"}"
-           data-id="${t.id}">
-        <span class="tr-id">#${t.id}</span>
-        <span class="tr-cls" style="color:${color}">${label}</span>
-        <span class="tr-sensors ${confirmed ? "multi" : "solo"}">${nSensors}× ${sensorsTxt}</span>
-        <span class="tr-conf">${conf}</span>
-        <span class="tr-angle mono">${az}, ${el}</span>
-        <button class="tr-btn ${tracked ? "active" : ""}" data-track-id="${t.id}">
-          ${tracked ? "TRACKING" : "TRACK"}
-        </button>
-      </div>
-    `;
-  }).join("");
+    const rowCls =
+      "target-row" +
+      (tracked   ? " tracked"   : "") +
+      (confirmed ? " confirmed" : " single");
+    if (n.row.className !== rowCls) n.row.className = rowCls;
 
-  list.innerHTML = rows;
-  // NOTE: TRACK button clicks are handled by a single delegated
-  // listener bound ONCE on the list container (see below). Re-binding
-  // per-button here would race the 20Hz innerHTML rewrite — the button
-  // the user clicked on often gets destroyed before its handler fires.
+    n.id.textContent      = `#${t.id}`;
+    n.cls.textContent     = label;
+    n.cls.style.color     = color;
+    n.sensors.textContent = `${nSensors}× ${sensorsTxt}`;
+    const senCls = "tr-sensors " + (confirmed ? "multi" : "solo");
+    if (n.sensors.className !== senCls) n.sensors.className = senCls;
+    n.conf.textContent    = conf;
+    n.angle.textContent   = `${az}, ${el}`;
+
+    // Only update btn state when it actually changed — avoids any
+    // attribute churn while the user is hovering.
+    const wantId   = String(t.id);
+    const wantText = tracked ? "TRACKING" : "TRACK";
+    const wantCls  = "tr-btn" + (tracked ? " active" : "");
+    if (n.btn.dataset.trackId !== wantId) n.btn.dataset.trackId = wantId;
+    if (n.btn.textContent !== wantText)   n.btn.textContent     = wantText;
+    if (n.btn.className   !== wantCls)    n.btn.className       = wantCls;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

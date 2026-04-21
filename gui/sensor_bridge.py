@@ -260,8 +260,12 @@ def build_ws_message(
     import time as _time
     fused_wire = fused_to_wire(fused, tf, ef)
 
-    # Ranked target list — highest score first.
+    # Ranked target list — pick top-N by score, then re-sort by stable
+    # key (fused track id) so rows don't shuffle as scores fluctuate
+    # tick-to-tick. A row that jumps slot 3 → 1 → 2 mid-click is how
+    # the TRACK button "flickers" and loses clicks.
     top_targets = sorted(fused_wire, key=track_score, reverse=True)[: max(0, int(top_n))]
+    top_targets = sorted(top_targets, key=lambda t: int(t.get("id") or 0))
 
     # Main target = user's tracked ID, but ONLY if it's still in the
     # fused list this tick. Otherwise the lock drops (GUI clears the

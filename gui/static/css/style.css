@@ -338,6 +338,26 @@ body {
   background: rgba(255,255,255,0.02);
   border: 1px solid transparent;
   font-size: 12px;
+  min-height: 32px;                     /* pin height so placeholders don't
+                                           collapse thinner than real rows */
+  box-sizing: border-box;
+}
+.target-row.placeholder {
+  opacity: 0.28;
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.06);
+  color: var(--text-3);
+  pointer-events: none;
+}
+.target-row.placeholder .tr-btn {
+  visibility: hidden;                    /* keep layout slot, hide the button */
+}
+.tr-btn-ghost {
+  display: inline-block;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 11px;
+  opacity: 0.5;
 }
 .target-row.confirmed {
   background: rgba(0, 232, 143, 0.06);
