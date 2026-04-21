@@ -96,6 +96,21 @@ class GimbalManager:
         self._home_tilt = home_tilt
         self._rate_hz   = float(gcfg.get("rate_hz", 20.0))
 
+        # Mounting geometry for tracking math.
+        #
+        #   cameras_on_gimbal: true  → cameras move with the gimbal. Fused
+        #     az/el is off-boresight error; command = current + error, so
+        #     as the gimbal rotates the target pixel drifts to center and
+        #     the loop settles.
+        #
+        #   cameras_on_gimbal: false → bench setup: cameras are stationary
+        #     on a tripod, gimbal is a separate rig. Fused az/el is a
+        #     fixed bench-frame angle; command = az/el directly (plus a
+        #     tilt offset so el=0 corresponds to home_tilt). The previous
+        #     formula *integrated* a non-decreasing error every tick and
+        #     slewed straight into the mechanical limits.
+        self._cameras_on_gimbal = bool(gcfg.get("cameras_on_gimbal", False))
+
         # Driver — may or may not actually open.
         self._driver = MaestroDriver(port=port or gcfg.get("port"))
         self._connected = False
@@ -219,13 +234,18 @@ class GimbalManager:
                         trk = t
                         break
             if trk is not None:
-                # Cameras are rigidly mounted on the gimbal, so the
-                # camera boresight angle = current gimbal pan/tilt.
-                # Target az/el is how far off-boresight the target is.
-                # To center: new angle = current + off-boresight error.
                 cur_pan, cur_tilt = self._controller.current
-                sp_pan  = cur_pan  + float(trk.az_deg)
-                sp_tilt = cur_tilt + float(trk.el_deg)
+                if self._cameras_on_gimbal:
+                    # Cameras rotate with the gimbal: az/el is the
+                    # off-boresight error, so command = current + error.
+                    sp_pan  = cur_pan  + float(trk.az_deg)
+                    sp_tilt = cur_tilt + float(trk.el_deg)
+                else:
+                    # Bench setup: cameras stationary. az/el is already
+                    # the absolute bench-frame bearing. Command directly.
+                    # Tilt is offset by home_tilt so el=0 → camera-level.
+                    sp_pan  = self._home_pan  + float(trk.az_deg)
+                    sp_tilt = self._home_tilt + float(trk.el_deg)
                 mode = "auto"
                 self._track_miss = 0
                 # Keep the manual park position synced so that when
