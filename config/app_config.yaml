@@ -172,19 +172,20 @@ gimbal:
   port: null                    # null = auto-detect Pololu VID
   rate_hz: 20                   # command/publish loop rate
 
-  # Home / rest pose. tilt convention: 0° = horizon, +° = up.
-  # Mechanical range is 0..22° tilt, so 11° is the natural middle.
+  # Home / rest pose. tilt convention: lower = horizon-ish,
+  # higher = more up. Mechanical range is 22..90° on this rig,
+  # so 56° is the natural middle.
   home_pan_deg: 0.0
-  home_tilt_deg: 11.0
+  home_tilt_deg: 56.0
 
-  # Software safety envelope & slew rate. The mechanical range on
-  # the tilt axis is user-specified as 0..22°; we hard-clamp to it
-  # here so no command (manual or auto-track) can exceed the limits.
+  # Software safety envelope & slew rate. Mechanical tilt range is
+  # user-specified as 22..90°; we hard-clamp so no command (manual
+  # or auto-track) can exceed it.
   limits:
     pan_min_deg: -90.0
     pan_max_deg:  90.0
-    tilt_min_deg:  0.0
-    tilt_max_deg: 22.0
+    tilt_min_deg: 22.0
+    tilt_max_deg: 90.0
     pan_slew_deg_per_s:  120.0
     tilt_slew_deg_per_s:  60.0
 
@@ -201,10 +202,10 @@ gimbal:
     invert: true        # servo mounted so +pan goes right
   tilt_calibration:
     channel: 1
-    min_deg:  0.0
-    max_deg: 22.0
-    us_at_min_deg: 1500.0
-    us_at_max_deg: 2000.0
+    min_deg: 22.0
+    max_deg: 90.0
+    us_at_min_deg:  500.0   # placeholder — recalibrate with scripts/gimbal_calibrate
+    us_at_max_deg: 2500.0
     invert: true        # servo mounted so +tilt goes up
 
 gui:
