@@ -154,8 +154,28 @@ eo:
     bbox_ema: 0.2
 
 radar:
-  enabled: false                # Phase A: radar disconnected placeholder
-  # real radar params added in Phase B
+  # AWR2944P EVM, firmware: mmw_demoDDM (Doppler-Division MIMO, SDK 4.7.2.1).
+  # See docs/radar_setup.md for setup + flashing details.
+  #
+  # *Two* USB cables to the EVM:
+  #   J10 (FTDI_USB, left)   → COM6-9  — auxiliary FTDI UARTs, unused by us
+  #   J8  (XDS_USB,  right)  → COM10/11 — XDS110 virtual UARTs, WHICH WE USE
+  # MSS_UARTA (CLI/SBL) is routed only to the XDS110, not the FTDI. The
+  # flashing-mode SBL ROM and the functional-mode mmw_demoDDM CLI both live
+  # on COM11; the data UART (TLV stream) is on COM10 at 3_125_000 baud.
+  #
+  # Stock DDM firmware on AWR2944P emits detected-points + side-info TLVs
+  # only; targets are clustered client-side by radar.radar_manager (TI's
+  # Group Tracker is NOT compiled into this build of mmw_demoDDM).
+  enabled: true
+  cli_port: COM11               # CLI UART (115200), pushes .cfg here
+  data_port: COM10              # data UART (3_125_000), TLV stream comes in here
+  cli_baud: 115200
+  data_baud: 3125000            # verified by brute-forcing bauds until magic word aligned
+  cfg_path: "C:/ti/mmwave_mcuplus_sdk_04_07_02_01/ti/demo/awr2x44P/mmw_ddm/profiles/awr2944P/profile_3d_3Azim_1ElevTx_DDMA_awr2944P_highRange.cfg"
+  profile_name: awr2944p_ddm
+  snr_min_db: 12.0              # drop detections below this — kills noise floor
+  max_range_m: 50.0             # match .cfg's profileCfg max range
 
 fusion:
   # Cross-sensor fusion (Ticket 5). Reads Thermal + EO (+ Radar when
@@ -178,11 +198,15 @@ fusion:
 
 gimbal:
   # Pan/tilt via Pololu Micro Maestro 6-Channel (Ticket 4).
-  # Port is auto-detected via USB VID=0x1FFB — set `port: COM5` to
-  # force a specific one. When no Maestro is present the manager
-  # still runs but publishes connected=false; GUI greys the dpad.
+  # Port is auto-detected via USB VID=0x1FFB, BUT: in "USB Dual Port"
+  # serial mode the Maestro exposes TWO COM ports (Command + TTL), and
+  # on this laptop Windows shows them both as plain "USB Serial Device"
+  # with no "Command Port" suffix — so auto-detect can pick the wrong
+  # one and every write silently no-ops (or errors with PermissionError
+  # 13). COM4 was verified as the Command Port via `scripts/gimbal_probe
+  # --sweep`. Leave this pinned; run the probe again if ports shuffle.
   enabled: true
-  port: null                    # null = auto-detect Pololu VID
+  port: COM4                    # Command Port (COM5 on this box is TTL)
   rate_hz: 60                   # command/publish loop rate
 
   # Home / rest pose. tilt convention: lower = horizon-ish,

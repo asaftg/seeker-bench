@@ -27,6 +27,7 @@ from eo.eo_manager import EOManager
 from fusion.fusion_manager import FusionManager
 from gimbal.gimbal_manager import GimbalManager
 from gui.app import create_app
+from radar.radar_manager import RadarManager
 from thermal.thermal_manager import ThermalManager
 
 
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
                         "leave webcams in a flaky state on Windows.")
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
     p.add_argument("--no-gimbal", action="store_true", help="Disable gimbal (Maestro servo controller)")
+    p.add_argument("--no-radar", action="store_true", help="Disable radar (AWR2944P)")
     p.add_argument("--host", default=None, help="GUI bind host")
     p.add_argument("--port", type=int, default=None, help="GUI bind port")
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser")
@@ -131,6 +133,30 @@ def main() -> int:
         fusion = FusionManager()
         fusion.start()
 
+    # Start radar manager — optional. Degrades gracefully if the EVM
+    # is absent (publishes connected=false sentinel; GUI shows DISCONNECTED).
+    radar: RadarManager | None = None
+    radar_cfg = (cfg.get("radar") or {})
+    if not args.no_radar and bool(radar_cfg.get("enabled", False)):
+        try:
+            radar = RadarManager(
+                cli_port=radar_cfg["cli_port"],
+                data_port=radar_cfg["data_port"],
+                cfg_path=radar_cfg["cfg_path"],
+                cli_baud=int(radar_cfg.get("cli_baud", 115200)),
+                data_baud=int(radar_cfg.get("data_baud", 921600)),
+                snr_min_db=float(radar_cfg.get("snr_min_db", 12.0)),
+                max_range_m=float(radar_cfg.get("max_range_m", 50.0)),
+                profile_name=str(radar_cfg.get("profile_name", "awr2944p_ddm")),
+            )
+            radar.start()
+        except KeyError as e:
+            log.warning("Radar config missing key %s — disabling radar", e)
+            radar = None
+        except Exception as e:
+            log.warning("Radar manager failed to start: %s — continuing without radar", e)
+            radar = None
+
     # Start gimbal manager — optional. Degrades gracefully if the
     # Maestro isn't plugged in (publishes connected=false state).
     gimbal: GimbalManager | None = None
@@ -166,6 +192,8 @@ def main() -> int:
             gimbal.stop()
         if fusion is not None:
             fusion.stop()
+        if radar is not None:
+            radar.stop()
         if eo is not None:
             eo.stop()
         if thermal is not None:
@@ -186,6 +214,8 @@ def main() -> int:
             gimbal.stop()
         if fusion is not None:
             fusion.stop()
+        if radar is not None:
+            radar.stop()
         if eo is not None:
             eo.stop()
         if thermal is not None:

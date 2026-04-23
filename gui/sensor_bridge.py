@@ -13,7 +13,8 @@ from typing import Any, Dict, Optional
 
 import cv2
 
-from common.frames import EOFrame, FusedTrack, GimbalState, ThermalFrame
+from common.frame_bus import BUS
+from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalFrame, Topic
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
@@ -100,13 +101,96 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
     }
 
 
-def radar_to_wire() -> Dict[str, Any]:
-    """Phase A stub — radar always disconnected."""
+def radar_to_wire(
+    rf: Optional[RadarFrame] = None,
+    max_points: int = 256,
+) -> Dict[str, Any]:
+    """Serialize a RadarFrame for the WebSocket.
+
+    Called with ``rf=None`` or ``rf.connected=False`` the return value
+    mirrors the Phase A stub shape so the GUI can render DISCONNECTED
+    without any case-specific branches.
+
+    ``max_points`` caps the outgoing point cloud to the top-N-by-SNR
+    entries per frame — mmw_demoDDM can spit several hundred points
+    in a busy scene, and full-resolution would bloat the WS envelope.
+    Targets are always small (tracklets cap near ~10) so they're not
+    capped.
+    """
+    if rf is None or not rf.connected:
+        return {
+            "connected": False,
+            "frame_id": rf.frame_id if rf is not None else 0,
+            "timestamp": rf.timestamp if rf is not None else 0.0,
+            "profile": rf.profile if rf is not None else "awr2944p_ddm",
+            "max_range_m": rf.max_range_m if rf is not None else 50.0,
+            "num_points": 0,
+            "num_targets": 0,
+            "points": [],
+            "targets": [],
+            "detections": [],   # reserved for fusion-labeled output
+        }
+
+    # Top-N-by-SNR point cap. NaN SNR (DDM build without SideInfo TLV)
+    # sorts to the end via a finite sentinel so the cap still works;
+    # the JSON serializer can't emit NaN so we also coerce to 0.0 below.
+    import math as _m
+    def _snr_key(d):
+        s = float(d.snr_db)
+        return -s if not _m.isnan(s) else float("inf")
+    dets = rf.detections
+    if len(dets) > max_points:
+        dets = sorted(dets, key=_snr_key)[:max_points]
+
+    def _safe_snr(v: float) -> float:
+        return 0.0 if _m.isnan(v) else round(v, 1)
+
+    points_wire = [
+        {
+            "x": round(d.x_m, 3),
+            "y": round(d.y_m, 3),
+            "z": round(d.z_m, 3),
+            "v": round(d.doppler_mps, 2),
+            "snr": _safe_snr(float(d.snr_db)),
+            "r": round(d.range_m, 2),
+            "az": round(d.az_deg, 1),
+            "el": round(d.el_deg, 1),
+            "tid": int(d.target_id),
+        }
+        for d in dets
+    ]
+
+    targets_wire = [
+        {
+            "tid": int(t.tid),
+            "x": round(t.pos_x_m, 3),
+            "y": round(t.pos_y_m, 3),
+            "z": round(t.pos_z_m, 3),
+            "vx": round(t.vel_x_mps, 2),
+            "vy": round(t.vel_y_mps, 2),
+            "vz": round(t.vel_z_mps, 2),
+            "sx": round(t.size_x_m, 2),
+            "sy": round(t.size_y_m, 2),
+            "sz": round(t.size_z_m, 2),
+            "conf": round(float(t.confidence), 2),
+            "src": t.source,
+            "np": int(t.num_points),
+            "class": "radar_detection",
+        }
+        for t in rf.targets
+    ]
+
     return {
-        "connected": False,
-        "points": [],
+        "connected": True,
+        "frame_id": rf.frame_id,
+        "timestamp": rf.timestamp,
+        "profile": rf.profile,
+        "max_range_m": rf.max_range_m,
+        "num_points": int(rf.num_points),
+        "num_targets": int(rf.num_targets),
+        "points": points_wire,
+        "targets": targets_wire,
         "detections": [],
-        "profile": "automotive_default",
     }
 
 
@@ -326,7 +410,7 @@ def build_ws_message(
         "ts": time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
         "eo": eo_to_wire(ef, jpeg_quality=jpeg_quality),
-        "radar": radar_to_wire(),
+        "radar": radar_to_wire(BUS.get_latest(Topic.RADAR)),
         "fused": fused_wire,
         "tracks": [],
         "top_targets": top_targets,

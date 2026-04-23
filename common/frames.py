@@ -194,16 +194,88 @@ class FusedTrack:
 
 
 # ───────────────────────────────────────────────────────────────
-# Radar frames (Phase A: stub shape only, real fields added in Phase B)
+# Radar frames (AWR2944P mmw_demoDDM — Ticket 5a)
 # ───────────────────────────────────────────────────────────────
 
 @dataclass
+class RadarDetection:
+    """A single pre-detected point from the AWR2944P point cloud.
+
+    Coordinates are in the sensor frame (metres):
+        +x = right, +y = forward (boresight), +z = up.
+    Doppler is signed: positive = approaching the sensor.
+
+    range_m / az_deg / el_deg are filled in by the parser from (x,y,z)
+    so the GUI / fusion never has to redo that trig.
+
+    ``target_id`` is the DBSCAN cluster ID this point was assigned to
+    by RadarManager (or 255 = unassigned / noise). Not a firmware
+    Group-Tracker ID — the AWR2944P mmw_demoDDM build does not link
+    gtrack.
+    """
+    x_m: float
+    y_m: float
+    z_m: float
+    doppler_mps: float
+    snr_db: float
+    noise_db: float = 0.0
+    range_m: float = 0.0
+    az_deg: float = 0.0
+    el_deg: float = 0.0
+    target_id: int = 255
+
+
+@dataclass
+class RadarTarget:
+    """A clustered radar target — rendered as a bounding box.
+
+    All targets from this pipeline carry the single semantic class
+    ``"radar_detection"`` (see project memory / Ticket 5a design).
+    Vehicle / human classification is a late-fusion job against the
+    EO + thermal panels, not radar-side.
+
+    Size fields are bbox half-extents in metres (the full box spans
+    pos ± size on each axis).
+
+    ``source`` distinguishes where the box came from — currently
+    always ``"dbscan"`` on this firmware build; reserved for
+    ``"tracker"`` once/if a gtrack-linked firmware arrives.
+    """
+    tid: int
+    pos_x_m: float
+    pos_y_m: float
+    pos_z_m: float
+    vel_x_mps: float
+    vel_y_mps: float
+    vel_z_mps: float
+    size_x_m: float = 0.5
+    size_y_m: float = 0.5
+    size_z_m: float = 0.5
+    confidence: float = 1.0
+    source: str = "dbscan"
+    num_points: int = 0
+
+
+@dataclass
 class RadarFrame:
+    """A parsed mmw_demo frame published on the bus.
+
+    ``connected=False`` is the sentinel "radar is gone" frame used by
+    the GUI to flip the radar panel to DISCONNECTED — matches the
+    ThermalFrame / EOFrame convention.
+    """
     timestamp: float
     frame_id: int
     connected: bool
-    # populated in Phase B:
-    detections: list = field(default_factory=list)
+    detections: List["RadarDetection"] = field(default_factory=list)
+    targets: List["RadarTarget"] = field(default_factory=list)
+    profile: str = ""
+    num_points: int = 0
+    num_targets: int = 0
+    # Max range used by the firmware profile — the GUI scales the
+    # polar canvas by this. Defaults to 50 m (stock DDM highRange
+    # profile range limit).
+    max_range_m: float = 50.0
 
 
 # ───────────────────────────────────────────────────────────────
