@@ -189,7 +189,7 @@ gimbal:
   # higher = more up. Mechanical range is 22..90° on this rig,
   # so 56° is the natural middle.
   home_pan_deg: 0.0
-  home_tilt_deg: 56.0
+  home_tilt_deg: 22.0   # minimum pitch — ground targets live here
 
   # Are the cameras rigidly mounted on the gimbal, or stationary next
   # to it on the bench?
