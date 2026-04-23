@@ -357,12 +357,32 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                         except (TypeError, ValueError):
                             log.warning("synthetic_target: non-int bbox %r", bbox)
                             continue
-                        tm_ref.seed_synthetic_target(x, y, w, h)
+                        tid = tm_ref.seed_synthetic_target(x, y, w, h)
+                        # Auto-lock the gimbal onto the synthetic target.
+                        # A user-drawn box is an explicit "track this" gesture
+                        # — requiring a second click on a TRACK button would
+                        # be redundant and, worse, the synthetic track may
+                        # not even appear in the fused TARGETS list that
+                        # owns the TRACK buttons. Routing through the heat-
+                        # track path works because `_resolve_heat_track`
+                        # reads from `tf.heat_tracks`, which already
+                        # includes synthetic tracks.
+                        if tid is not None and gm is not None:
+                            state["tracked_heat_id"] = int(tid)
+                            state["tracked_target_id"] = None
+                            gm.set_track_heat(int(tid))
+                            log.info("Gimbal auto-locked on synthetic target id=%d", tid)
 
                 elif cmd.get("type") == "clear_synthetic_target" or command == "clear_synthetic_target":
                     tm_ref = app.state.thermal_manager
                     if tm_ref is not None:
                         tm_ref.clear_synthetic_target()
+                    # Drop any gimbal lock on the synthetic so we don't
+                    # keep chasing a phantom ID after the user cleared it.
+                    if state["tracked_heat_id"] is not None:
+                        state["tracked_heat_id"] = None
+                        if gm is not None:
+                            gm.set_track_heat(None)
 
                 elif command == "nir":
                     mode = str(cmd.get("mode", "auto")).lower()

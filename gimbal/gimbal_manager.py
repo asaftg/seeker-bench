@@ -242,6 +242,19 @@ class GimbalManager:
         self._deadband_deg   = float(gcfg.get("deadband_deg", 2.5))
         self._max_step_deg   = float(gcfg.get("max_step_deg", 2.0))
 
+        # Error-signal low-pass: hot targets like vehicles don't have a
+        # single crisp centroid. Headlights, grille, engine bay, wheel
+        # wells all flicker as separate blobs that merge and split frame
+        # to frame; the resulting bbox centroid can jitter several
+        # degrees of off-boresight angle. Feeding that raw into the
+        # controller multiplies the jitter by kp and pumps the servo.
+        # A first-order IIR on (az, el) with alpha ~0.35 smooths
+        # high-frequency centroid noise while still reacting in ~3–4
+        # frames to real target motion. Zero disables filtering.
+        self._err_lp_alpha   = float(gcfg.get("err_lp_alpha", 0.35))
+        self._err_lp_az: Optional[float] = None
+        self._err_lp_el: Optional[float] = None
+
         # Sticky deadband: once inside the band, require the error to
         # exceed a LARGER threshold before re-engaging. This is a
         # Schmitt-trigger-style hysteresis that prevents the edge case
@@ -392,6 +405,29 @@ class GimbalManager:
                 except (TypeError, ValueError):
                     log.warning("Bad heat_id: %r", heat_id)
 
+    def _lp_filter_error(self, az: float, el: float) -> tuple[float, float]:
+        """First-order IIR low-pass on the (az, el) error signal.
+
+        Seeds on first call so we don't slam from 0 toward a large
+        initial error. Returns the filtered (az, el) pair.
+        """
+        a = self._err_lp_alpha
+        if a <= 0.0:
+            return az, el
+        if self._err_lp_az is None:
+            self._err_lp_az = az
+            self._err_lp_el = el
+        else:
+            self._err_lp_az = (1.0 - a) * self._err_lp_az + a * az
+            self._err_lp_el = (1.0 - a) * self._err_lp_el + a * el
+        return self._err_lp_az, self._err_lp_el
+
+    def _reset_track_filter(self) -> None:
+        """Clear the low-pass state so the next track acquisition starts
+        clean and doesn't drag a stale error from the previous target."""
+        self._err_lp_az = None
+        self._err_lp_el = None
+
     # ── main loop ─────────────────────────────────────────────
 
     def _run(self) -> None:
@@ -445,8 +481,14 @@ class GimbalManager:
                 cur_pan, cur_tilt = self._controller.current
                 if fresh_frame or self._last_sp_pan is None:
                     if self._cameras_on_gimbal:
+                        # First-order low-pass on the raw error before
+                        # deadband + gain. Smooths centroid jitter on
+                        # multi-patch targets (vehicles, humans) without
+                        # adding meaningful lag for real motion.
+                        az_in, el_in = self._lp_filter_error(
+                            float(heat_obs.az_deg), float(heat_obs.el_deg))
                         az, el, self._in_deadband = _hyst_deadband(
-                            float(heat_obs.az_deg), float(heat_obs.el_deg),
+                            az_in, el_in,
                             self._deadband_deg, self._deadband_exit_ratio,
                             self._in_deadband)
                         d_pan  = _clip(self._kp_track * az, self._max_step_deg)
@@ -505,8 +547,10 @@ class GimbalManager:
                 cur_pan, cur_tilt = self._controller.current
                 if fresh_frame or self._last_sp_pan is None:
                     if self._cameras_on_gimbal:
+                        az_in, el_in = self._lp_filter_error(
+                            float(trk.az_deg), float(trk.el_deg))
                         az, el, self._in_deadband = _hyst_deadband(
-                            float(trk.az_deg), float(trk.el_deg),
+                            az_in, el_in,
                             self._deadband_deg, self._deadband_exit_ratio,
                             self._in_deadband)
                         d_pan  = _clip(self._kp_track * az, self._max_step_deg)
@@ -569,6 +613,8 @@ class GimbalManager:
             self._last_sp_pan   = None
             self._last_sp_tilt  = None
             self._in_deadband   = False
+            self._reset_track_filter()
+            self._tilt_saturated_logged = False
 
         # Slew + clamp
         cmd_pan, cmd_tilt = self._controller.step(sp_pan, sp_tilt)
