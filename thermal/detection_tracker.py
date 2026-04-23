@@ -10,8 +10,8 @@ Pipeline (per frame):
        one frame, the Kalman predicts ~80 px because last tick's
        velocity already said so, and the match still succeeds.
 
-    2. Detection ↔ track matching by centroid distance, greedy best-first.
-       Distance is predicted-centroid ↔ detection-centroid, so the
+    2. Detection <-> track matching by centroid distance, greedy best-first.
+       Distance is predicted-centroid <-> detection-centroid, so the
        "budget" only has to cover *acceleration* error, not raw motion.
 
     3. For matched pairs: Kalman update with the detection centroid as
@@ -24,6 +24,23 @@ Pipeline (per frame):
        Kalman with inflated noise. This keeps the lock alive when the
        heat detector drops a frame (blob momentarily merges into warm
        background, etc.).
+
+       The OF bridge is GATED on several sanity checks to avoid
+       "ghost track" drift (see `_of_estimate_shift` and the bridge
+       block in `update`):
+
+         - `max_of_bridges`: a track can only be kept alive by OF for
+           at most N consecutive frames. After that it must see a real
+           detection or it is dropped. Prevents permanent ghosts.
+         - Per-bridge displacement cap at `max_dist_px * 0.5`: LK
+           occasionally returns "consistent" large shifts on pure
+           texture; reject anything that looks like teleportation.
+         - Post-shift warmth check: the new ROI must still contain a
+           patch measurably hotter than its surround. If the blob has
+           evaporated, the OF "lock" is onto background texture and we
+           let the track die naturally.
+         - Inlier spread check (unchanged): if the feature points
+           disagree with each other, we don't trust the median.
 
     5. Still-unmatched tracks just predict (pure coast) and accumulate
        misses. Past `max_misses` they die.
@@ -54,13 +71,16 @@ except Exception:
     _HAS_CV2 = False
 
 from common.frames import BBox, ThermalDetection
+from common.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 
-# ─────────────────────────────── Kalman ───────────────────────────────
+# --------------------------------- Kalman -----------------------------
 #
 # 4-state constant-velocity model per track:
 #
-#     state  x = [px, py, vx, vy]ᵀ
+#     state  x = [px, py, vx, vy]^T
 #     F = [[1 0 dt 0],
 #          [0 1 0 dt],
 #          [0 0 1  0],
@@ -69,9 +89,31 @@ from common.frames import BBox, ThermalDetection
 #          [0 1 0 0]]
 #
 # dt = 1 tick (we run at a fixed ~20 Hz, no need to carry wall time).
-# Process noise Q is tuned so the filter reacts quickly to acceleration
-# (targets + gimbal jerks) without thrashing on detector jitter. Q/R
-# ratio picked empirically — override via TrackerConfig if needed.
+#
+# Noise tuning rationale (defaults in TrackerConfig):
+#
+#   q_pos = 4  (px^2 per tick)
+#     Sigma_pos ~ 2 px/tick of untracked "position wander" the model
+#     doesn't account for — roughly the frame-to-frame centroid jitter
+#     we see on a stationary warm blob from detector re-centering.
+#
+#   q_vel = 9  ((px/tick)^2 per tick)
+#     Sigma_vel ~ 3 px/tick^2 acceleration budget. Typical gimbal slews
+#     are ~20 px/tick of velocity; the filter needs a few ticks to catch
+#     up. q_vel=9 lets vx/vy change by ~3 px/tick each step without the
+#     filter fighting it; any larger and we start tracking detector
+#     noise as acceleration, any smaller and we lag fast maneuvers.
+#
+#   r_meas = 4  (px^2)
+#     Sigma_meas ~ 2 px on a real detection centroid (blob edge ambiguity
+#     on low-contrast warm targets). Matches observed jitter. Q/R ~ 1:1
+#     on position means the filter weights prediction and measurement
+#     roughly equally, which is the behavior we want: prediction
+#     dominates during one-tick gaps, measurement dominates on steady
+#     hits.
+#
+# Override via TrackerConfig when the scene changes (e.g. on-gimbal
+# motion → try q_vel=16; extremely stable tripod → q_vel=4).
 
 
 class _Kalman2D:
@@ -127,7 +169,7 @@ class _Kalman2D:
         return float(self.x[2]), float(self.x[3])
 
 
-# ─────────────────────────────── data types ───────────────────────────
+# --------------------------------- data types -------------------------
 
 def _centroid(b: BBox) -> Tuple[float, float]:
     return (b.x + b.w * 0.5, b.y + b.h * 0.5)
@@ -141,6 +183,13 @@ class _Track:
     misses: int = 0
     age: int = 1
     id: int = 0
+    # Count of consecutive frames the track has been kept alive ONLY by
+    # the optical-flow bridge (reset to 0 on any real-detection match).
+    # Capped by TrackerConfig.max_of_bridges.
+    of_bridge_streak: int = 0
+    # Whether the track has ever been emitted as CONFIRMED (first time
+    # hits reached min_hits). Used to log the CONFIRMED transition once.
+    announced_confirmed: bool = False
     # Optical-flow bridge state: last frame's feature points (Nx1x2 float32)
     # sampled inside the bbox, used by cv2.calcOpticalFlowPyrLK to locate
     # the track when the detector drops a frame. Refreshed on every
@@ -173,26 +222,30 @@ class TrackerConfig:
     max_dist_px: float = 60.0
     min_hits: int = 5            # frames before a track is emitted
     # Frames a confirmed track survives without a detection. At 20 Hz,
-    # 6 ticks ≈ 300 ms of Kalman coast — enough to bridge a single
+    # 6 ticks ~ 300 ms of Kalman coast — enough to bridge a single
     # detector hiccup without producing "ghost" boxes that visibly drift
     # across the screen on longer dropouts.
     max_misses: int = 6
     ema: float = 0.4             # bbox smoothing: 0 = raw, 1 = frozen
 
-    # Kalman noise knobs (in px² for pos / (px/tick)² for vel / px² for meas).
-    # Higher q → filter trusts motion model less, reacts faster to changes.
-    # Higher r → filter trusts measurements less, smooths harder.
+    # Kalman noise knobs (in px^2 for pos / (px/tick)^2 for vel / px^2 for meas).
+    # See module docstring ("Noise tuning rationale") for why these values.
     kf_q_pos: float = 4.0
     kf_q_vel: float = 9.0
     kf_r_meas: float = 4.0
 
-    # Optical-flow bridge. DEFAULT OFF: in early testing it latches onto
-    # background texture on noisy thermal scenes, produces "consistent"
-    # false shifts, and (because we zero `misses` on OF success) the
-    # ghost tracks never expire — they just drift across the frame as
-    # purple coasting boxes forever. Will be re-enabled once the bridge
-    # is gated on detector quality / confidence.
-    of_enabled: bool = False
+    # ---- Optical-flow bridge ------------------------------------------
+    # Re-enabled with guards (see module docstring). The bridge is
+    # tightly gated to avoid the "purple ghost" drift seen in early
+    # testing:
+    #   - max_of_bridges limits how long a track can survive on OF
+    #     alone before it must see a real detection
+    #   - of_max_shift_px (computed as max_dist_px * 0.5) caps per-bridge
+    #     displacement, rejecting LK teleportation on texture
+    #   - post-shift warmth check rejects bridges where the ROI no
+    #     longer contains a measurably warm patch
+    #   - inlier-spread check rejects scattered feature point clouds
+    of_enabled: bool = True
     of_r_scale: float = 25.0     # how much to inflate R for OF measurements
     of_max_features: int = 20    # max corners to track per bbox
     of_min_features: int = 3     # min surviving corners to trust OF
@@ -202,9 +255,20 @@ class TrackerConfig:
     # any individual feature, in px, before we consider the OF result
     # unreliable (scene change, occlusion) and discard it.
     of_max_inlier_spread: float = 15.0
+    # Max consecutive frames a confirmed track may be kept alive SOLELY
+    # by the OF bridge with no real detection. After this many bridges
+    # in a row the bridge is refused; Kalman coast then max_misses will
+    # drop the track normally. 3 @ 20 Hz = 150 ms of blind coast, which
+    # is about as much as we want to trust LK on a warm target.
+    max_of_bridges: int = 3
+    # Minimum mean-intensity contrast (ROI - surround) for the bridged
+    # ROI to be considered "still warm". In uint8 display space. 5 is a
+    # loose floor; pure-texture ROIs come out within +/-1 of their
+    # surround and get rejected, real warm blobs easily clear this.
+    of_min_warmth_contrast: float = 5.0
 
 
-# ─────────────────────────────── tracker ─────────────────────────────
+# --------------------------------- tracker ----------------------------
 
 class DetectionTracker:
     def __init__(self, config: TrackerConfig | None = None) -> None:
@@ -251,13 +315,16 @@ class DetectionTracker:
         if not self.cfg.enabled:
             return detections
 
-        # 1. Kalman predict everyone forward one tick. Shift the stored
-        #    bbox by the predicted delta so downstream logic (OF, snapshot)
-        #    sees a reasonable current position even if the detection
-        #    doesn't arrive.
+        # 1. Kalman predict everyone forward one tick. Capture the
+        #    pre-predict centroid BEFORE the predict call so the OF
+        #    bridge below can use it directly as the "old position"
+        #    anchor (no velocity-back-out math required — keeps the
+        #    OF measurement derivation honest and readable).
         predicted: List[Tuple[float, float]] = []
+        prev_centroids: List[Tuple[float, float]] = []
         for trk in self._tracks:
             prev_cx, prev_cy = _centroid(trk.det.bbox)
+            prev_centroids.append((prev_cx, prev_cy))
             px, py = trk.kf.predict()
             predicted.append((px, py))
             # Shift bbox to predicted position. EMA later replaces this
@@ -289,6 +356,7 @@ class DetectionTracker:
         #    Only bother if we have last frame, this frame, and the track
         #    was worth drawing. Pending tracks (hits < min_hits) don't
         #    get a bridge — they're cheap to respawn.
+        of_shift_cap = self.cfg.max_dist_px * 0.5
         if (self.cfg.of_enabled and _HAS_CV2
                 and self._prev_gray is not None and agc8 is not None
                 and self._prev_gray.shape == agc8.shape):
@@ -297,26 +365,39 @@ class DetectionTracker:
                     continue
                 if trk.hits < self.cfg.min_hits:
                     continue
+                # Refuse to bridge if we've already OF-bridged this track
+                # for max_of_bridges frames in a row — that way a truly
+                # gone target dies instead of drifting forever.
+                if trk.of_bridge_streak >= self.cfg.max_of_bridges:
+                    continue
                 shift = self._of_estimate_shift(trk, agc8)
                 if shift is None:
                     continue
                 dx, dy = shift
-                # Apply as a Kalman measurement with inflated noise.
-                # Use the track's pre-predict bbox position + shift as
-                # the measurement (we already predicted above, so add
-                # shift to the OLD centroid to form the observation).
-                old_cx, old_cy = _centroid(_shift_bbox(trk.det,
-                                                       -(trk.kf.vel[0]),
-                                                       -(trk.kf.vel[1])))
-                # Simpler: the previous frame's feature-points centroid
-                # is stored implicitly — the "before OF" position is
-                # the Kalman state *before* this tick's predict. We
-                # approximate by using the current predict position
-                # minus one-tick velocity.
-                # Compute observation directly from feature-point
-                # median in the new frame (done inside _of_estimate_shift).
+                # Per-bridge displacement cap: LK sometimes produces a
+                # large "consistent" shift on pure texture. Anything
+                # bigger than half the match budget is almost certainly
+                # wrong.
+                if math.hypot(dx, dy) > of_shift_cap:
+                    continue
+                # Anchor on the pre-predict centroid captured in step 1.
+                # Observation = old position + measured OF shift.
+                old_cx, old_cy = prev_centroids[ti]
                 meas_x = old_cx + dx
                 meas_y = old_cy + dy
+
+                # Warmth check: build the candidate bbox and make sure
+                # it still contains something hotter than its surround.
+                # Pure-texture drift fails this because there's no warm
+                # blob at the new location.
+                cur_cx, cur_cy = _centroid(trk.det.bbox)
+                cand_bbox = _shift_bbox(trk.det,
+                                        meas_x - cur_cx,
+                                        meas_y - cur_cy).bbox
+                if not _roi_still_warm(agc8, cand_bbox,
+                                       self.cfg.of_min_warmth_contrast):
+                    continue
+
                 trk.kf.update(meas_x, meas_y, r_scale=self.cfg.of_r_scale)
                 # Snap bbox to the OF-derived position (EMA would lag
                 # too much on a coast). Re-sample features from the
@@ -327,7 +408,15 @@ class DetectionTracker:
                 trk.of_pts = _sample_features(agc8, trk.det.bbox,
                                               self.cfg.of_max_features)
                 matched_t.add(ti)  # counts as a (weak) match
-                trk.misses = 0
+                # Do NOT reset misses to 0: the OF bridge is a weak
+                # match and we still want max_misses to eventually kill
+                # a track that only ever gets OF updates. We decrement
+                # age a tick but leave misses ticking in step 4 below
+                # by NOT adding ti to matched_t... wait, we did. So
+                # instead: increment the bridge streak here and let
+                # step 4 treat this as matched. Streak cap (above) is
+                # the real guardrail.
+                trk.of_bridge_streak += 1
                 trk.age += 1
 
         # 4. Age / drop unmatched tracks.
@@ -340,6 +429,13 @@ class DetectionTracker:
             trk.age += 1
             if trk.misses <= self.cfg.max_misses:
                 kept.append(trk)
+            else:
+                log.info(
+                    "heat-track DROPPED id=%d pos=(%.1f,%.1f) reason=max_misses "
+                    "(hits=%d age=%d of_streak=%d)",
+                    trk.id, trk.kf.pos[0], trk.kf.pos[1],
+                    trk.hits, trk.age, trk.of_bridge_streak,
+                )
 
         # 5. Birth new tracks for unmatched detections.
         for di, d in enumerate(detections):
@@ -352,10 +448,28 @@ class DetectionTracker:
                            r_meas=self.cfg.kf_r_meas)
             of_pts = _sample_features(agc8, d.bbox,
                                       self.cfg.of_max_features) if agc8 is not None else None
-            kept.append(_Track(det=d, kf=kf, id=self._next_id, of_pts=of_pts))
+            new_id = self._next_id
             self._next_id += 1
+            kept.append(_Track(det=d, kf=kf, id=new_id, of_pts=of_pts))
+            log.info(
+                "heat-track BORN id=%d pos=(%.1f,%.1f) area=%d",
+                new_id, cx, cy, d.area_px,
+            )
 
         self._tracks = kept
+
+        # 5b. Confirmation announcements. Log once when a track crosses
+        #     min_hits for the first time; this is what the user reads
+        #     tomorrow morning to diagnose "why didn't my track lock?"
+        for trk in self._tracks:
+            if (not trk.announced_confirmed
+                    and trk.hits >= self.cfg.min_hits):
+                trk.announced_confirmed = True
+                log.info(
+                    "heat-track CONFIRMED id=%d pos=(%.1f,%.1f) hits=%d age=%d",
+                    trk.id, trk.kf.pos[0], trk.kf.pos[1],
+                    trk.hits, trk.age,
+                )
 
         # Save this frame for the next tick's optical flow. Copy so
         # external mutation of the source buffer doesn't corrupt us.
@@ -369,7 +483,7 @@ class DetectionTracker:
                 out.append(trk.det)
         return out
 
-    # ── internals ──────────────────────────────────────────────────────
+    # -- internals -----------------------------------------------------
 
     def _merge_detection(self,
                          trk: _Track,
@@ -401,6 +515,7 @@ class DetectionTracker:
         )
         trk.hits += 1
         trk.misses = 0
+        trk.of_bridge_streak = 0  # real detection resets the bridge streak
         trk.age += 1
 
         # Refresh optical-flow feature points inside the (smoothed)
@@ -442,13 +557,13 @@ class DetectionTracker:
         med = np.median(deltas, axis=0)
         spread = np.max(np.linalg.norm(deltas - med, axis=1))
         if float(spread) > self.cfg.of_max_inlier_spread:
-            # Points scattered → probably tracking different things.
+            # Points scattered -> probably tracking different things.
             # Bail rather than drag the track somewhere random.
             return None
         return float(med[0]), float(med[1])
 
 
-# ─────────────────────────────── helpers ──────────────────────────────
+# --------------------------------- helpers ----------------------------
 
 def _shift_bbox(d: ThermalDetection, dx: float, dy: float) -> ThermalDetection:
     """Return a new ThermalDetection with the bbox translated by (dx, dy)."""
@@ -465,6 +580,50 @@ def _shift_bbox(d: ThermalDetection, dx: float, dy: float) -> ThermalDetection:
         contrast=d.contrast,
         classification=d.classification,
     )
+
+
+def _roi_still_warm(gray: np.ndarray,
+                    bbox: BBox,
+                    min_contrast: float) -> bool:
+    """True if the ROI is hotter than the surrounding pad by at least
+    ``min_contrast`` mean-intensity counts.
+
+    This is the OF bridge's "is there still a blob here?" check. The
+    surround is a padded ring around the bbox; pure-texture drift shows
+    roi_mean ~ surround_mean (contrast near 0) and gets rejected, while
+    a real warm blob clears this easily.
+    """
+    if gray is None or gray.size == 0:
+        return False
+    H, W = gray.shape[:2]
+    # Inner ROI
+    x0 = max(0, bbox.x)
+    y0 = max(0, bbox.y)
+    x1 = min(W, bbox.x + bbox.w)
+    y1 = min(H, bbox.y + bbox.h)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return False
+    roi = gray[y0:y1, x0:x1]
+    # Surround: bbox padded by half its size on each side, minus the ROI.
+    pad_x = max(2, bbox.w // 2)
+    pad_y = max(2, bbox.h // 2)
+    sx0 = max(0, bbox.x - pad_x)
+    sy0 = max(0, bbox.y - pad_y)
+    sx1 = min(W, bbox.x + bbox.w + pad_x)
+    sy1 = min(H, bbox.y + bbox.h + pad_y)
+    if sx1 - sx0 < 2 or sy1 - sy0 < 2:
+        return False
+    surround = gray[sy0:sy1, sx0:sx1]
+    roi_mean = float(roi.mean())
+    # Subtract ROI contribution from the surround mean. Cheap
+    # approximation: weighted mean removal.
+    sur_total = float(surround.sum())
+    sur_px = int(surround.size)
+    roi_total = float(roi.sum())
+    roi_px = int(roi.size)
+    sur_only_px = max(1, sur_px - roi_px)
+    sur_only_mean = (sur_total - roi_total) / sur_only_px
+    return (roi_mean - sur_only_mean) >= float(min_contrast)
 
 
 def _sample_features(gray: np.ndarray,

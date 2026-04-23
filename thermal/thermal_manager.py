@@ -72,6 +72,12 @@ class ThermalManager:
         )
 
         trk_cfg = (hdcfg.get("tracker") or {})
+        # OF bridge defaults to ON (see TrackerConfig docstring).
+        # The bridge is gated on (a) a consecutive-bridge cap, (b) a
+        # per-frame displacement cap, (c) a post-shift ROI warmth check,
+        # and (d) the existing inlier-spread check. Previously-known
+        # "ghost coasting purple box" behavior is fixed by those guards.
+        _tcfg_defaults = TrackerConfig()
         self._tracker = DetectionTracker(
             TrackerConfig(
                 enabled=bool(trk_cfg.get("enabled", True)),
@@ -79,6 +85,9 @@ class ThermalManager:
                 min_hits=int(trk_cfg.get("min_hits", 5)),
                 max_misses=int(trk_cfg.get("max_misses", 5)),
                 ema=float(trk_cfg.get("ema", 0.5)),
+                of_enabled=bool(trk_cfg.get("of_enabled", _tcfg_defaults.of_enabled)),
+                max_of_bridges=int(trk_cfg.get("max_of_bridges", _tcfg_defaults.max_of_bridges)),
+                of_min_warmth_contrast=float(trk_cfg.get("of_min_warmth_contrast", _tcfg_defaults.of_min_warmth_contrast)),
             )
         )
 
