@@ -195,6 +195,11 @@ class _Track:
     # the track when the detector drops a frame. Refreshed on every
     # real-detection match.
     of_pts: Optional[np.ndarray] = field(default=None, repr=False)
+    # Track is born from a user "Draw Target" bbox rather than a heat
+    # detection. Propagates purely via optical flow — no warmth check,
+    # no streak / misses accounting (never needs a real detection), no
+    # classifier pass. Lives until user clears or OF loses lock entirely.
+    synthetic: bool = False
 
 
 @dataclass
@@ -210,6 +215,7 @@ class HeatTrackSnapshot:
     age: int
     confirmed: bool       # hits >= min_hits (would be drawn as a box)
     coasting: bool        # misses > 0 (not matched this tick)
+    synthetic: bool = False  # user-drawn "Draw Target" seed
 
 
 @dataclass
@@ -296,10 +302,87 @@ class DetectionTracker:
                 hits=trk.hits,
                 misses=trk.misses,
                 age=trk.age,
-                confirmed=(trk.hits >= self.cfg.min_hits),
+                # Synthetic tracks are confirmed from birth so the GUI
+                # renders the USER TARGET overlay immediately.
+                confirmed=trk.synthetic or (trk.hits >= self.cfg.min_hits),
                 coasting=(trk.misses > 0),
+                synthetic=trk.synthetic,
             ))
         return out
+
+    # ------------------------------------------------------------------
+    # Synthetic "Draw Target" tracks
+    # ------------------------------------------------------------------
+    def seed_synthetic(self,
+                       bbox: BBox,
+                       agc8: Optional[np.ndarray] = None,
+                       ) -> Optional[int]:
+        """Seed a user-drawn bbox as a synthetic track.
+
+        The track is born CONFIRMED (hits = min_hits), carries
+        ``synthetic=True`` on both the _Track and its ThermalDetection,
+        and will propagate via optical flow only. Any previously-seeded
+        synthetic track is replaced — one user target at a time.
+
+        Returns the new track's internal ID, or None if the bbox is
+        degenerate.
+        """
+        if bbox.w < 2 or bbox.h < 2:
+            return None
+        # Only one synthetic target at a time — replace any existing one.
+        self._tracks = [t for t in self._tracks if not t.synthetic]
+
+        cx = bbox.x + bbox.w * 0.5
+        cy = bbox.y + bbox.h * 0.5
+        kf = _Kalman2D(cx, cy,
+                       q_pos=self.cfg.kf_q_pos,
+                       q_vel=self.cfg.kf_q_vel,
+                       r_meas=self.cfg.kf_r_meas)
+        from common.frames import ClassificationResult, TargetClass
+        det = ThermalDetection(
+            bbox=BBox(x=int(bbox.x), y=int(bbox.y),
+                      w=int(bbox.w), h=int(bbox.h)),
+            area_px=int(bbox.w * bbox.h),
+            contrast=0.0,
+            classification=ClassificationResult(
+                target_class=TargetClass.UNKNOWN,
+                confidence=1.0,
+                classifier_used="user",
+            ),
+            synthetic=True,
+        )
+        of_pts = None
+        if agc8 is not None and _HAS_CV2:
+            of_pts = _sample_features(agc8, det.bbox, self.cfg.of_max_features)
+        new_id = self._next_id
+        self._next_id += 1
+        trk = _Track(
+            det=det,
+            kf=kf,
+            hits=max(1, self.cfg.min_hits),  # confirmed from birth
+            id=new_id,
+            of_pts=of_pts,
+            synthetic=True,
+            announced_confirmed=True,
+        )
+        self._tracks.append(trk)
+        log.info(
+            "synthetic-track BORN id=%d bbox=(%d,%d,%d,%d)",
+            new_id, bbox.x, bbox.y, bbox.w, bbox.h,
+        )
+        return new_id
+
+    def clear_synthetic(self) -> int:
+        """Remove all synthetic tracks. Returns the count removed."""
+        before = len(self._tracks)
+        self._tracks = [t for t in self._tracks if not t.synthetic]
+        removed = before - len(self._tracks)
+        if removed:
+            log.info("synthetic-track CLEARED (%d removed)", removed)
+        return removed
+
+    def has_synthetic(self) -> bool:
+        return any(t.synthetic for t in self._tracks)
 
     def update(self,
                detections: List[ThermalDetection],
@@ -334,8 +417,13 @@ class DetectionTracker:
             trk.det = _shift_bbox(trk.det, dx, dy)
 
         # 2. Match detections to predicted positions, greedy best-first.
+        #    Synthetic (user-drawn) tracks are excluded from detection
+        #    matching — they live on OF alone and are never re-bound to a
+        #    heat blob that happens to wander under them.
         candidates: list[tuple[float, int, int]] = []
         for ti, (px, py) in enumerate(predicted):
+            if self._tracks[ti].synthetic:
+                continue
             for di, d in enumerate(detections):
                 dcx, dcy = _centroid(d.bbox)
                 dist = math.hypot(px - dcx, py - dcy)
@@ -363,12 +451,17 @@ class DetectionTracker:
             for ti, trk in enumerate(self._tracks):
                 if ti in matched_t:
                     continue
-                if trk.hits < self.cfg.min_hits:
+                if not trk.synthetic and trk.hits < self.cfg.min_hits:
                     continue
                 # Refuse to bridge if we've already OF-bridged this track
                 # for max_of_bridges frames in a row — that way a truly
-                # gone target dies instead of drifting forever.
-                if trk.of_bridge_streak >= self.cfg.max_of_bridges:
+                # gone target dies instead of drifting forever. Synthetic
+                # tracks skip this cap: they have no heat detection that
+                # could ever reset the streak, so capping would kill the
+                # user target after max_of_bridges frames regardless of
+                # whether OF is still locked.
+                if (not trk.synthetic
+                        and trk.of_bridge_streak >= self.cfg.max_of_bridges):
                     continue
                 shift = self._of_estimate_shift(trk, agc8)
                 if shift is None:
@@ -390,12 +483,17 @@ class DetectionTracker:
                 # it still contains something hotter than its surround.
                 # Pure-texture drift fails this because there's no warm
                 # blob at the new location.
+                #
+                # Skipped for synthetic tracks — the user targeted a
+                # cold object on purpose (parked car, tree). The
+                # displacement cap + inlier spread still guard drift.
                 cur_cx, cur_cy = _centroid(trk.det.bbox)
                 cand_bbox = _shift_bbox(trk.det,
                                         meas_x - cur_cx,
                                         meas_y - cur_cy).bbox
-                if not _roi_still_warm(agc8, cand_bbox,
-                                       self.cfg.of_min_warmth_contrast):
+                if (not trk.synthetic
+                        and not _roi_still_warm(agc8, cand_bbox,
+                                                self.cfg.of_min_warmth_contrast)):
                     continue
 
                 trk.kf.update(meas_x, meas_y, r_scale=self.cfg.of_r_scale)
@@ -427,7 +525,11 @@ class DetectionTracker:
                 continue
             trk.misses += 1
             trk.age += 1
-            if trk.misses <= self.cfg.max_misses:
+            # Synthetic (user-drawn) tracks are NEVER dropped by max_misses.
+            # They persist on Kalman coast until the user hits Clear Target
+            # or seeds a new one. The user owns the target lifecycle; the
+            # tracker just carries the box.
+            if trk.synthetic or trk.misses <= self.cfg.max_misses:
                 kept.append(trk)
             else:
                 log.info(
@@ -477,9 +579,15 @@ class DetectionTracker:
             self._prev_gray = agc8.copy()
 
         # 6. Emit confirmed tracks matched this frame (real OR OF bridge).
+        #    Synthetic (user-drawn) tracks are always emitted — they're
+        #    rendered by the GUI from the detections list regardless of
+        #    whether OF matched this tick, and their bbox is carried
+        #    forward on Kalman coast.
         out: List[ThermalDetection] = []
         for trk in self._tracks:
-            if trk.hits >= self.cfg.min_hits and trk.misses == 0:
+            if trk.synthetic:
+                out.append(trk.det)
+            elif trk.hits >= self.cfg.min_hits and trk.misses == 0:
                 out.append(trk.det)
         return out
 
@@ -579,6 +687,7 @@ def _shift_bbox(d: ThermalDetection, dx: float, dy: float) -> ThermalDetection:
         area_px=d.area_px,
         contrast=d.contrast,
         classification=d.classification,
+        synthetic=d.synthetic,
     )
 
 

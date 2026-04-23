@@ -64,6 +64,13 @@ class ThermalDetection:
     area_px: int
     contrast: float                 # residual peak above background
     classification: Optional[ClassificationResult] = None
+    # True when the detection was seeded by a user "Draw Target" bbox
+    # rather than by the heat detector. Synthetic detections propagate
+    # through the tracker via optical flow only (no warmth requirement),
+    # are skipped by classifiers, and are rendered as a magenta dashed
+    # "USER TARGET" box in the GUI. Debug/demo handle for objects that
+    # aren't hot (parked cars, trees, etc.).
+    synthetic: bool = False
 
 
 @dataclass

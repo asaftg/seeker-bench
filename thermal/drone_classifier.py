@@ -201,6 +201,14 @@ class Classifier:
         for det in detections:
             result: Optional[ClassificationResult] = None
 
+            # Synthetic user-seeded targets bypass classification entirely.
+            # They carry their own "user" classifier_used tag and a
+            # UNKNOWN class; running YOLO on them would overwrite the
+            # user label with whatever random class a stock model fires.
+            if getattr(det, "synthetic", False):
+                out.append(det.classification)
+                continue
+
             if self.yolo_active:
                 # Extract a padded ROI from the display image for YOLO
                 x0 = max(0, det.bbox.x - pad)
