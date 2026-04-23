@@ -343,6 +343,27 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                         gm.set_home()
                     log.info("Gimbal home")
 
+                elif cmd.get("type") == "synthetic_target" or command == "synthetic_target":
+                    # User drew a bbox on the thermal panel — seed a
+                    # synthetic OF-only track. Payload:
+                    #   {type:"synthetic_target", bbox:[x,y,w,h]}
+                    tm_ref = app.state.thermal_manager
+                    bbox = cmd.get("bbox")
+                    if tm_ref is None or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                        log.warning("synthetic_target: bad payload / no thermal manager")
+                    else:
+                        try:
+                            x, y, w, h = (int(v) for v in bbox)
+                        except (TypeError, ValueError):
+                            log.warning("synthetic_target: non-int bbox %r", bbox)
+                            continue
+                        tm_ref.seed_synthetic_target(x, y, w, h)
+
+                elif cmd.get("type") == "clear_synthetic_target" or command == "clear_synthetic_target":
+                    tm_ref = app.state.thermal_manager
+                    if tm_ref is not None:
+                        tm_ref.clear_synthetic_target()
+
                 elif command == "nir":
                     mode = str(cmd.get("mode", "auto")).lower()
                     if mode in ("auto", "on", "off"):

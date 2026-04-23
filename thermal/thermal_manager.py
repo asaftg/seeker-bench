@@ -208,6 +208,36 @@ class ThermalManager:
         log.info("zoom preset -> %s (tracker reset)", preset)
         return True
 
+    # ─────────────────── synthetic "Draw Target" ─────────────────
+    def seed_synthetic_target(self, x: int, y: int, w: int, h: int) -> Optional[int]:
+        """Seed a user-drawn bbox as a synthetic track in the tracker.
+
+        Bbox is in display (post-zoom) coordinates — the same frame the
+        GUI is drawing on. Returns the new track's ID or None if the
+        bbox was rejected (too small / off-frame guarded at the GUI).
+        """
+        try:
+            tid = self._tracker.seed_synthetic(
+                BBox(x=int(x), y=int(y), w=int(w), h=int(h))
+            )
+            if tid is not None:
+                log.info(
+                    "ThermalManager seeded synthetic target id=%d bbox=(%d,%d,%d,%d)",
+                    tid, x, y, w, h,
+                )
+            return tid
+        except Exception as e:
+            log.warning("seed_synthetic_target failed: %s", e)
+            return None
+
+    def clear_synthetic_target(self) -> int:
+        """Remove any synthetic tracks. Returns count cleared."""
+        try:
+            return self._tracker.clear_synthetic()
+        except Exception as e:
+            log.warning("clear_synthetic_target failed: %s", e)
+            return 0
+
     def set_device(self, new_index: int | str) -> None:
         """Reopen thermal capture on a different cv2 device index at runtime.
 

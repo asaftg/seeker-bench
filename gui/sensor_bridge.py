@@ -59,6 +59,7 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
             "area_px": det.area_px,
             "contrast": round(float(det.contrast), 1),
             "classification": None,
+            "synthetic": bool(getattr(det, "synthetic", False)),
         }
         if det.classification is not None:
             entry["classification"] = {
