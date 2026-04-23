@@ -12,6 +12,7 @@ const $ = (id) => document.getElementById(id);
 // ─────────────────────────────────────────────────────────────────────────
 const thermalView = new ThermalView("thermal-canvas", "thermal-disconnected");
 const eoView      = new EOView("eo-canvas", "eo-disconnected");
+const radarView   = new RadarView("radar-canvas");
 
 // Delegated TRACK button handler — bound ONCE on the list container.
 // The list's innerHTML gets rewritten every WS frame (~20Hz), so any
@@ -640,11 +641,12 @@ function connect() {
       }
     }
 
-    // ── Radar panel ── (disconnected until Ticket 4)
+    // ── Radar panel ── (Ticket 5a: live AWR2944P point cloud)
     const radar = msg.radar || {};
     const radarDisc = $("radar-disconnected");
     if (radarDisc) radarDisc.classList.toggle("hidden", !!radar.connected);
     setPill("pill-radar", radar.connected ? "on" : "off", "RADAR");
+    radarView.update(radar);
 
     // ── Illuminator pill ──
     const illum = msg.illuminator;

@@ -202,6 +202,17 @@ export class RadarView {
 
   update(radar) {
     if (!this.ctx) return;
+    // Defensive re-fit: if the view was constructed before CSS layout
+    // settled, the constructor's _fit() sized the canvas to 1×1. Check
+    // on each update and re-fit if the bounding rect has grown.
+    const r = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const wantW = Math.max(1, Math.floor(r.width * dpr));
+    const wantH = Math.max(1, Math.floor(r.height * dpr));
+    if (this.canvas.width !== wantW || this.canvas.height !== wantH) {
+      this.canvas.width = wantW;
+      this.canvas.height = wantH;
+    }
     this._lastRadar = radar || null;
 
     if (!radar || !radar.connected) {
