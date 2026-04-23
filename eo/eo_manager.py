@@ -350,7 +350,7 @@ class EOManager:
         #    rates because when a fresh tick lands, the new bbox lines
         #    up with where the track predicted it would be.
         out_dets: list[EODetection] = []
-        for d in getattr(self, "_last_dets", []):
+        for d in self._last_dets:
             bx, by, bw, bh = d["bbox"]
             try:
                 tc = TargetClass(d["class"])
