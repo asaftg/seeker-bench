@@ -8,10 +8,10 @@ drop fields, compress differently) without touching the JS.
 from __future__ import annotations
 
 import base64
+import time
 from typing import Any, Dict, Optional
 
 import cv2
-import numpy as np
 
 from common.frames import EOFrame, FusedTrack, GimbalState, ThermalFrame
 from fusion.angular import angular_bbox_visible, angular_to_bbox
@@ -275,7 +275,6 @@ def build_ws_message(
     ``main_target_id`` (green highlight + gimbal auto-track target);
     otherwise ``main_target_id`` is None and the gimbal stays manual.
     """
-    import time as _time
     fused_wire = fused_to_wire(fused, tf, ef)
 
     # Ranked target list — pick top-N by score, then re-sort by stable
@@ -322,7 +321,7 @@ def build_ws_message(
         }
 
     return {
-        "ts": _time.time(),
+        "ts": time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
         "eo": eo_to_wire(ef, jpeg_quality=jpeg_quality),
         "radar": radar_to_wire(),

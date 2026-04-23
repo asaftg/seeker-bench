@@ -16,7 +16,6 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, Response

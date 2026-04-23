@@ -50,7 +50,7 @@ def main() -> int:
     try:
         from common.config import load_config
         from common.frame_bus import BUS
-        from common.frames import Topic, ThermalFrame
+        from common.frames import Topic
         from gui.sensor_bridge import thermal_to_wire
         from thermal.thermal_manager import ThermalManager
         check("Core imports", True)

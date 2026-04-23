@@ -19,7 +19,6 @@ detection needs its own fine-tune — see TODO at bottom.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 

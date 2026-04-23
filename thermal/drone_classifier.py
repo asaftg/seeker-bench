@@ -20,13 +20,9 @@ Contract:
 """
 from __future__ import annotations
 
-import math
-import os
-import sys
 from pathlib import Path
 from typing import List, Optional
 
-import cv2
 import numpy as np
 
 from common.frames import ClassificationResult, TargetClass, ThermalDetection

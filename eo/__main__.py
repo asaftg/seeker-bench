@@ -16,7 +16,6 @@ import sys
 import time
 
 import cv2
-import numpy as np
 
 from common.logging_setup import configure, get_logger
 
