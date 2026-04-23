@@ -183,7 +183,7 @@ gimbal:
   # still runs but publishes connected=false; GUI greys the dpad.
   enabled: true
   port: null                    # null = auto-detect Pololu VID
-  rate_hz: 20                   # command/publish loop rate
+  rate_hz: 60                   # command/publish loop rate
 
   # Home / rest pose. tilt convention: lower = horizon-ish,
   # higher = more up. Mechanical range is 22..90° on this rig,
@@ -203,7 +203,7 @@ gimbal:
   # true (flight / real mission): cameras rotate with the gimbal, az/el
   #   is measured off-boresight and shrinks to zero as the gimbal
   #   centers the target, so the command integrates: `pan += az`.
-  cameras_on_gimbal: false
+  cameras_on_gimbal: true
 
   # Software safety envelope & slew rate. Mechanical tilt range is
   # user-specified as 22..90°; we hard-clamp so no command (manual
@@ -231,8 +231,13 @@ gimbal:
     channel: 1
     min_deg: 22.0
     max_deg: 90.0
-    us_at_min_deg:  500.0   # placeholder — recalibrate with scripts/gimbal_calibrate
-    us_at_max_deg: 2500.0
+    # Calibrated 2026-04-22 via Maestro Control Center:
+    #   992 µs  → 90° real (max up, vertical)
+    #   1725 µs → 22° real (max down, mechanical stop)
+    # With invert=true: min_deg (22°) maps to us_at_max_deg, max_deg (90°)
+    # maps to us_at_min_deg — that's the direction the servo is mounted.
+    us_at_min_deg:  992.0
+    us_at_max_deg: 1725.0
     invert: true        # servo mounted so +tilt goes up
 
 gui:
