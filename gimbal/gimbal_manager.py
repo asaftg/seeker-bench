@@ -95,6 +95,28 @@ def _hyst_deadband(az: float,
         return az, el, False
 
 
+def _pan_only_if_tilt_saturated(cur_tilt: float,
+                                d_tilt: float,
+                                tilt_floor: float,
+                                tilt_ceil: float,
+                                eps: float) -> tuple[float, bool]:
+    """Zero the tilt delta when the servo is at a mechanical stop and
+    the controller wants to drive it further into that stop.
+
+    Returns (d_tilt_out, saturated). When saturated, the caller keeps
+    the pan command (visual servo still tracks horizontally) but stops
+    spending control effort on tilt — which would otherwise produce
+    micro-jitter via clamp-and-retry each frame.
+    """
+    at_floor = cur_tilt <= tilt_floor + eps
+    at_ceil  = cur_tilt >= tilt_ceil  - eps
+    if at_floor and d_tilt < 0.0:
+        return 0.0, True
+    if at_ceil and d_tilt > 0.0:
+        return 0.0, True
+    return d_tilt, False
+
+
 class GimbalManager:
     """Pan/tilt servo manager.
 
@@ -155,6 +177,18 @@ class GimbalManager:
         self._home_pan  = home_pan
         self._home_tilt = home_tilt
         self._rate_hz   = float(gcfg.get("rate_hz", 20.0))
+
+        # Mechanical tilt envelope — used by the pan-only saturation
+        # guard so we stop feeding phantom tilt corrections when the
+        # target is outside the reachable pitch range. Without this,
+        # a ground target below tilt_min causes the control loop to
+        # command tilt deltas every frame that get clamped at the
+        # floor, producing visible jitter in pan via coupled error
+        # readout.
+        self._tilt_floor = float(limits.tilt_min_deg)
+        self._tilt_ceil  = float(limits.tilt_max_deg)
+        # Small epsilon so we treat "within 0.3° of the stop" as saturated.
+        self._tilt_sat_eps_deg = 0.3
 
         # Mounting geometry for tracking math.
         #
@@ -227,6 +261,11 @@ class GimbalManager:
         self._last_track_ts: Optional[float] = None
         self._last_sp_pan:   Optional[float] = None
         self._last_sp_tilt:  Optional[float] = None
+
+        # Pan-only saturation log throttle — we emit one INFO when we
+        # enter saturation and another when we exit, but nothing in
+        # between (would spam at rate_hz).
+        self._tilt_saturated_logged = False
 
         # Driver — may or may not actually open.
         self._driver = MaestroDriver(port=port or gcfg.get("port"))
@@ -412,6 +451,17 @@ class GimbalManager:
                             self._in_deadband)
                         d_pan  = _clip(self._kp_track * az, self._max_step_deg)
                         d_tilt = _clip(self._kp_track * el, self._max_step_deg)
+                        d_tilt, tilt_sat = _pan_only_if_tilt_saturated(
+                            cur_tilt, d_tilt,
+                            self._tilt_floor, self._tilt_ceil,
+                            self._tilt_sat_eps_deg)
+                        if tilt_sat and not self._tilt_saturated_logged:
+                            log.info("Tilt saturated at mechanical stop "
+                                     "(cur=%.1f, el_err=%.2f) — pan-only",
+                                     cur_tilt, el)
+                            self._tilt_saturated_logged = True
+                        elif not tilt_sat:
+                            self._tilt_saturated_logged = False
                         sp_pan  = cur_pan  + d_pan
                         sp_tilt = cur_tilt + d_tilt
                     else:
@@ -461,6 +511,17 @@ class GimbalManager:
                             self._in_deadband)
                         d_pan  = _clip(self._kp_track * az, self._max_step_deg)
                         d_tilt = _clip(self._kp_track * el, self._max_step_deg)
+                        d_tilt, tilt_sat = _pan_only_if_tilt_saturated(
+                            cur_tilt, d_tilt,
+                            self._tilt_floor, self._tilt_ceil,
+                            self._tilt_sat_eps_deg)
+                        if tilt_sat and not self._tilt_saturated_logged:
+                            log.info("Tilt saturated at mechanical stop "
+                                     "(cur=%.1f, el_err=%.2f) — pan-only",
+                                     cur_tilt, el)
+                            self._tilt_saturated_logged = True
+                        elif not tilt_sat:
+                            self._tilt_saturated_logged = False
                         sp_pan  = cur_pan  + d_pan
                         sp_tilt = cur_tilt + d_tilt
                     else:
