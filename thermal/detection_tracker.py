@@ -471,7 +471,19 @@ class DetectionTracker:
                 # large "consistent" shift on pure texture. Anything
                 # bigger than half the match budget is almost certainly
                 # wrong.
-                if math.hypot(dx, dy) > of_shift_cap:
+                #
+                # Synthetic tracks need a much larger cap: the moment
+                # the user draws a box, the gimbal auto-locks and slews
+                # toward the target, which drags the whole scene across
+                # the image at up to ~35 px/frame (120°/s over a 75°
+                # FOV at 30 Hz capture). The normal cap would reject
+                # the legitimate OF match every frame during slew,
+                # leaving the Kalman to coast at v=0 while the scene
+                # runs out from under the bbox. Scale the cap with the
+                # match budget itself rather than halving it.
+                trk_shift_cap = (self.cfg.max_dist_px * 1.5
+                                 if trk.synthetic else of_shift_cap)
+                if math.hypot(dx, dy) > trk_shift_cap:
                     continue
                 # Anchor on the pre-predict centroid captured in step 1.
                 # Observation = old position + measured OF shift.
