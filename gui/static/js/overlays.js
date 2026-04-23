@@ -239,6 +239,54 @@ export function drawHeatTrackDebug(ctx, track, scale, dx, dy) {
 }
 
 // ---------------------------------------------------------------------------
+// Synthetic "USER TARGET" box — magenta dashed. Drawn for any detection
+// carrying synthetic=true (user "Draw Target" seed, propagated by the
+// tracker's OF bridge). Independent of heat detector / classifier.
+// ---------------------------------------------------------------------------
+export function drawSyntheticTargetBox(ctx, det, scale, dx, dy) {
+  const b = det && det.bbox;
+  if (!b) return;
+  const x = dx + b.x * scale;
+  const y = dy + b.y * scale;
+  const w = b.w * scale;
+  const h = b.h * scale;
+
+  ctx.save();
+  ctx.strokeStyle = COLORS.dev;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([7, 4]);
+  ctx.strokeRect(x, y, w, h);
+  // Crosshair at centroid for the operator's aim reference.
+  const cx = x + w / 2, cy = y + h / 2;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, cy); ctx.lineTo(cx + 7, cy);
+  ctx.moveTo(cx, cy - 7); ctx.lineTo(cx, cy + 7);
+  ctx.stroke();
+
+  // The tracker assigns the synthetic track its own internal ID but
+  // we don't carry it out through the wire as a distinct field —
+  // reuse the area/contrast label slot for a stable "USER TARGET" tag.
+  const idTag = (det.synthetic_id != null) ? `#${det.synthetic_id} ` : "";
+  _drawLabel(ctx, `${idTag}USER TARGET`, x, y, COLORS.dev);
+  ctx.restore();
+}
+
+// Transient rubber-band rectangle while the user is dragging in draw mode.
+// Takes CANVAS-space coords (already scaled) — the caller is in the same
+// coordinate frame as the mouse event.
+export function drawRubberBand(ctx, x0, y0, x1, y1) {
+  const x = Math.min(x0, x1), y = Math.min(y0, y1);
+  const w = Math.abs(x1 - x0), h = Math.abs(y1 - y0);
+  ctx.save();
+  ctx.strokeStyle = COLORS.dev;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+  ctx.strokeRect(x, y, w, h);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
 // Radar projected track (cyan dashed)
 // ---------------------------------------------------------------------------
 export function drawRadarBox(ctx, x, y, w, h, label) {

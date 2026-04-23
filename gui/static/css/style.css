@@ -262,6 +262,35 @@ body {
   font-family: "JetBrains Mono", monospace;
   margin-left: auto;
 }
+
+/* Draw-a-bbox synthetic target control — lives in the thermal panel
+   subbar next to the zoom buttons. When the toggle is active the
+   thermal canvas cursor becomes a crosshair and click-drag seeds a
+   synthetic OF-only track. Magenta glow mirrors the dev-mode aesthetic
+   since this is a debug/demo tool independent of the heat detector. */
+.draw-target-btn, .clear-target-btn {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+  background: transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-left: 6px;
+  transition: background 80ms, color 80ms, border-color 80ms;
+}
+.draw-target-btn:hover, .clear-target-btn:hover {
+  background: var(--bg-card-2);
+  color: var(--text);
+}
+.draw-target-btn.active {
+  background: rgba(230, 70, 210, 0.18);
+  border-color: rgba(230, 70, 210, 0.55);
+  color: #ff7be2;
+}
+#thermal-canvas.draw-mode { cursor: crosshair; }
 .cam-selector {
   display: inline-flex;
   align-items: center;

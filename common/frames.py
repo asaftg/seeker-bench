@@ -89,6 +89,7 @@ class HeatTrackDebug:
     age: int
     confirmed: bool       # has reached min_hits — would be rendered as a production box
     coasting: bool        # missed this tick — coasting on last known position
+    synthetic: bool = False  # user "Draw Target" seed (propagated via OF only)
 
 
 @dataclass

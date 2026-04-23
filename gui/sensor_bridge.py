@@ -82,6 +82,7 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
             "age": int(ht.age),
             "confirmed": bool(ht.confirmed),
             "coasting": bool(ht.coasting),
+            "synthetic": bool(getattr(ht, "synthetic", False)),
         })
 
     return {

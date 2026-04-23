@@ -482,6 +482,7 @@ class ThermalManager:
                     id=s.id, bbox=s.bbox,
                     hits=s.hits, misses=s.misses, age=s.age,
                     confirmed=s.confirmed, coasting=s.coasting,
+                    synthetic=getattr(s, "synthetic", False),
                 )
                 for s in _snaps
             ]

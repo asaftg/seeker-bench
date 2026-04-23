@@ -55,6 +55,14 @@
         <button class="zoom-btn" data-zoom="mid">18°</button>
         <button class="zoom-btn" data-zoom="narrow">12°</button>
         <span class="fov-label" id="thermal-fov">75° HFOV</span>
+        <button class="draw-target-btn" id="draw-target-btn"
+                title="Drag a bbox on the thermal feed to seed a synthetic OF-only track (ESC cancels)">
+          DRAW TARGET
+        </button>
+        <button class="clear-target-btn" id="clear-target-btn"
+                title="Clear the current synthetic target">
+          CLEAR
+        </button>
       </div>
       <div class="panel-canvas">
         <canvas id="thermal-canvas"></canvas>

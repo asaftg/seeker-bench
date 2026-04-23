@@ -64,6 +64,51 @@ let _trackedTargetId  = null;     // null = manual; int = user pressed TRACK
 let _trackedHeatId    = null;     // dev-mode: raw heat-blob tracker ID we asked gimbal to follow
 let _devMode          = false;    // developer overlays: heat-blob tracker debug, etc.
 
+// ─────────────────────────────────────────────────────────────────────────
+// Draw-a-bbox synthetic target — thermal-panel debug/demo tool.
+// Toggle DRAW TARGET, drag a rectangle on the thermal feed, release to
+// seed an OF-only track on the backend. CLEAR removes it. ESC cancels
+// an in-flight drag (and also deactivates draw mode for quick exit).
+// ─────────────────────────────────────────────────────────────────────────
+(() => {
+  const drawBtn = document.getElementById("draw-target-btn");
+  const clearBtn = document.getElementById("clear-target-btn");
+  if (!drawBtn && !clearBtn) return;
+
+  const setDraw = (on) => {
+    if (drawBtn) drawBtn.classList.toggle("active", !!on);
+    thermalView.setDrawMode(!!on, (bbox) => {
+      // bbox already clamped + min-size-checked by ThermalView.
+      wsSend({
+        type: "synthetic_target",
+        bbox: [bbox.x, bbox.y, bbox.w, bbox.h],
+      });
+      // Auto-exit draw mode after a successful commit so the user can
+      // immediately interact with the rest of the UI.
+      if (drawBtn) drawBtn.classList.remove("active");
+      thermalView.setDrawMode(false);
+    });
+  };
+
+  if (drawBtn) {
+    drawBtn.addEventListener("click", () => {
+      setDraw(!thermalView.isDrawMode());
+    });
+  }
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      wsSend({ type: "clear_synthetic_target" });
+    });
+  }
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && thermalView.isDrawMode()) {
+      thermalView.cancelDrag();
+      setDraw(false);
+    }
+  });
+})();
+
 // Developer-mode toggle — flips a client-only flag that views consult
 // when drawing. No round-trip: the backend always sends the debug
 // payload, the client decides whether to paint it.
