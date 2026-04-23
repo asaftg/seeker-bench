@@ -40,3 +40,9 @@ models/*.pt
 .idea/
 .vscode/
 *.swp
+
+# Stray ultralytics checkpoint cached in repo root
+yolov8*.pt
+
+# Overnight training artifacts (logs, samples, reports)
+training_runs/
