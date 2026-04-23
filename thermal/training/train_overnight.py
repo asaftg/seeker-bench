@@ -46,10 +46,19 @@ class TeeStream:
 
 
 def setup_log():
+    """Ensure log dir exists. Do NOT replace sys.stdout -- on Windows,
+    ultralytics' dataloader workers inherit the parent's stdout file handle,
+    and a wrapper object without fileno() causes workers to die silently during
+    the label scan (the exact failure mode that killed the prior run at 23:20).
+    Instead, rely on shell-level `>` redirection from the launch command so
+    stdout/stderr are real OS file handles that child processes can inherit."""
     LOG.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(LOG, "a", buffering=1, encoding="utf-8")
-    sys.stdout = TeeStream(sys.__stdout__, fh)
-    sys.stderr = TeeStream(sys.__stderr__, fh)
+    # force unbuffered prints so the redirected log updates live
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 
 def say(msg): print(msg)
@@ -79,15 +88,37 @@ def legacy_map50(weights_path: Path, data_yaml: Path) -> float:
 
 def train_one(bundle_name: str, data_yaml: Path, epochs: int,
               out_name: str, legacy_pt: Path | None,
-              samples_dir: Path, target_pt: Path):
+              samples_dir: Path, target_pt: Path,
+              smoke_epochs: int | None = None):
     from ultralytics import YOLO
     import torch
 
     say(f"\n=== TRAIN {bundle_name} :: {data_yaml.name} ===")
     say(f"  epochs={epochs} imgsz=640 device=0 cuda={torch.cuda.is_available()}")
 
+    # Smoke test first: 3 epochs on batch=16. If this completes cleanly we know
+    # label scan + caching + one full dataloader pass succeeded; then we go to
+    # the full-length run. Prior attempt used batch=32 and died during label
+    # scan -- start safer.
+    if smoke_epochs:
+        say(f"  SMOKE: {smoke_epochs} epochs @ batch=16 cache=disk")
+        try:
+            YOLO("yolov8s.pt").train(
+                data=str(data_yaml), epochs=smoke_epochs, imgsz=640, batch=16,
+                device=0, project=str(RUNS_TRAIN), name=out_name + "_smoke",
+                exist_ok=True, verbose=True, patience=smoke_epochs,
+                workers=8, amp=True, cache="disk",
+            )
+            say(f"  SMOKE passed for {bundle_name}")
+        except Exception as e:
+            say(f"  SMOKE FAILED for {bundle_name}: {e}")
+            traceback.print_exc()
+            append_report(f"\n## {out_name}\nSMOKE FAILED: {e}\n")
+            return
+
     # OOM/robustness ladder: (weights, batch)
-    ladder = [("yolov8s.pt", 32), ("yolov8s.pt", 16), ("yolov8s.pt", 8), ("yolov8n.pt", 16)]
+    # Start at 16 (was 32 -- safer for the mixed-source unified dataset on 16GB).
+    ladder = [("yolov8s.pt", 16), ("yolov8s.pt", 8), ("yolov8n.pt", 16), ("yolov8n.pt", 8)]
     results = None
     last_err = None
     chosen = None
@@ -106,8 +137,9 @@ def train_one(bundle_name: str, data_yaml: Path, epochs: int,
                 exist_ok=True,
                 verbose=True,
                 patience=15,
-                workers=4,
+                workers=8,
                 amp=True,
+                cache="disk",  # avoid rescanning 38k labels each epoch
             )
             chosen = (weights, batch, model)
             break
@@ -218,9 +250,10 @@ def main():
             data_yaml=thermal_yaml,
             epochs=80,
             out_name="seeker_thermal_v2",
-            legacy_pt=MODELS / "seeker_thermal.pt",
+            legacy_pt=MODELS / "seeker_thermal_hv.pt",
             samples_dir=SAMPLES_T,
             target_pt=MODELS / "seeker_thermal_v2.pt",
+            smoke_epochs=3,
         )
     except Exception as e:
         say(f"thermal training top-level error: {e}")
@@ -237,6 +270,7 @@ def main():
             legacy_pt=None,  # no legacy EO-specific model in models/
             samples_dir=SAMPLES_E,
             target_pt=MODELS / "seeker_eo_v2.pt",
+            smoke_epochs=3,
         )
     except Exception as e:
         say(f"eo training top-level error: {e}")
