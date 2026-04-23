@@ -24,7 +24,7 @@ import numpy as np
 
 from common.config import load_config
 from common.frame_bus import BUS
-from common.frames import BBox, ThermalFrame, Topic
+from common.frames import BBox, HeatTrackDebug, ThermalFrame, Topic
 from common.logging_setup import get_logger
 from thermal.classifier_hv import HumanVehicleClassifier
 from thermal.detection_tracker import DetectionTracker, TrackerConfig
@@ -420,10 +420,34 @@ class ThermalManager:
             vfov_cur = self._full_vfov
 
         # ── 4. Temporal tracker ────────────────────────────────────
+        # Tracker needs a grayscale view of the display image for its
+        # Lucas-Kanade optical-flow bridge (works in bbox/display space,
+        # so the crop-scaled `display` is the correct coordinate frame).
         try:
-            detections = self._tracker.update(detections)
+            display_gray = cv2.cvtColor(display, cv2.COLOR_BGR2GRAY) \
+                if display is not None and display.ndim == 3 else display
+        except Exception:
+            display_gray = None
+        try:
+            detections = self._tracker.update(detections, display_gray)
         except Exception as e:
             log.warning("DetectionTracker failed: %s", e)
+
+        # Dev-mode snapshot of the tracker's internal state (all tracks,
+        # including unconfirmed + coasting). Cheap enough to compute
+        # every frame; the GUI only renders when developer mode is on.
+        try:
+            _snaps = self._tracker.snapshot()
+            heat_tracks_debug = [
+                HeatTrackDebug(
+                    id=s.id, bbox=s.bbox,
+                    hits=s.hits, misses=s.misses, age=s.age,
+                    confirmed=s.confirmed, coasting=s.coasting,
+                )
+                for s in _snaps
+            ]
+        except Exception:
+            heat_tracks_debug = []
 
         # ── 5. Classification (throttled) ──────────────────────────
         run_classifiers = (self._frame_id % self._classify_every == 0)
@@ -567,6 +591,7 @@ class ThermalManager:
             hfov_deg=hfov_cur,
             vfov_deg=vfov_cur,
             zoom_preset=self._zoom_preset,
+            heat_tracks=heat_tracks_debug,
         )
         BUS.publish(Topic.THERMAL, tf)
 
