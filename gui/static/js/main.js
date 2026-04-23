@@ -25,11 +25,29 @@ const eoView      = new EOView("eo-canvas", "eo-disconnected");
     const btn = ev.target.closest(".tr-btn");
     if (!btn || !list.contains(btn)) return;
     ev.stopPropagation();
+
+    // Heat-blob row (dev mode) uses data-heat-id; fused row uses data-track-id.
+    if (btn.dataset.heatId) {
+      const raw = btn.dataset.heatId;
+      const id = (raw === "" || raw == null) ? null : Number(raw);
+      const isCurrent = (_trackedHeatId != null) && (_trackedHeatId === id);
+      const nextId = isCurrent ? null : id;
+      _trackedHeatId = nextId;
+      // A heat-lock supersedes the fused lock — clear the mirror so
+      // the UI doesn't briefly show two active rows before the server
+      // echoes back the new state.
+      if (nextId != null) _trackedTargetId = null;
+      console.log("[track] heat click id=", id, "→ send", nextId);
+      wsSend({ command: "track_heat", heat_id: nextId });
+      return;
+    }
+
     const raw = btn.dataset.trackId;
     const id = raw != null ? Number(raw) : null;
     const isCurrent = (_trackedTargetId != null) && (_trackedTargetId === id);
     const nextId = isCurrent ? null : id;
     _trackedTargetId = nextId;
+    if (nextId != null) _trackedHeatId = null;
     console.log("[track] click id=", id, "→ send", nextId);
     wsSend({ command: "track", track_id: nextId });
   });
@@ -43,6 +61,23 @@ let _nirMode          = "auto";   // "auto" | "on" | "off"
 let _gimbalPan        = null;
 let _gimbalTilt       = null;
 let _trackedTargetId  = null;     // null = manual; int = user pressed TRACK
+let _trackedHeatId    = null;     // dev-mode: raw heat-blob tracker ID we asked gimbal to follow
+let _devMode          = false;    // developer overlays: heat-blob tracker debug, etc.
+
+// Developer-mode toggle — flips a client-only flag that views consult
+// when drawing. No round-trip: the backend always sends the debug
+// payload, the client decides whether to paint it.
+(() => {
+  const btn = document.getElementById("dev-toggle");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    _devMode = !_devMode;
+    btn.classList.toggle("active", _devMode);
+    btn.title = _devMode
+      ? "Developer overlays ON — click to hide heat-blob tracks"
+      : "Developer overlays (heat-blob tracker debug)";
+  });
+})();
 
 // ─────────────────────────────────────────────────────────────────────────
 // Connection pills
@@ -79,7 +114,10 @@ function _clsLabel(cls) {
 // is hovering/clicking every 50ms — that's what caused the flicker +
 // missed clicks. Stable DOM nodes = stable hover, stable clicks.
 const SLOTS = 5;
-let _rowNodes = null;   // [{row, id, cls, sensors, conf, angle, btn}, ...]
+const HEAT_SLOTS = 5;
+let _rowNodes = null;       // fused-track rows
+let _heatHeader = null;     // divider shown above heat rows in dev mode
+let _heatRowNodes = null;   // raw heat-blob rows (dev-mode only)
 
 function _buildRowNodes() {
   const list = $("targets-list");
@@ -111,9 +149,47 @@ function _buildRowNodes() {
   return nodes;
 }
 
+function _buildHeatRowNodes() {
+  const list = $("targets-list");
+  if (!list) return null;
+
+  // Section divider — hidden unless dev mode is on AND there's data.
+  const header = document.createElement("div");
+  header.className = "target-heat-header hidden";
+  header.textContent = "HEAT · DEV";
+  list.appendChild(header);
+  _heatHeader = header;
+
+  const nodes = [];
+  for (let i = 0; i < HEAT_SLOTS; i++) {
+    const row = document.createElement("div");
+    row.className = "target-row target-row-heat placeholder hidden";
+    row.innerHTML = `
+      <span class="tr-id">—</span>
+      <span class="tr-cls">—</span>
+      <span class="tr-sensors">—</span>
+      <span class="tr-conf">—</span>
+      <span class="tr-angle mono">—</span>
+      <button class="tr-btn" data-heat-id="">TRACK</button>
+    `;
+    list.appendChild(row);
+    nodes.push({
+      row,
+      id:      row.children[0],
+      cls:     row.children[1],
+      sensors: row.children[2],
+      conf:    row.children[3],
+      angle:   row.children[4],
+      btn:     row.children[5],
+    });
+  }
+  return nodes;
+}
+
 function renderTargets(msg) {
   const lockState = $("targets-lock-state");
   if (!_rowNodes) _rowNodes = _buildRowNodes();
+  if (!_heatRowNodes) _heatRowNodes = _buildHeatRowNodes();
   if (!_rowNodes) return;
 
   const top = msg.top_targets || [];
@@ -122,16 +198,26 @@ function renderTargets(msg) {
   if (backendTracked !== _trackedTargetId) {
     _trackedTargetId = backendTracked;
   }
+  const backendHeat = (msg.tracked_heat_id != null)
+    ? Number(msg.tracked_heat_id) : null;
+  if (backendHeat !== _trackedHeatId) {
+    _trackedHeatId = backendHeat;
+  }
 
   if (lockState) {
     if (_trackedTargetId != null) {
       lockState.textContent = `lock · #${_trackedTargetId} · gimbal AUTO`;
       lockState.style.color = "var(--fused-green, #00e88f)";
+    } else if (_trackedHeatId != null) {
+      lockState.textContent = `lock · H#${_trackedHeatId} · gimbal AUTO (dev)`;
+      lockState.style.color = "#ff7be2";
     } else {
       lockState.textContent = "no lock · gimbal manual";
       lockState.style.color = "var(--text-3)";
     }
   }
+
+  _renderHeatRows(msg);
 
   for (let i = 0; i < SLOTS; i++) {
     const t = top[i] || null;
@@ -188,6 +274,65 @@ function renderTargets(msg) {
     if (n.btn.dataset.trackId !== wantId) n.btn.dataset.trackId = wantId;
     if (n.btn.textContent !== wantText)   n.btn.textContent     = wantText;
     if (n.btn.className   !== wantCls)    n.btn.className       = wantCls;
+  }
+}
+
+// Dev-mode only: render raw heat-blob tracker rows below the fused list.
+// Each row has a TRACK button that locks the gimbal onto the blob's
+// current bbox center (converted to az/el on the backend, per frame).
+// We only surface CONFIRMED tracks — pending/coasting entries would
+// just thrash the list and a click on them would often miss.
+function _renderHeatRows(msg) {
+  if (!_heatRowNodes || !_heatHeader) return;
+
+  const heatTracks = ((msg.thermal && msg.thermal.heat_tracks) || [])
+    .filter(h => h && h.confirmed);
+  // Sort by id ascending so rows are stable (same sort every tick).
+  heatTracks.sort((a, b) => a.id - b.id);
+  const show = _devMode && heatTracks.length > 0;
+
+  if (_heatHeader.classList.contains("hidden") === show) {
+    _heatHeader.classList.toggle("hidden", !show);
+  }
+
+  for (let i = 0; i < HEAT_SLOTS; i++) {
+    const n = _heatRowNodes[i];
+    const h = show ? (heatTracks[i] || null) : null;
+
+    if (h == null) {
+      if (!n.row.classList.contains("hidden")) {
+        n.row.classList.add("hidden");
+      }
+      // Nothing else to do; button is inside a hidden row.
+      continue;
+    }
+
+    if (n.row.classList.contains("hidden")) {
+      n.row.classList.remove("hidden");
+    }
+
+    const tracked = (_trackedHeatId != null) && (h.id === _trackedHeatId);
+    const rowCls =
+      "target-row target-row-heat" +
+      (tracked ? " tracked" : "");
+    if (n.row.className !== rowCls) n.row.className = rowCls;
+
+    const state = h.coasting ? "coast" : "ok";
+    n.id.textContent      = `H#${h.id}`;
+    n.cls.textContent     = "HEAT";
+    n.cls.style.color     = "#ff7be2";   // dev magenta
+    n.sensors.textContent = `thermal · ${state}`;
+    n.sensors.className   = "tr-sensors";
+    n.conf.textContent    = `${h.hits}/${h.misses}`;
+    const b = h.bbox || {};
+    n.angle.textContent   = `${b.w|0}×${b.h|0}`;
+
+    const wantId   = String(h.id);
+    const wantText = tracked ? "TRACKING" : "TRACK";
+    const wantCls  = "tr-btn" + (tracked ? " active" : "");
+    if (n.btn.dataset.heatId !== wantId) n.btn.dataset.heatId = wantId;
+    if (n.btn.textContent    !== wantText) n.btn.textContent    = wantText;
+    if (n.btn.className      !== wantCls)  n.btn.className      = wantCls;
   }
 }
 
@@ -417,7 +562,7 @@ function connect() {
 
     // ── Thermal panel ──
     const thermal = msg.thermal || {};
-    thermalView.update(thermal, msg.main_target_id || null, fused);
+    thermalView.update(thermal, msg.main_target_id || null, fused, _devMode);
     syncZoomButtons(thermal.zoom_preset);
 
     const thermHz = $("thermal-hz");

@@ -67,6 +67,24 @@ class ThermalDetection:
 
 
 @dataclass
+class HeatTrackDebug:
+    """Debug-mode view of a heat-blob tracker entry.
+
+    Only populated on ThermalFrame when the developer-mode toggle in
+    the GUI is on (cheap enough to compute always, but we keep the wire
+    field empty by default to avoid sending dozens of dicts every frame
+    for users who don't care).
+    """
+    id: int
+    bbox: BBox
+    hits: int
+    misses: int
+    age: int
+    confirmed: bool       # has reached min_hits — would be rendered as a production box
+    coasting: bool        # missed this tick — coasting on last known position
+
+
+@dataclass
 class ThermalFrame:
     """A fully-processed thermal frame published on the bus.
 
@@ -89,6 +107,12 @@ class ThermalFrame:
     hfov_deg: float = 75.0
     vfov_deg: float = 60.0
     zoom_preset: str = "full"
+
+    # Developer-mode only: raw state of the heat-blob tracker, including
+    # unconfirmed and coasting tracks. Populated unconditionally by
+    # ThermalManager; the GUI chooses whether to render based on its
+    # own devMode flag.
+    heat_tracks: List[HeatTrackDebug] = field(default_factory=list)
 
 
 # ───────────────────────────────────────────────────────────────

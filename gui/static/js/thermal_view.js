@@ -7,6 +7,7 @@ import {
   drawDetectionBox,
   drawFusedBox,
   drawProjectedBox,
+  drawHeatTrackDebug,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -24,6 +25,8 @@ export class ThermalView {
     this._lastDetections = [];
     this._lastFused = [];
     this._mainTargetId = null;
+    this._lastHeatTracks = [];
+    this._devMode = false;
     if (this.img) {
       this.img.onload = () => this._draw();
     }
@@ -40,9 +43,10 @@ export class ThermalView {
     if (this._lastFrameW > 0) this._draw();
   }
 
-  update(thermal, mainTargetId = null, fused = []) {
+  update(thermal, mainTargetId = null, fused = [], devMode = false) {
     this._mainTargetId = mainTargetId;
     this._lastFused = fused || [];
+    this._devMode = !!devMode;
     if (!thermal || !thermal.connected) {
       if (this.overlay) this.overlay.classList.remove("hidden");
       this._clear();
@@ -53,6 +57,7 @@ export class ThermalView {
     this._lastFrameW = thermal.width || 0;
     this._lastFrameH = thermal.height || 0;
     this._lastDetections = thermal.detections || [];
+    this._lastHeatTracks = thermal.heat_tracks || [];
 
     if (thermal.jpeg_b64) {
       this.img.src = "data:image/jpeg;base64," + thermal.jpeg_b64;
@@ -113,6 +118,15 @@ export class ThermalView {
         if (!detectedHere) {
           drawProjectedBox(this.ctx, bbox, trk, scale, dx, dy);
         }
+      }
+    }
+
+    // Developer overlay: every heat-blob tracker entry (incl. pending
+    // + coasting). Drawn AFTER production boxes so the magenta lines
+    // sit on top and are unambiguously the debug view.
+    if (this._devMode) {
+      for (const ht of this._lastHeatTracks) {
+        drawHeatTrackDebug(this.ctx, ht, scale, dx, dy);
       }
     }
   }

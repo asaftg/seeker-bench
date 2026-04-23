@@ -15,6 +15,7 @@ export const COLORS = {
   hand:    "#ffa502",   // amber (legacy indoor test)
   radar:   "#00d4ff",   // cyan dashed
   main:    "#00e88f",   // green thick — main target override
+  dev:     "#ff4ccc",   // magenta — developer overlays (tracker debug)
 };
 
 // ---------------------------------------------------------------------------
@@ -185,6 +186,56 @@ function _iou(a, b) {
   if (inter <= 0) return 0;
   const union = a.w * a.h + b.w * b.h - inter;
   return union > 0 ? inter / union : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Developer mode — heat-blob tracker overlay.
+// Draws EVERY tracker entry (including unconfirmed + coasting) in magenta,
+// with the internal track ID and hits/misses next to each box. Separate
+// from the production heat/drone/fused boxes so turning dev-mode on/off
+// never disturbs what a non-developer user sees.
+//
+//   confirmed + matched this tick → solid thin magenta
+//   confirmed + coasting (miss)   → dashed magenta
+//   unconfirmed (hits<min)        → dotted magenta
+// ---------------------------------------------------------------------------
+export function drawHeatTrackDebug(ctx, track, scale, dx, dy) {
+  const b = track.bbox;
+  if (!b) return;
+  const x = dx + b.x * scale;
+  const y = dy + b.y * scale;
+  const w = b.w * scale;
+  const h = b.h * scale;
+
+  ctx.save();
+  ctx.strokeStyle = COLORS.dev;
+  ctx.lineWidth = 1;
+  if (!track.confirmed) {
+    ctx.setLineDash([2, 3]);         // dotted = not yet confirmed
+  } else if (track.coasting) {
+    ctx.setLineDash([6, 4]);         // dashed = coasting on last position
+  } else {
+    ctx.setLineDash([]);             // solid  = matched this tick
+  }
+  ctx.strokeRect(x, y, w, h);
+
+  // Tiny corner tick at the bbox centroid so overlapping boxes are
+  // still distinguishable.
+  const cx = x + w / 2, cy = y + h / 2;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(cx - 2, cy); ctx.lineTo(cx + 2, cy);
+  ctx.moveTo(cx, cy - 2); ctx.lineTo(cx, cy + 2);
+  ctx.stroke();
+
+  const tag = track.coasting ? "coast" : (track.confirmed ? "ok" : "pend");
+  const label = `H#${track.id} ${track.hits}/${track.misses} ${tag}`;
+  _drawLabel(ctx, label, x, y + h + 12, COLORS.dev);  // label BELOW the box
+                                                       // so it doesn't overlap
+                                                       // the production label
+                                                       // drawn on a same-spot
+                                                       // production detection.
+  ctx.restore();
 }
 
 // ---------------------------------------------------------------------------

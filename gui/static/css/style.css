@@ -116,6 +116,53 @@ body {
   white-space: nowrap;
 }
 
+/* Developer-mode toggle — small topbar button. Off state looks like a
+   dimmed pill; on state glows magenta so you can tell at a glance that
+   the dev overlays are active (keeps demos from accidentally shipping
+   with tracker noise drawn over the thermal). */
+.dev-toggle {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  padding: 3px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  margin-right: 8px;
+  background: rgba(90,100,128,0.15);
+  color: var(--text-3);
+  transition: background 80ms, color 80ms, border-color 80ms;
+}
+.dev-toggle:hover { color: #fff; }
+.dev-toggle.active {
+  background: rgba(230, 70, 210, 0.18);
+  border-color: rgba(230, 70, 210, 0.55);
+  color: #ff7be2;
+}
+
+/* Heat-blob debug rows in the targets list (dev mode). */
+.target-heat-header {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: #ff7be2;
+  text-transform: uppercase;
+  padding: 4px 8px 2px;
+  border-top: 1px dashed rgba(230, 70, 210, 0.35);
+  margin-top: 4px;
+}
+.target-heat-header.hidden { display: none; }
+.target-row-heat {
+  background: rgba(230, 70, 210, 0.05);
+  border-left: 2px solid rgba(230, 70, 210, 0.4);
+}
+.target-row-heat.hidden { display: none; }
+.target-row-heat.tracked {
+  background: rgba(230, 70, 210, 0.15);
+  border-left-color: #ff7be2;
+}
+
 
 /* ─────────── LAYOUT ─────────── */
 .stage {

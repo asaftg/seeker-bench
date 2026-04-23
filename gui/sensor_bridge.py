@@ -35,6 +35,7 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
             "vfov_deg": 60.0,
             "zoom_preset": "full",
             "detections": [],
+            "heat_tracks": [],
         }
 
     # JPEG-encode the AGC display image
@@ -67,6 +68,21 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
             }
         det_list.append(entry)
 
+    # Dev-mode heat-blob tracker snapshot. The GUI filters on its own
+    # devMode flag; we always send it so toggling dev-mode is a pure
+    # client-side operation (no round-trip).
+    heat_tracks = []
+    for ht in getattr(tf, "heat_tracks", None) or []:
+        heat_tracks.append({
+            "id": int(ht.id),
+            "bbox": {"x": ht.bbox.x, "y": ht.bbox.y, "w": ht.bbox.w, "h": ht.bbox.h},
+            "hits": int(ht.hits),
+            "misses": int(ht.misses),
+            "age": int(ht.age),
+            "confirmed": bool(ht.confirmed),
+            "coasting": bool(ht.coasting),
+        })
+
     return {
         "connected": True,
         "frame_id": tf.frame_id,
@@ -78,6 +94,7 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
         "vfov_deg": tf.vfov_deg,
         "zoom_preset": tf.zoom_preset,
         "detections": det_list,
+        "heat_tracks": heat_tracks,
     }
 
 
@@ -248,6 +265,7 @@ def build_ws_message(
     jpeg_quality: int = 80,
     nir_mode: str = "auto",
     tracked_target_id: Optional[int] = None,
+    tracked_heat_id: Optional[int] = None,
     top_n: int = 5,
 ) -> Dict[str, Any]:
     """Build the full WebSocket envelope.
@@ -313,6 +331,7 @@ def build_ws_message(
         "top_targets": top_targets,
         "main_target_id": main_id,
         "tracked_target_id": tracked_target_id,
+        "tracked_heat_id": tracked_heat_id,
         "gimbal": gimbal_payload,
         "illuminator": {
             "state": nir_mode,

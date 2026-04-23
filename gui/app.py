@@ -196,7 +196,12 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
         #   nir_mode / gimbal_*: pass-through to the wire payload.
         state = {
             "nir_mode": "auto",
-            "tracked_target_id": None,  # int | None (mirror of gimbal_manager lock)
+            "tracked_target_id": None,  # int | None (fused-track lock)
+            "tracked_heat_id": None,    # int | None (dev-mode raw heat-blob lock)
+            # Sync latch: becomes True once the gimbal publishes the lock
+            # back at us (proves the command took). Only then will a
+            # subsequent gimbal-side clear unwind our client mirror.
+            "_lock_confirmed": False,
         }
         gm = app.state.gimbal_manager
 
@@ -209,6 +214,34 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                     ef = BUS.get_latest(Topic.EO)
                     fused = BUS.get_latest(Topic.FUSED)
                     gstate = BUS.get_latest(Topic.GIMBAL)
+                    # Reconcile client-echo lock state with the authoritative
+                    # gimbal state. The gimbal thread owns the real lock;
+                    # we just mirror it here for the outgoing payload. If
+                    # the gimbal grace-dropped a lock, its published
+                    # `tracked_target_id` goes None — clear our mirror so
+                    # the GUI banner stops lying.
+                    #
+                    # IMPORTANT: compare against the gimbal's published
+                    # tracked_target_id, NOT against `mode`. Mode lags a
+                    # tick behind `set_track_heat()`, so clearing on
+                    # `mode == "manual"` would race with fresh TRACK
+                    # clicks and wipe them before the gimbal tick
+                    # promotes mode to "auto" (symptom: first click
+                    # centers but never shows "locked"; second works).
+                    if gstate is not None:
+                        gm_lock = getattr(gstate, "tracked_target_id", None)
+                        if gm_lock is None:
+                            # Only clear if we had previously confirmed a
+                            # lock was live end-to-end. A tick where the
+                            # client set a lock but the gimbal hasn't
+                            # picked it up yet ALSO shows gm_lock=None,
+                            # so we wait one more tick before clearing.
+                            if state.get("_lock_confirmed"):
+                                state["tracked_target_id"] = None
+                                state["tracked_heat_id"] = None
+                                state["_lock_confirmed"] = False
+                        else:
+                            state["_lock_confirmed"] = True
                     payload = build_ws_message(
                         tf=tf,
                         ef=ef,
@@ -217,6 +250,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                         jpeg_quality=jpeg_quality,
                         nir_mode=state["nir_mode"],
                         tracked_target_id=state["tracked_target_id"],
+                        tracked_heat_id=state["tracked_heat_id"],
                     )
                     # `default=str` is a safety net for numpy scalars that
                     # slip through the dataclass contracts — better to ship
@@ -255,21 +289,46 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                     if raw is None:
                         state["tracked_target_id"] = None
                         if gm is not None: gm.set_track_target(None)
-                        log.info("Track lock cleared → manual gimbal")
+                        log.info("Fused track lock cleared → manual gimbal")
                     else:
                         try:
                             tid = int(raw)
                             state["tracked_target_id"] = tid
+                            # Fused lock supersedes any dev-mode heat lock
+                            state["tracked_heat_id"] = None
                             if gm is not None: gm.set_track_target(tid)
                             log.info("Track lock → fused-id %d", tid)
                         except (TypeError, ValueError):
                             log.warning("Bad track_id payload: %r", raw)
 
+                elif command == "track_heat":
+                    # Dev-mode: lock the gimbal onto a raw heat-blob ID.
+                    # `heat_id: null` clears. Mutually exclusive with
+                    # the fused track lock.
+                    raw = cmd.get("heat_id", None)
+                    if raw is None:
+                        state["tracked_heat_id"] = None
+                        if gm is not None: gm.set_track_heat(None)
+                        log.info("Heat track lock cleared → manual gimbal")
+                    else:
+                        try:
+                            hid = int(raw)
+                            state["tracked_heat_id"] = hid
+                            state["tracked_target_id"] = None
+                            if gm is not None: gm.set_track_heat(hid)
+                            log.info("Track lock → heat-id H#%d", hid)
+                        except (TypeError, ValueError):
+                            log.warning("Bad heat_id payload: %r", raw)
+
                 elif command == "gimbal_manual":
-                    # Manual dpad always wins — releases any track lock.
+                    # Manual dpad always wins — releases any track lock
+                    # (both fused and heat).
                     if state["tracked_target_id"] is not None:
-                        log.info("Manual gimbal input — releasing track lock")
+                        log.info("Manual gimbal input — releasing fused track lock")
                         state["tracked_target_id"] = None
+                    if state["tracked_heat_id"] is not None:
+                        log.info("Manual gimbal input — releasing heat track lock")
+                        state["tracked_heat_id"] = None
                     dp = float(cmd.get("delta_pan", 0))
                     dt = float(cmd.get("delta_tilt", 0))
                     if gm is not None:
@@ -279,6 +338,8 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                 elif command == "gimbal_home":
                     if state["tracked_target_id"] is not None:
                         state["tracked_target_id"] = None
+                    if state["tracked_heat_id"] is not None:
+                        state["tracked_heat_id"] = None
                     if gm is not None:
                         gm.set_home()
                     log.info("Gimbal home")
