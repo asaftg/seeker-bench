@@ -408,6 +408,20 @@ class DetectionTracker:
         for trk in self._tracks:
             prev_cx, prev_cy = _centroid(trk.det.bbox)
             prev_centroids.append((prev_cx, prev_cy))
+            # If this is a synthetic track that was seeded without a
+            # frame (of_pts is None), grab features now so OF can
+            # start working from THIS tick forward. Without this the
+            # track would coast at v=0 forever and the gimbal would
+            # slew the scene out from under a frozen bbox.
+            if (trk.synthetic and trk.of_pts is None
+                    and agc8 is not None and _HAS_CV2):
+                trk.of_pts = _sample_features(agc8, trk.det.bbox,
+                                              self.cfg.of_max_features)
+                log.info(
+                    "synthetic track id=%d: late-sampled %d OF features",
+                    trk.id,
+                    0 if trk.of_pts is None else len(trk.of_pts),
+                )
             px, py = trk.kf.predict()
             predicted.append((px, py))
             # Shift bbox to predicted position. EMA later replaces this

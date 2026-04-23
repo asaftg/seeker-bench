@@ -91,6 +91,14 @@ class ThermalManager:
             )
         )
 
+        # Latest display-space grayscale frame, stashed each tick so a
+        # GUI-thread seed_synthetic_target() call can hand it to the
+        # tracker for initial OF feature sampling. Without this the
+        # synthetic track is born with of_pts=None → OF can never match
+        # → Kalman coasts at v=0 → bbox freezes in image space while
+        # the gimbal slews the scene out from under it.
+        self._last_display_gray: Optional[np.ndarray] = None
+
         self._classifier: Optional[Classifier] = None
         if enable_classifier:
             ccfg = cfg.get("classifier", {})
@@ -217,14 +225,37 @@ class ThermalManager:
         bbox was rejected (too small / off-frame guarded at the GUI).
         """
         try:
+            # Hand the current grayscale frame so the tracker can seed
+            # OF features inside the drawn bbox at birth. Without this
+            # the synthetic track has no features to lock and OF never
+            # matches on any subsequent frame.
+            gray = self._last_display_gray
             tid = self._tracker.seed_synthetic(
-                BBox(x=int(x), y=int(y), w=int(w), h=int(h))
+                BBox(x=int(x), y=int(y), w=int(w), h=int(h)),
+                agc8=gray,
             )
             if tid is not None:
+                n_feats = 0
+                try:
+                    for t in self._tracker.snapshot():
+                        if t.id == tid:
+                            # snapshot returns HeatTrackDebug-like items
+                            # without of_pts; check the internal list
+                            break
+                except Exception:
+                    pass
+                has_frame = gray is not None
                 log.info(
-                    "ThermalManager seeded synthetic target id=%d bbox=(%d,%d,%d,%d)",
-                    tid, x, y, w, h,
+                    "ThermalManager seeded synthetic target id=%d bbox=(%d,%d,%d,%d) "
+                    "frame_available=%s",
+                    tid, x, y, w, h, has_frame,
                 )
+                if not has_frame:
+                    log.warning(
+                        "Synthetic target seeded WITHOUT frame — OF will not "
+                        "engage until next update tick. Gimbal auto-lock may "
+                        "slew while bbox is frozen."
+                    )
             return tid
         except Exception as e:
             log.warning("seed_synthetic_target failed: %s", e)
@@ -467,6 +498,8 @@ class ThermalManager:
                 if display is not None and display.ndim == 3 else display
         except Exception:
             display_gray = None
+        # Publish for the GUI-thread seed_synthetic_target() call.
+        self._last_display_gray = display_gray
         try:
             detections = self._tracker.update(detections, display_gray)
         except Exception as e:
