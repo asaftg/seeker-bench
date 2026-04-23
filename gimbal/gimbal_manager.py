@@ -41,6 +41,7 @@ class _HeatObs:
     """Internal az/el observation derived from a heat-blob bbox."""
     az_deg: float
     el_deg: float
+    synthetic: bool = False  # True if the source is a user-drawn target
 
 
 def _clip(v: float, lim: float) -> float:
@@ -487,12 +488,27 @@ class GimbalManager:
                         # adding meaningful lag for real motion.
                         az_in, el_in = self._lp_filter_error(
                             float(heat_obs.az_deg), float(heat_obs.el_deg))
+                        # Synthetic targets have extra loop delay: OF
+                        # needs (prev, curr) + Kalman smoothing adds its
+                        # own dynamics. Using the same kp/deadband as a
+                        # direct heat-blob centroid pumps the servo. Soft
+                        # gains here trade settling precision for
+                        # stability — acceptable because a user-drawn
+                        # box doesn't need pixel-perfect centering.
+                        if heat_obs.synthetic:
+                            kp_eff  = self._kp_track * 0.6
+                            band    = self._deadband_deg * 1.6
+                            step_eff= self._max_step_deg * 0.6
+                        else:
+                            kp_eff  = self._kp_track
+                            band    = self._deadband_deg
+                            step_eff= self._max_step_deg
                         az, el, self._in_deadband = _hyst_deadband(
                             az_in, el_in,
-                            self._deadband_deg, self._deadband_exit_ratio,
+                            band, self._deadband_exit_ratio,
                             self._in_deadband)
-                        d_pan  = _clip(self._kp_track * az, self._max_step_deg)
-                        d_tilt = _clip(self._kp_track * el, self._max_step_deg)
+                        d_pan  = _clip(kp_eff * az, step_eff)
+                        d_tilt = _clip(kp_eff * el, step_eff)
                         d_tilt, tilt_sat = _pan_only_if_tilt_saturated(
                             cur_tilt, d_tilt,
                             self._tilt_floor, self._tilt_ceil,
@@ -679,7 +695,11 @@ class GimbalManager:
         az = nx * float(tf.hfov_deg)
         # y=0 is top of image; el positive = up → flip sign
         el = -ny * float(tf.vfov_deg)
-        return _HeatObs(az_deg=float(az), el_deg=float(el))
+        return _HeatObs(
+            az_deg=float(az),
+            el_deg=float(el),
+            synthetic=bool(getattr(hit, "synthetic", False)),
+        )
 
     def _command_now(self, pan_deg: float, tilt_deg: float) -> None:
         if not self._connected:
