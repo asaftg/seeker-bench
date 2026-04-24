@@ -35,12 +35,33 @@ Living roadmap — tomorrow's priorities on top, parked items below.
 Start the real work: extend `FusionManager` to consume `RadarTarget`s
 alongside EO/thermal detections, producing unified `FusedTrack`s where
 `sensors` can include "radar". This is the actual late-fusion (vs.
-today's projection overlay). Requires:
+today's projection overlay).
+
+**Why late (not early/mid):** all three sensors already produce tracked
+outputs — plugging radar into `FusionManager`'s existing track-to-track
+association is a local extension, not a rewrite. Early fusion discards
+radar's temporal smoothing; mid fusion (radar-points-into-image +
+shared detector) is a real win for detection at range but needs a
+joint model we don't have yet — revisit as Phase 3.
+
+Requires:
 - Observation model for radar (az, el from pos; range as extra gating
   feature the EO/thermal path doesn't have).
 - Track-to-track association gate for radar vs. existing tracks.
 - GUI row rendering already handles multi-sensor "sensors" lists, so
   minimal UI churn.
+
+### P1.5 — Gimbal tracking / PID tuning (separate ticket, non-radar)
+Target-lock tracking is functional but not tight. Action items:
+- Profile current pan/tilt error response with a step input (slew
+  onto a target, log error over time) to see actual rise/settle.
+- Tune PID gains (currently softened for synthetic-target scenes —
+  see commit `6e3e39c`). Real-target behavior may want different
+  balance between aggression and overshoot.
+- Consider splitting gains per-axis (tilt often needs more damping
+  than pan due to gravity-loaded servo).
+- Check deadband + slew-rate limiter interaction — mechanical
+  stops at pitch limits shouldn't trigger integrator windup.
 
 ---
 
