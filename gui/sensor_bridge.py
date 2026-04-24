@@ -101,9 +101,79 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
     }
 
 
+def _radar_target_to_panel_bboxes(
+    t: Any,
+    tf: Optional[ThermalFrame],
+    ef: Optional[EOFrame],
+    az_bias_deg: float = 0.0,
+    el_bias_deg: float = 0.0,
+) -> tuple[Optional[Dict[str, int]], Optional[Dict[str, int]]]:
+    """Project a single RadarTarget into thermal + EO pixel bboxes.
+
+    Radar frame convention (from tlv_parser): x=right, y=forward (range axis),
+    z=up. Boresight is +y. Matches fusion.angular's az-right / el-up convention.
+
+    Returns (bbox_thermal, bbox_eo) — either may be None if the target is
+    outside that sensor's FOV or that sensor's frame size is unknown.
+
+    NOTE: assumes radar and cameras are co-located with shared boresight.
+    That's good enough for the current bench setup; a real mount will need
+    extrinsic calibration (translation + rotation of radar relative to EO).
+    """
+    import math as _m
+    x, y, z = float(t.pos_x_m), float(t.pos_y_m), float(t.pos_z_m)
+    # Skip targets behind the sensor — projection is meaningless there.
+    if y <= 0.1:
+        return None, None
+    horiz = _m.sqrt(x * x + y * y)
+    az_deg = _m.degrees(_m.atan2(x, y)) + float(az_bias_deg)
+    el_deg = (_m.degrees(_m.atan2(z, horiz)) if horiz > 1e-6 else 0.0) + float(el_bias_deg)
+
+    # Angular extent from cluster size at slant range. Size is in metres;
+    # width uses lateral dim (sx), height uses vertical dim (sz). Floor at
+    # ~0.4° so a tiny cluster doesn't render as a single-pixel dot.
+    r_slant = _m.sqrt(x * x + y * y + z * z)
+    sx = max(0.4, float(t.size_x_m))
+    sz = max(0.4, float(t.size_z_m))
+    if r_slant < 0.5:
+        r_slant = 0.5
+    ang_w_deg = max(0.4, 2.0 * _m.degrees(_m.atan2(sx / 2.0, r_slant)))
+    ang_h_deg = max(0.4, 2.0 * _m.degrees(_m.atan2(sz / 2.0, r_slant)))
+
+    bt = None
+    if tf is not None and tf.connected and tf.agc8 is not None:
+        t_h, t_w = tf.agc8.shape[:2]
+        if t_w and t_h and angular_bbox_visible(
+            az_deg, el_deg, ang_w_deg, ang_h_deg, tf.hfov_deg, tf.vfov_deg
+        ):
+            bx, by, bw, bh = angular_to_bbox(
+                az_deg, el_deg, ang_w_deg, ang_h_deg,
+                t_w, t_h, tf.hfov_deg, tf.vfov_deg,
+            )
+            if bw > 0 and bh > 0:
+                bt = {"x": bx, "y": by, "w": bw, "h": bh}
+    be = None
+    if ef is not None and ef.connected and ef.bgr is not None:
+        e_h, e_w = ef.bgr.shape[:2]
+        if e_w and e_h and angular_bbox_visible(
+            az_deg, el_deg, ang_w_deg, ang_h_deg, ef.hfov_deg, ef.vfov_deg
+        ):
+            bx, by, bw, bh = angular_to_bbox(
+                az_deg, el_deg, ang_w_deg, ang_h_deg,
+                e_w, e_h, ef.hfov_deg, ef.vfov_deg,
+            )
+            if bw > 0 and bh > 0:
+                be = {"x": bx, "y": by, "w": bw, "h": bh}
+    return bt, be
+
+
 def radar_to_wire(
     rf: Optional[RadarFrame] = None,
     max_points: int = 256,
+    tf: Optional[ThermalFrame] = None,
+    ef: Optional[EOFrame] = None,
+    radar_az_bias_deg: float = 0.0,
+    radar_el_bias_deg: float = 0.0,
 ) -> Dict[str, Any]:
     """Serialize a RadarFrame for the WebSocket.
 
@@ -124,6 +194,7 @@ def radar_to_wire(
             "timestamp": rf.timestamp if rf is not None else 0.0,
             "profile": rf.profile if rf is not None else "awr2944p_ddm",
             "max_range_m": rf.max_range_m if rf is not None else 50.0,
+            "fov_half_deg": rf.fov_half_deg if rf is not None else 60.0,
             "num_points": 0,
             "num_targets": 0,
             "points": [],
@@ -160,8 +231,12 @@ def radar_to_wire(
         for d in dets
     ]
 
-    targets_wire = [
-        {
+    targets_wire = []
+    for t in rf.targets:
+        bt, be = _radar_target_to_panel_bboxes(
+            t, tf, ef, radar_az_bias_deg, radar_el_bias_deg,
+        )
+        targets_wire.append({
             "tid": int(t.tid),
             "x": round(t.pos_x_m, 3),
             "y": round(t.pos_y_m, 3),
@@ -175,10 +250,16 @@ def radar_to_wire(
             "conf": round(float(t.confidence), 2),
             "src": t.source,
             "np": int(t.num_points),
+            "coasting": bool(t.coasting),
+            "hits": int(t.hits),
+            "misses": int(t.misses),
             "class": "radar_detection",
-        }
-        for t in rf.targets
-    ]
+            # Pre-projected into each sensor's pixel grid for the radar-
+            # overlay option on EO / thermal panels. Either may be null
+            # (target outside FOV or that sensor disconnected).
+            "bbox_thermal": bt,
+            "bbox_eo": be,
+        })
 
     return {
         "connected": True,
@@ -353,6 +434,8 @@ def build_ws_message(
     tracked_target_id: Optional[int] = None,
     tracked_heat_id: Optional[int] = None,
     top_n: int = 5,
+    radar_az_bias_deg: float = 0.0,
+    radar_el_bias_deg: float = 0.0,
 ) -> Dict[str, Any]:
     """Build the full WebSocket envelope.
 
@@ -410,7 +493,11 @@ def build_ws_message(
         "ts": time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
         "eo": eo_to_wire(ef, jpeg_quality=jpeg_quality),
-        "radar": radar_to_wire(BUS.get_latest(Topic.RADAR)),
+        "radar": radar_to_wire(
+            BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
+            radar_az_bias_deg=radar_az_bias_deg,
+            radar_el_bias_deg=radar_el_bias_deg,
+        ),
         "fused": fused_wire,
         "tracks": [],
         "top_targets": top_targets,

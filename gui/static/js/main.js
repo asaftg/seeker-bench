@@ -14,6 +14,32 @@ const thermalView = new ThermalView("thermal-canvas", "thermal-disconnected");
 const eoView      = new EOView("eo-canvas", "eo-disconnected");
 const radarView   = new RadarView("radar-canvas");
 
+// Mini preview in the DEVELOPERS tab — shows the live thermal image
+// (no boxes/labels) next to the sensitivity sliders so the user sees
+// blob-bb effects immediately while tuning. Optional; disappears if
+// the DEV canvas isn't in the DOM.
+// Mini preview SHOWS overlays — that's the whole point: let the user
+// watch bounding boxes grow/shrink as they drag the sensitivity sliders.
+const thermalMini = document.getElementById("thermal-mini-canvas")
+  ? new ThermalView("thermal-mini-canvas", null)
+  : null;
+const radarMini = document.getElementById("radar-mini-canvas")
+  ? new RadarView("radar-mini-canvas")
+  : null;
+
+// Black-hot ↔ white-hot toggle. Drives BOTH views so tuning preview
+// and main panel stay consistent.
+(() => {
+  const cb = document.getElementById("thermal-invert");
+  if (!cb) return;
+  const apply = () => {
+    thermalView.setInvert(cb.checked);
+    if (thermalMini) thermalMini.setInvert(cb.checked);
+  };
+  cb.addEventListener("change", apply);
+  apply();
+})();
+
 // Delegated TRACK button handler — bound ONCE on the list container.
 // The list's innerHTML gets rewritten every WS frame (~20Hz), so any
 // per-button listener would race the rewrite and lose its click. The
@@ -58,12 +84,26 @@ const radarView   = new RadarView("radar-canvas");
 // ─────────────────────────────────────────────────────────────────────────
 // UI state (local mirror; reconciled from WS on each frame)
 // ─────────────────────────────────────────────────────────────────────────
-let _nirMode          = "auto";   // "auto" | "on" | "off"
 let _gimbalPan        = null;
 let _gimbalTilt       = null;
 let _trackedTargetId  = null;     // null = manual; int = user pressed TRACK
 let _trackedHeatId    = null;     // dev-mode: raw heat-blob tracker ID we asked gimbal to follow
 let _devMode          = false;    // developer overlays: heat-blob tracker debug, etc.
+let _recOn            = false;    // REC pill toggle — stubbed recording (backend logs but writes nothing yet)
+
+// Cross-sensor overlay gating — source-centric. Each flag controls
+// whether that sensor's tracks project onto the OTHER panels:
+//   radar:   draw radar bboxes (cyan dashed) on thermal + EO.
+//   thermal: thermal's contribution (fused 2-sensor boxes projected
+//            into EO pixel space, single-sensor-thermal projections
+//            into EO) appears on EO panel.
+//   eo:      EO's contribution appears on thermal panel.
+// Raw native detections on a panel's OWN sensor are unaffected.
+const _overlay = {
+  radar:   true,
+  thermal: true,
+  eo:      true,
+};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Draw-a-bbox synthetic target — thermal-panel debug/demo tool.
@@ -111,17 +151,70 @@ let _devMode          = false;    // developer overlays: heat-blob tracker debug
 })();
 
 // Developer-mode toggle — flips a client-only flag that views consult
-// when drawing. No round-trip: the backend always sends the debug
-// payload, the client decides whether to paint it.
+// when drawing. Relocated to the DEVELOPERS tab; the button now shows
+// its state as text ("ON"/"OFF") since it's a standalone control rather
+// than a topbar pill.
 (() => {
   const btn = document.getElementById("dev-toggle");
   if (!btn) return;
+  const sync = () => {
+    btn.classList.toggle("active", _devMode);
+    btn.textContent = _devMode ? "ON" : "OFF";
+  };
+  sync();
   btn.addEventListener("click", () => {
     _devMode = !_devMode;
-    btn.classList.toggle("active", _devMode);
-    btn.title = _devMode
-      ? "Developer overlays ON — click to hide heat-blob tracks"
-      : "Developer overlays (heat-blob tracker debug)";
+    sync();
+  });
+})();
+
+// Tab switcher — MAIN vs DEVELOPERS. Pure DOM toggle; no state persists.
+// The mini-preview canvases are hidden (display:none) at page load so
+// their bounding rect is 0×0 — their views pick up a 1×1 back-buffer.
+// On first activation of the DEV tab we nudge them to refit, then they
+// stay in sync via the resize listener and per-update rect check.
+(() => {
+  const btns = document.querySelectorAll(".tab-btn");
+  const panels = document.querySelectorAll(".tab-content");
+  btns.forEach(btn => {
+    btn.addEventListener("click", () => {
+      const want = btn.dataset.tab;
+      btns.forEach(b => b.classList.toggle("active", b === btn));
+      panels.forEach(p => p.classList.toggle("hidden", p.dataset.tab !== want));
+      if (want === "dev") {
+        // Two RAFs: first paint reveals the panel (giving canvases a
+        // non-zero rect), second RAF lets layout settle before refit.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (thermalMini && typeof thermalMini.refit === "function") thermalMini.refit();
+          if (radarMini   && typeof radarMini.refit   === "function") radarMini.refit();
+        }));
+      }
+    });
+  });
+})();
+
+// Overlay-screen toggles — one checkbox per sensor; turning a sensor
+// off hides its tracks from every OTHER panel.
+(() => {
+  const radar   = document.getElementById("overlay-radar");
+  const thermal = document.getElementById("overlay-thermal");
+  const eo      = document.getElementById("overlay-eo");
+  radar?.addEventListener("change",   () => { _overlay.radar   = radar.checked; });
+  thermal?.addEventListener("change", () => { _overlay.thermal = thermal.checked; });
+  eo?.addEventListener("change",      () => { _overlay.eo      = eo.checked; });
+})();
+
+// REC pill toggle — stubbed until HDF5 recording ships. We mirror state
+// visually so the user sees a red pulse while "recording", and send a
+// WS command so the backend can start logging (even if it writes nothing
+// to disk yet). The status bar reflects state from the WS echo.
+(() => {
+  const pill = document.getElementById("pill-rec");
+  if (!pill) return;
+  pill.addEventListener("click", () => {
+    _recOn = !_recOn;
+    pill.classList.toggle("pill-rec-on", _recOn);
+    wsSend({ command: "record", on: _recOn });
   });
 })();
 
@@ -382,39 +475,9 @@ function _renderHeatRows(msg) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// NIR toggle
-// ─────────────────────────────────────────────────────────────────────────
-document.querySelectorAll(".nir-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    const mode = btn.dataset.nir;
-    _nirMode = mode;
-    syncNirUI(mode);
-    wsSend({ command: "nir", mode });
-  });
-});
-
-function syncNirUI(mode) {
-  document.querySelectorAll(".nir-btn").forEach(b => {
-    b.classList.toggle("active", b.dataset.nir === mode);
-  });
-  const pill = $("pill-nir");
-  if (pill) {
-    if (mode === "off") {
-      setPill("pill-nir", "off", "NIR OFF");
-    } else if (mode === "on") {
-      setPill("pill-nir", "on", "NIR ON");
-    } else {
-      setPill("pill-nir", "warn", "NIR AUTO");
-    }
-  }
-  const hint = $("nir-hint");
-  if (hint) {
-    hint.textContent = mode === "auto" ? "pulsed 20% duty (safe)" :
-                       mode === "on"   ? "continuous — thermal caution!" :
-                                         "illuminator off";
-  }
-}
+// NIR illuminator: removed from GUI (manual flashlight, no host control).
+// Any legacy `illuminator` field on the WS payload is silently ignored
+// below in the message handler.
 
 // ─────────────────────────────────────────────────────────────────────────
 // Gimbal dpad
@@ -533,6 +596,128 @@ if (areaSlider) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Radar live tuning — DEV-tab sliders push via WS so the RadarManager's
+// SNR / azimuth gate / DBSCAN params update on the next processed frame.
+// ─────────────────────────────────────────────────────────────────────────
+(() => {
+  const rows = [
+    { id: "radar-snr",    key: "snr_min_db",        fmt: v => v.toFixed(1) + " dB",  round: v => v },
+    { id: "radar-az",     key: "az_half_deg",       fmt: v => "±" + v.toFixed(0) + "°", round: v => Math.round(v) },
+    { id: "radar-speed",  key: "speed_min_mps",     fmt: v => v.toFixed(1) + " m/s", round: v => v },
+    { id: "radar-range-min", key: "range_min_m",    fmt: v => v.toFixed(1) + " m",   round: v => v },
+    { id: "radar-eps",    key: "cluster_eps_pos_m", fmt: v => v.toFixed(1) + " m",   round: v => v },
+    { id: "radar-minpts", key: "cluster_min_samples", fmt: v => String(v),           round: v => Math.round(v), int: true },
+  ];
+  let _pending = {};
+  let _timer = null;
+  function flush() {
+    _timer = null;
+    const patch = _pending; _pending = {};
+    if (Object.keys(patch).length > 0) {
+      wsSend(Object.assign({ command: "radar_tune" }, patch));
+    }
+  }
+  function queue(key, val) {
+    _pending[key] = val;
+    if (_timer == null) _timer = setTimeout(flush, 80);
+  }
+  for (const row of rows) {
+    const sl = $(row.id);
+    const lbl = $(row.id + "-val");
+    if (!sl) continue;
+    const paint = () => {
+      const raw = parseFloat(sl.value);
+      const v = row.int ? row.round(raw) : raw;
+      if (lbl) lbl.textContent = row.fmt(v);
+      queue(row.key, v);
+    };
+    sl.addEventListener("input", paint);
+    paint();  // sync initial label
+  }
+
+  // Adopt server-side values on first message so manual edits in YAML
+  // don't fight with the slider defaults hard-coded in HTML.
+  let _hydrated = false;
+  window.__hydrateRadarTuning = (rt) => {
+    if (_hydrated || !rt) return;
+    _hydrated = true;
+    const map = {
+      "radar-snr":    rt.snr_min_db,
+      "radar-az":     rt.az_half_deg,
+      "radar-speed":  rt.speed_min_mps,
+      "radar-range-min": rt.range_min_m,
+      "radar-eps":    rt.cluster_eps_pos_m,
+      "radar-minpts": rt.cluster_min_samples,
+    };
+    for (const [id, v] of Object.entries(map)) {
+      const sl = $(id); const lbl = $(id + "-val");
+      if (!sl || v == null) continue;
+      sl.value = String(v);
+      const row = rows.find(r => r.id === id);
+      if (lbl && row) lbl.textContent = row.fmt(row.int ? Math.round(v) : v);
+    }
+  };
+})();
+
+// ─────────────────────────────────────────────────────────────────────────
+// Extrinsic calibration sliders — radar + thermal az/el bias vs. EO
+// (ground truth). Debounced `extrinsic_tune` WS command; hydrates from
+// the first server payload so YAML defaults win over HTML defaults.
+// ─────────────────────────────────────────────────────────────────────────
+(() => {
+  const rows = [
+    { id: "ext-radar-az",   key: "radar_az_bias_deg"   },
+    { id: "ext-radar-el",   key: "radar_el_bias_deg"   },
+    { id: "ext-thermal-az", key: "thermal_az_bias_deg" },
+    { id: "ext-thermal-el", key: "thermal_el_bias_deg" },
+  ];
+  const fmt = v => (v >= 0 ? "+" : "") + v.toFixed(1) + "°";
+  let _pending = {};
+  let _timer = null;
+  function flush() {
+    _timer = null;
+    const patch = _pending; _pending = {};
+    if (Object.keys(patch).length > 0) {
+      wsSend(Object.assign({ command: "extrinsic_tune" }, patch));
+    }
+  }
+  function queue(key, val) {
+    _pending[key] = val;
+    if (_timer == null) _timer = setTimeout(flush, 80);
+  }
+  for (const row of rows) {
+    const sl = $(row.id);
+    const lbl = $(row.id + "-val");
+    if (!sl) continue;
+    const paint = () => {
+      const v = parseFloat(sl.value);
+      if (lbl) lbl.textContent = fmt(v);
+      queue(row.key, v);
+    };
+    sl.addEventListener("input", paint);
+    paint();
+  }
+
+  let _hydrated = false;
+  window.__hydrateExtrinsic = (ext) => {
+    if (_hydrated || !ext) return;
+    _hydrated = true;
+    const map = {
+      "ext-radar-az":   ext.radar_az_bias_deg,
+      "ext-radar-el":   ext.radar_el_bias_deg,
+      "ext-thermal-az": ext.thermal_az_bias_deg,
+      "ext-thermal-el": ext.thermal_el_bias_deg,
+    };
+    for (const [id, v] of Object.entries(map)) {
+      const sl = $(id); const lbl = $(id + "-val");
+      if (!sl || v == null) continue;
+      sl.value = String(v);
+      if (lbl) lbl.textContent = fmt(Number(v));
+    }
+  };
+})();
+
+// ─────────────────────────────────────────────────────────────────────────
 // FPS counter
 // ─────────────────────────────────────────────────────────────────────────
 let _fps = { t0: performance.now(), frames: 0, current: "—" };
@@ -545,24 +730,6 @@ function tickFps() {
     _fps.t0      = now;
     _fps.frames  = 0;
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Status bar
-// ─────────────────────────────────────────────────────────────────────────
-function updateStatusBar(msg) {
-  const t = msg.thermal || {};
-  const det = t.detections ? t.detections.length : 0;
-  const tracks = (msg.tracks || []).length;
-  const mainId = msg.main_target_id || "—";
-
-  const left  = $("stat-left");
-  const mid   = $("stat-mid");
-  if (left) left.textContent =
-    `ws ${_fps.current} Hz · thermal ${_fps.current} Hz · eo — · radar —`;
-  const lock = (_trackedTargetId != null) ? `#${_trackedTargetId} AUTO` : "manual";
-  if (mid) mid.textContent =
-    `${det} det · ${tracks} tracks · main ${mainId} · gimbal ${lock} · rec OFF`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -603,12 +770,27 @@ function connect() {
     let msg;
     try { msg = JSON.parse(ev.data); } catch(_) { return; }
 
-    // Fusion: single green bbox on every panel for confirmed targets.
-    const fused = msg.fused || [];
+    // Source-centric overlay gating (DEV tab → OVERLAY SCREEN). A
+    // fused track appears on panel P iff at least one of its contributing
+    // sensors other than P has its overlay toggle on — turning off a
+    // sensor hides its contribution from the OTHER panels. Radar targets
+    // (projection-only, no late fusion yet) are gated by `_overlay.radar`.
+    const fusedAll = msg.fused || [];
+    const fusedForPanel = (panel) => fusedAll.filter(t => {
+      const sensors = t.sensors || [];
+      return sensors.some(s => s !== panel && _overlay[s]);
+    });
+    const fusedThermal = fusedForPanel("thermal");
+    const fusedEO      = fusedForPanel("eo");
+
+    const radarTargetsAll = (msg.radar && msg.radar.connected && msg.radar.targets) || [];
+    const radarForThermal = _overlay.radar ? radarTargetsAll : [];
+    const radarForEO      = _overlay.radar ? radarTargetsAll : [];
 
     // ── Thermal panel ──
     const thermal = msg.thermal || {};
-    thermalView.update(thermal, msg.main_target_id || null, fused, _devMode);
+    thermalView.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
+    if (thermalMini) thermalMini.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
     syncZoomButtons(thermal.zoom_preset);
 
     const thermHz = $("thermal-hz");
@@ -620,7 +802,7 @@ function connect() {
 
     // ── EO panel ──
     const eo = msg.eo || {};
-    eoView.update(eo, msg.main_target_id || null, fused);
+    eoView.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
     const eoHz = $("eo-hz");
     if (eoHz) eoHz.textContent = eo.connected ? (_fps.current + " Hz") : "— Hz";
@@ -647,37 +829,53 @@ function connect() {
     if (radarDisc) radarDisc.classList.toggle("hidden", !!radar.connected);
     setPill("pill-radar", radar.connected ? "on" : "off", "RADAR");
     radarView.update(radar);
+    if (radarMini) radarMini.update(radar);
 
-    // ── Illuminator pill ──
-    const illum = msg.illuminator;
-    if (illum) {
-      // Sync NIR state from backend (handles reconnect)
-      if (illum.state && illum.state !== _nirMode) {
-        _nirMode = illum.state;
-        syncNirUI(_nirMode);
+    // Hydrate DEV-tab radar sliders from the server-reported tuning on
+    // first tick so they reflect YAML defaults, not HTML-hard-coded ones.
+    if (msg.radar_tuning && typeof window.__hydrateRadarTuning === "function") {
+      window.__hydrateRadarTuning(msg.radar_tuning);
+    }
+    if (msg.extrinsic && typeof window.__hydrateExtrinsic === "function") {
+      window.__hydrateExtrinsic(msg.extrinsic);
+    }
+
+    // ── Recording pill echo ──
+    if (msg.recording != null) {
+      const want = !!msg.recording;
+      if (want !== _recOn) {
+        _recOn = want;
+        const pill = $("pill-rec");
+        if (pill) pill.classList.toggle("pill-rec-on", _recOn);
       }
     }
 
     // ── Gimbal pill + display ──
+    // Green when the servos are online (connected + responding). Amber
+    // when auto-tracking a target. Off only when the gimbal manager
+    // failed to start or the controller is disconnected.
     const gimbal = msg.gimbal;
     if (gimbal) {
       updateGimbalUI(gimbal);
       const mode = gimbal.mode || "manual";
-      setPill("pill-gimbal",
-              mode === "auto" ? "warn" : "off",
-              mode === "auto" ? "GIMBAL AUTO" : "GIMBAL");
+      const online = gimbal.connected !== false;   // treat missing field as online (older payloads)
+      if (!online) {
+        setPill("pill-gimbal", "off",  "GIMBAL");
+      } else if (mode === "auto") {
+        setPill("pill-gimbal", "warn", "GIMBAL AUTO");
+      } else {
+        setPill("pill-gimbal", "on",   "GIMBAL");
+      }
+    } else {
+      setPill("pill-gimbal", "off", "GIMBAL");
     }
 
     // ── Targets list (top 5 with TRACK buttons) ──
     renderTargets(msg);
-
-    // ── Status bar ──
-    updateStatusBar(msg);
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Boot
 // ─────────────────────────────────────────────────────────────────────────
-syncNirUI(_nirMode);
 connect();

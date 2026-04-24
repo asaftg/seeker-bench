@@ -362,12 +362,13 @@ body {
 }
 
 
-/* ─────────── ROW 2: target list + NIR ─────────── */
+/* ─────────── ROW 2: target list + gimbal dpad ─────────── */
 .row-main {
   display: grid;
   grid-template-columns: 3fr 1fr;
   gap: 10px;
 }
+.gimbal-card { padding: 10px 12px; }
 
 /* Targets card — ranked top-N with per-row TRACK button */
 .targets-card {
@@ -635,6 +636,58 @@ body {
 }
 .ctrl-val b { color: var(--cyan); }
 
+/* Thermal tuning card — sliders on the left, live mini preview on the right. */
+.thermal-tuning-card { min-width: 0; grid-column: span 2; }
+.thermal-tuning-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 16px;
+  align-items: stretch;
+}
+.thermal-tuning-sliders { min-width: 0; }
+.thermal-mini-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mini-preview-label {
+  font-size: 9.5px;
+  color: var(--text-3);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+.thermal-mini-preview canvas {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+}
+
+/* Radar tuning card — same pattern as thermal: sliders + mini preview. */
+.radar-tuning-card { min-width: 0; grid-column: span 2; }
+.radar-tuning-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 16px;
+  align-items: stretch;
+}
+.radar-tuning-sliders { min-width: 0; }
+.radar-mini-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.radar-mini-preview canvas {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+}
+
 /* Gimbal dpad */
 .dpad {
   display: grid;
@@ -709,6 +762,116 @@ select {
   font-size: 10.5px;
   color: var(--text-2);
   margin-bottom: 3px;
+}
+
+
+/* ─────────── TABS ─────────── */
+.tabbar {
+  display: flex;
+  gap: 0;
+  padding: 0 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  padding: 10px 18px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms, background 120ms;
+}
+.tab-btn:hover { color: var(--text-2); background: rgba(255,255,255,0.02); }
+.tab-btn.active {
+  color: var(--cyan);
+  border-bottom-color: var(--cyan);
+}
+.tab-content { display: flex; flex-direction: column; gap: 10px; }
+.tab-content.hidden { display: none; }
+
+/* DEV banner above the dev controls */
+.dev-banner {
+  font-size: 11px;
+  color: #ff7be2;
+  background: rgba(230, 70, 210, 0.08);
+  border: 1px solid rgba(230, 70, 210, 0.35);
+  padding: 8px 12px;
+  border-radius: 6px;
+}
+
+/* Big DEV toggle button inside the dev tab (replaces the topbar toggle) */
+.dev-toggle-big {
+  width: 100%;
+  padding: 10px 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  border-radius: 6px;
+  border: 1px solid var(--border-2);
+  background: rgba(90,100,128,0.15);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.dev-toggle-big:hover { color: #fff; }
+.dev-toggle-big.active {
+  background: rgba(230, 70, 210, 0.18);
+  border-color: rgba(230, 70, 210, 0.55);
+  color: #ff7be2;
+}
+
+/* Fusion overlay toggles */
+.fusion-row { margin-bottom: 6px; }
+.fusion-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-left: 16px;
+  padding-left: 10px;
+  border-left: 1px dashed var(--border-2);
+}
+.fusion-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.fusion-toggle input[type="checkbox"] {
+  accent-color: var(--green);
+  cursor: pointer;
+}
+.fusion-toggle.disabled {
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+.fusion-toggle em {
+  font-style: italic;
+  color: var(--text-3);
+  font-size: 10px;
+}
+
+/* REC pill — clickable when not recording, red-pulse when recording */
+#pill-rec { cursor: pointer; user-select: none; }
+#pill-rec:hover { filter: brightness(1.2); }
+#pill-rec.pill-rec-on {
+  background: var(--danger-dim);
+  color: var(--danger);
+}
+#pill-rec.pill-rec-on .dot {
+  animation: rec-pulse 1s infinite;
+  background: var(--danger);
+}
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(1.25); }
 }
 
 

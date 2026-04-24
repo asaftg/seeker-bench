@@ -1,24 +1,36 @@
-"""DBSCAN clustering + tracklet association for the AWR2944P point cloud.
+"""DBSCAN clustering + Kalman tracker for the AWR2944P point cloud.
 
 The AWR2944P mmw_demoDDM firmware emits the raw point cloud but does
 NOT ship TI's Group Tracker, so this module is the PRIMARY path for
-producing stable bounding boxes — not a fallback. See Ticket 5a plan.
+producing stable bounding boxes — not a fallback.
 
 Pipeline per frame:
     1. DBSCAN over (x, y, z, doppler) to group physically-close
        points that are also moving similarly.
     2. Compute each cluster's centroid and half-extents.
-    3. Greedy nearest-neighbour association to last frame's clusters
-       (gated by position distance) to carry forward a persistent
-       target ID — so the GUI can colour box 4 the same red every
-       frame even though DBSCAN has no notion of memory.
+    3. Associate each cluster to an existing tracklet (nearest-
+       neighbour, gate widens while the tracklet is coasting).
+    4. Constant-velocity Kalman update on matched tracklets;
+       unmatched tracklets coast (predict, don't update) until
+       they time out.
 
-Targets produced here are the class-less ``"radar_detection"``
-geometry agreed in the Ticket 5a design — semantic labelling (person
-vs. vehicle) happens in fusion against EO + thermal, never here.
+Two stabilisation layers sit on top of DBSCAN:
+
+  * M-of-N confirmation — a new tracklet must accumulate
+    ``confirm_min_hits`` hits in the last ``confirm_window`` frames
+    before it's published. Kills single-frame false positives that
+    would otherwise flash as a bbox on the display.
+
+  * Coast-on-miss — a confirmed tracklet with no association this
+    frame is predicted forward using its Kalman-estimated velocity
+    and still published, flagged ``coasting=True`` so the GUI can
+    render it dashed / dim. Dropped only after ``coast_max_frames``
+    consecutive misses — this is the dead-reckoning the operator
+    sees as a steady bbox through brief signal dropouts.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -29,58 +41,224 @@ from common.frames import RadarDetection, RadarTarget
 
 @dataclass
 class ClusterParams:
-    """DBSCAN + tracklet knobs.
+    """DBSCAN + tracker knobs.
 
-    ``eps_pos_m`` / ``eps_dop_mps`` together define DBSCAN's distance
-    metric — a point is a neighbour if its Euclidean-over-position
-    distance is within eps_pos_m AND its doppler difference is within
-    eps_dop_mps. Keeping these independent matters: two pedestrians
-    standing close together have similar position but different
-    velocity (when one is moving), and we want them as separate
-    boxes. Pure-position DBSCAN would merge them.
+    DBSCAN:
+        ``eps_pos_m`` / ``eps_dop_mps`` together define DBSCAN's
+        distance metric — a point is a neighbour if its Euclidean-
+        over-position distance is within eps_pos_m AND its doppler
+        difference is within eps_dop_mps.
+        ``min_samples`` = minimum points to seed a cluster.
+        ``min_size_m`` / ``max_size_m`` clamp reported bbox half-
+        extents so tiny clusters don't flicker and giant ones don't
+        dominate.
 
-    ``min_samples`` = minimum points to seed a cluster. Below this the
-    point is noise (target_id = 255).
+    Tracker:
+        ``assoc_gate_m`` = nearest-neighbour gate at dt=0 (fresh hit).
+        Gate grows at ``gate_growth_m_per_s`` per second of coast
+        to reflect the widening uncertainty ball around a coasting
+        track.
 
-    ``assoc_gate_m`` = nearest-neighbour gate (metres) for cross-frame
-    association. Set slightly larger than the largest plausible
-    per-frame motion at our radar FPS (20 Hz → ~1 m at 20 m/s).
+        ``coast_max_frames`` = drop a tracklet after this many
+        consecutive missed associations. At 10 Hz, 10 frames ≈ 1 s
+        of dead-reckoning — long enough to bridge packet dropouts,
+        short enough that a target that really left doesn't linger
+        as a ghost.
 
-    ``min_size_m`` / ``max_size_m`` clamp the reported bbox half-
-    extents. Tiny clusters would flicker as single pixels; giant ones
-    usually mean two objects got merged and we don't want to show a
-    confusingly-huge box.
+        ``confirm_min_hits`` / ``confirm_window`` — new tracklets
+        must score ``min_hits`` hits in the trailing ``window``
+        frames before their RadarTarget is published. 2-of-3 is the
+        usual sweet spot.
+
+        ``q_accel_mps2`` — process-noise RMS acceleration for the
+        constant-velocity model. Higher = trusts measurement more,
+        quicker response but more jitter. Lower = smoother but lags
+        maneuvers.
+
+        ``r_pos_m`` — measurement-noise std on position. DBSCAN
+        centroids jitter ~10-20 cm frame-to-frame on a rock-still
+        target, so ~0.3-0.5 m is realistic.
     """
-    eps_pos_m: float = 0.6
-    eps_dop_mps: float = 1.5
-    min_samples: int = 3
-    assoc_gate_m: float = 1.5
+    # DBSCAN
+    eps_pos_m: float = 8.0
+    eps_dop_mps: float = 3.0
+    min_samples: int = 2
     min_size_m: float = 0.25
     max_size_m: float = 3.0
+    # Tracker association
+    assoc_gate_m: float = 5.0
+    gate_growth_m_per_s: float = 2.0
+    # Absorb-orphan radius: if a DBSCAN cluster finds no free track but
+    # sits within this distance of an already-matched track's predicted
+    # centroid, drop it instead of spawning a new ID. Kills the "ghost"
+    # secondary IDs that appear when a single long / bright object
+    # (vehicle, wall front) fragments into two DBSCAN clusters — the
+    # first cluster claims the real track, the orphan is its split
+    # sibling, not a separate object.
+    merge_overlap_m: float = 5.0
+    # Tracker persistence
+    coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
+    confirm_min_hits: int = 2
+    confirm_window: int = 3
+    # Velocity half-life during coast (seconds). The Kalman's velocity
+    # stays latched to whatever it was at last measurement, so a target
+    # that actually slowed down would have its predicted position fly
+    # past the real location, pushing the re-acquisition cluster out of
+    # the association gate → new ID spawns. Damping the predicted
+    # velocity toward zero during coast (exp decay) keeps the predicted
+    # position near where the target actually is when it reappears.
+    coast_vel_halflife_s: float = 1.0
+    # Kalman
+    q_accel_mps2: float = 3.0           # higher = tracks pivots faster
+    r_pos_m: float = 0.4
+    # Track graveyard — reaped tracks are stashed for this many seconds
+    # before being fully forgotten. When a would-be new track's centroid
+    # lands within ``resurrect_radius_m`` of a graveyard entry, the old
+    # ID is resurrected instead of minting a fresh one. Handles both
+    # "target lost behind occlusion then reappears" and "target pivots
+    # sharply out of the gate, KF prediction overshoots, reacquires
+    # nearby" — classic sources of ID churn that coast budget alone
+    # can't fix.
+    graveyard_ttl_s: float = 4.0
+    resurrect_radius_m: float = 12.0
 
 
-@dataclass
 class _Tracklet:
-    """Per-target state carried across frames for ID persistence."""
-    tid: int
-    last_centroid: np.ndarray   # shape (3,), metres
-    last_velocity: np.ndarray   # shape (3,), m/s
-    misses: int                 # frames since last matched
-    hits: int                   # frames matched so far
+    """Per-target Kalman state carried across frames.
+
+    6D CV state: [px, py, pz, vx, vy, vz]. Measurement is position
+    only; radial-doppler is used as an init hint and mixed into the
+    velocity EMA for the published ``vel_*`` fields, but not as a
+    Kalman observation (would need a non-linear H at each step).
+    """
+
+    __slots__ = (
+        "tid", "x", "P", "size_half", "hits", "misses",
+        "hit_history", "confirmed", "last_hit_t",
+    )
+
+    def __init__(
+        self,
+        tid: int,
+        centroid: np.ndarray,
+        vel: np.ndarray,
+        size_half: np.ndarray,
+        now_t: float,
+        r_pos_m: float,
+    ) -> None:
+        self.tid = tid
+        # State [px,py,pz,vx,vy,vz]
+        self.x = np.zeros(6, dtype=np.float64)
+        self.x[0:3] = centroid
+        self.x[3:6] = vel
+        # Covariance: position uncertainty ~ R, velocity large (unknown).
+        self.P = np.eye(6, dtype=np.float64)
+        self.P[0:3, 0:3] *= (r_pos_m * r_pos_m)
+        self.P[3:6, 3:6] *= 25.0  # (5 m/s)^2 — we really don't know yet
+        self.size_half = size_half.astype(np.float64)
+        self.hits = 1
+        self.misses = 0
+        self.hit_history: List[bool] = [True]
+        self.confirmed = False
+        self.last_hit_t = now_t
+
+    def predict(
+        self,
+        dt: float,
+        q_accel_mps2: float,
+        coast_vel_halflife_s: float = 0.0,
+    ) -> None:
+        """Advance state by dt using CV model; inflate P by process noise.
+
+        If this tracklet is coasting (``misses > 0``) and a positive
+        ``coast_vel_halflife_s`` is provided, the velocity component of
+        the state is exponentially decayed toward zero before propagation.
+        That prevents a coasting predicted position from overshooting when
+        the real target has slowed or stopped — the common cause of a
+        reacquired target spawning a fresh ID because the KF prediction
+        landed outside the association gate.
+        """
+        if dt <= 0:
+            return
+        if self.misses > 0 and coast_vel_halflife_s > 0.0:
+            # exp decay: v *= 0.5 ** (dt / halflife)
+            decay = 0.5 ** (dt / coast_vel_halflife_s)
+            self.x[3:6] *= decay
+        F = np.eye(6, dtype=np.float64)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+        self.x = F @ self.x
+        # Discrete white-noise acceleration Q.
+        # Per-axis: [[dt^4/4, dt^3/2],[dt^3/2, dt^2]] * q_accel^2
+        q = float(q_accel_mps2) ** 2
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt2 * dt2
+        Qblk_pp = 0.25 * dt4 * q
+        Qblk_pv = 0.5 * dt3 * q
+        Qblk_vv = dt2 * q
+        Q = np.zeros((6, 6), dtype=np.float64)
+        for i in range(3):
+            Q[i, i] += Qblk_pp
+            Q[i + 3, i + 3] += Qblk_vv
+            Q[i, i + 3] += Qblk_pv
+            Q[i + 3, i] += Qblk_pv
+        self.P = F @ self.P @ F.T + Q
+
+    def update(self, z_pos: np.ndarray, r_pos_m: float) -> None:
+        """Kalman position measurement update."""
+        H = np.zeros((3, 6), dtype=np.float64)
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+        R = np.eye(3, dtype=np.float64) * (r_pos_m * r_pos_m)
+        y = z_pos - H @ self.x             # innovation
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        I6 = np.eye(6, dtype=np.float64)
+        self.P = (I6 - K @ H) @ self.P
+
+    @property
+    def centroid(self) -> np.ndarray:
+        return self.x[0:3]
+
+    @property
+    def velocity(self) -> np.ndarray:
+        return self.x[3:6]
+
+    def reconfirm_on_hit(self, window: int, min_hits: int) -> None:
+        self.hit_history.append(True)
+        if len(self.hit_history) > window:
+            self.hit_history = self.hit_history[-window:]
+        self.hits += 1
+        self.misses = 0
+        if not self.confirmed and sum(self.hit_history) >= min_hits:
+            self.confirmed = True
+
+    def miss_tick(self, window: int) -> None:
+        self.hit_history.append(False)
+        if len(self.hit_history) > window:
+            self.hit_history = self.hit_history[-window:]
+        self.misses += 1
 
 
 class RadarClusterer:
-    """Stateful DBSCAN + tracklet tracker for a point-cloud stream.
+    """Stateful DBSCAN + Kalman tracker for a point-cloud stream.
 
-    Stateful because we carry tracklet IDs across frames. One instance
-    per RadarManager — don't share across sensors.
+    One instance per RadarManager — don't share across sensors.
     """
 
     def __init__(self, params: Optional[ClusterParams] = None) -> None:
         self.params = params or ClusterParams()
         self._tracks: Dict[int, _Tracklet] = {}
         self._next_tid: int = 0
-        self._max_misses: int = 5  # ≈250 ms at 20 Hz — reap dead tracklets
+        self._last_step_t: Optional[float] = None
+        # Graveyard: tid → (last_centroid, last_velocity, reap_t). Entries
+        # live for params.graveyard_ttl_s then are forgotten. Used to
+        # resurrect IDs when a cluster spawns near a recently-dead track.
+        self._graveyard: Dict[int, Tuple[np.ndarray, np.ndarray, float]] = {}
 
     # ──────────────────────── public API ────────────────────────
     def step(
@@ -88,17 +266,30 @@ class RadarClusterer:
     ) -> Tuple[List[RadarDetection], List[RadarTarget]]:
         """Cluster the current frame and return (points-with-tid, targets).
 
-        The returned detections are the same objects passed in, with
-        their ``target_id`` field mutated to reflect cluster membership
-        (255 = noise / unassigned). No copy — the caller may treat it
-        as a returned list for readability.
+        Returned targets include confirmed tracklets that were either
+        updated this frame OR are coasting within budget. Unconfirmed
+        tracklets are kept internally but NOT emitted — that's the M-of-N
+        filter in action.
         """
-        if not detections:
-            # No points this frame — age existing tracklets so they
-            # time out properly during a brief signal dropout.
-            self._age_and_reap()
-            return detections, []
+        now_t = time.time()
+        dt = 0.1 if self._last_step_t is None else max(1e-3, now_t - self._last_step_t)
+        self._last_step_t = now_t
 
+        # Predict every tracklet forward to "now" before association,
+        # so the assoc gate is measured against the predicted position
+        # (important when a target moves fast between frames).
+        for trk in self._tracks.values():
+            trk.predict(
+                dt,
+                self.params.q_accel_mps2,
+                self.params.coast_vel_halflife_s,
+            )
+
+        if not detections:
+            self._miss_all_and_reap()
+            return detections, self._publish_coasting_only()
+
+        # ── DBSCAN ──
         pts = np.array(
             [[d.x_m, d.y_m, d.z_m, d.doppler_mps] for d in detections],
             dtype=np.float32,
@@ -110,137 +301,252 @@ class RadarClusterer:
             min_samples=self.params.min_samples,
         )
 
-        # Build per-cluster stats in positional coordinates.
         clusters: Dict[int, List[int]] = {}
         for i, lbl in enumerate(labels):
             if lbl < 0:
                 continue
             clusters.setdefault(int(lbl), []).append(i)
 
-        # Frame-local cluster → (centroid, size, mean_doppler, vel).
+        # ── Per-cluster stats in sensor coords ──
         frame_clusters: List[Tuple[int, np.ndarray, np.ndarray, np.ndarray, int]] = []
         for cid, idxs in clusters.items():
             xs = pts[idxs, 0]
             ys = pts[idxs, 1]
             zs = pts[idxs, 2]
             ds = pts[idxs, 3]
-            centroid = np.array([xs.mean(), ys.mean(), zs.mean()], dtype=np.float32)
-            # Half-extents = 1.5 × std, clamped. std alone under-sells
-            # small clusters; 3×std over-sells when the cloud is
-            # spiky. 1.5 is the visually-honest compromise.
+            centroid = np.array([xs.mean(), ys.mean(), zs.mean()], dtype=np.float64)
             half = np.array([
                 1.5 * float(xs.std() if len(xs) > 1 else self.params.min_size_m),
                 1.5 * float(ys.std() if len(ys) > 1 else self.params.min_size_m),
                 1.5 * float(zs.std() if len(zs) > 1 else self.params.min_size_m),
-            ], dtype=np.float32)
+            ], dtype=np.float64)
             np.clip(half, self.params.min_size_m, self.params.max_size_m, out=half)
 
-            # Velocity: doppler is radial (along the ray from sensor).
-            # We don't have the full 3D vel here; project the mean
-            # doppler back onto the (unit-centroid) ray. It's an
-            # approximation but it's what the gimbal / fuser actually
-            # wants — "which way is this target heading relative to
-            # our boresight".
+            # Radial-doppler → 3D velocity hint along the sensor ray.
             r = max(float(np.linalg.norm(centroid)), 1e-3)
             dir_hat = centroid / r
             vel = dir_hat * float(ds.mean())
             frame_clusters.append((cid, centroid, half, vel, len(idxs)))
 
-        # ── associate to existing tracklets (nearest neighbour, gated) ──
-        targets: List[RadarTarget] = []
-        matched_tracks: set[int] = set()
-
-        # Sort by largest cluster first so big persistent objects win
-        # when two competes for the same tracklet.
+        # Associate largest clusters first (greedy).
         frame_clusters.sort(key=lambda t: -t[4])
 
-        # Remember which point index → target tid so we can back-fill
-        # detections in a second pass.
+        matched_tracks: set[int] = set()
         cid_to_tid: Dict[int, int] = {}
 
         for cid, centroid, half, vel, n_pts in frame_clusters:
             tid = self._find_best_track(centroid, exclude=matched_tracks)
             if tid is None:
-                tid = self._next_tid
-                self._next_tid += 1
-                self._tracks[tid] = _Tracklet(
+                # Before creating a new track, check if this cluster is
+                # a DBSCAN-split sibling of an already-matched track —
+                # same object, two clusters this frame. Dropping it
+                # avoids the "ghost second ID" the operator sees parked
+                # next to the real one on long/bright targets.
+                if self._overlaps_matched(centroid, matched_tracks):
+                    continue
+                # Try to resurrect a recently-reaped track ID if this
+                # cluster lands near one. Happens when a target
+                # reappears after a long occlusion, or when a human
+                # pivots sharply and the KF prediction overshot the
+                # gate — same object, just looked briefly lost to the
+                # association step.
+                resurrected_tid = self._try_resurrect(centroid)
+                if resurrected_tid is not None:
+                    tid = resurrected_tid
+                else:
+                    tid = self._next_tid
+                    self._next_tid += 1
+                new_trk = _Tracklet(
                     tid=tid,
-                    last_centroid=centroid,
-                    last_velocity=vel,
-                    misses=0,
-                    hits=1,
+                    centroid=centroid,
+                    vel=vel,
+                    size_half=half,
+                    now_t=now_t,
+                    r_pos_m=self.params.r_pos_m,
                 )
+                # Resurrected IDs skip M-of-N re-warmup — only confirmed
+                # tracks get stashed in the graveyard, so by the time we
+                # pull one out we know the operator already saw this ID
+                # as a real target. Making them wait 2 frames to be
+                # visible again would show a brief "gap" in the trail.
+                if resurrected_tid is not None:
+                    new_trk.confirmed = True
+                self._tracks[tid] = new_trk
             else:
                 trk = self._tracks[tid]
-                # EMA smoothing — DBSCAN centroids jitter by 10-20 cm
-                # frame to frame even on a rock-still target. Low EMA
-                # alpha keeps boxes from quivering in the GUI.
+                trk.update(centroid, self.params.r_pos_m)
+                # Size: EMA the measured half-extents so clusters that
+                # shrink/grow by a point or two don't pulsate.
                 alpha = 0.5
-                trk.last_centroid = alpha * centroid + (1 - alpha) * trk.last_centroid
-                trk.last_velocity = alpha * vel + (1 - alpha) * trk.last_velocity
-                trk.misses = 0
-                trk.hits += 1
-                centroid = trk.last_centroid
-                vel = trk.last_velocity
+                trk.size_half = alpha * half + (1 - alpha) * trk.size_half
+                trk.reconfirm_on_hit(
+                    self.params.confirm_window,
+                    self.params.confirm_min_hits,
+                )
+                trk.last_hit_t = now_t
                 matched_tracks.add(tid)
 
             cid_to_tid[cid] = tid
 
-            targets.append(RadarTarget(
-                tid=int(tid),
-                pos_x_m=float(centroid[0]),
-                pos_y_m=float(centroid[1]),
-                pos_z_m=float(centroid[2]),
-                vel_x_mps=float(vel[0]),
-                vel_y_mps=float(vel[1]),
-                vel_z_mps=float(vel[2]),
-                size_x_m=float(half[0]),
-                size_y_m=float(half[1]),
-                size_z_m=float(half[2]),
-                confidence=min(1.0, n_pts / 10.0),  # more points → higher conf, capped
-                source="dbscan",
-                num_points=int(n_pts),
-            ))
+        # Age un-matched tracklets.
+        for tid, trk in list(self._tracks.items()):
+            if tid not in matched_tracks:
+                trk.miss_tick(self.params.confirm_window)
 
-        # Age un-matched tracklets; reap ones past timeout.
-        self._age_and_reap(matched=matched_tracks)
+        # Reap dead.
+        self._reap()
 
-        # Back-fill each detection's target_id from its DBSCAN label
-        # through the cluster → tid map (noise stays at 255).
+        # Back-fill detection→tid.
         for i, lbl in enumerate(labels):
             if lbl >= 0 and lbl in cid_to_tid:
                 detections[i].target_id = cid_to_tid[lbl]
             else:
                 detections[i].target_id = 255
 
+        # Publish confirmed tracks (hit this frame OR coasting).
+        targets = self._publish_all()
         return detections, targets
 
     # ──────────────────────── internals ────────────────────────
     def _find_best_track(
         self, centroid: np.ndarray, exclude: set[int]
     ) -> Optional[int]:
+        """Greedy gated nearest-neighbour. The gate scales with *both*
+        time-since-last-hit AND the track's own speed, so a 20 m/s
+        target coasting half a second gets a ~10 m catch radius instead
+        of the base-gate 3 m. Without this, re-acquired tracks spawn
+        fresh IDs mid-coast — operator sees "same box" jumping numbers.
+        """
+        base_gate = self.params.assoc_gate_m
+        growth = self.params.gate_growth_m_per_s
         best_tid: Optional[int] = None
-        best_d2 = self.params.assoc_gate_m * self.params.assoc_gate_m
+        best_d2 = float("inf")
+        now_t = self._last_step_t or time.time()
         for tid, trk in self._tracks.items():
             if tid in exclude:
                 continue
-            d = trk.last_centroid - centroid
+            dt_since = max(0.0, now_t - trk.last_hit_t)
+            speed = float(np.linalg.norm(trk.velocity))
+            # Gate = base + (const growth + per-track speed) * dt.
+            # At rest: just the linear growth term. Fast movers widen
+            # their own gate proportionally to how far they could have
+            # travelled since last measurement.
+            gate = base_gate + (growth + speed) * dt_since
+            gate2 = gate * gate
+            d = trk.centroid - centroid
             d2 = float(d @ d)
-            if d2 < best_d2:
+            if d2 < gate2 and d2 < best_d2:
                 best_d2 = d2
                 best_tid = tid
         return best_tid
 
-    def _age_and_reap(self, matched: Optional[set[int]] = None) -> None:
-        matched = matched or set()
-        dead: List[int] = []
-        for tid, trk in self._tracks.items():
-            if tid not in matched:
-                trk.misses += 1
-                if trk.misses > self._max_misses:
-                    dead.append(tid)
+    def _overlaps_matched(
+        self, centroid: np.ndarray, matched: set[int]
+    ) -> bool:
+        """True if centroid sits within merge_overlap_m of any already-
+        matched track's predicted position. Used to drop DBSCAN-split
+        siblings instead of spawning new IDs for them."""
+        gate2 = self.params.merge_overlap_m ** 2
+        for tid in matched:
+            trk = self._tracks.get(tid)
+            if trk is None:
+                continue
+            d = trk.centroid - centroid
+            if float(d @ d) < gate2:
+                return True
+        return False
+
+    def _miss_all_and_reap(self) -> None:
+        for trk in self._tracks.values():
+            trk.miss_tick(self.params.confirm_window)
+        self._reap()
+
+    def _reap(self) -> None:
+        now_t = self._last_step_t or time.time()
+        dead = [tid for tid, trk in self._tracks.items()
+                if trk.misses > self.params.coast_max_frames]
         for tid in dead:
+            trk = self._tracks[tid]
+            # Only confirmed tracks deserve resurrection — unconfirmed
+            # ones were transient anyway, no point keeping their ID.
+            if trk.confirmed:
+                self._graveyard[tid] = (
+                    trk.centroid.copy(),
+                    trk.velocity.copy(),
+                    now_t,
+                )
             del self._tracks[tid]
+        # Age out stale graveyard entries.
+        ttl = self.params.graveyard_ttl_s
+        stale = [tid for tid, (_, _, t_reap) in self._graveyard.items()
+                 if (now_t - t_reap) > ttl]
+        for tid in stale:
+            del self._graveyard[tid]
+
+    def _try_resurrect(self, centroid: np.ndarray) -> Optional[int]:
+        """Return a graveyard tid whose last position is closest to
+        ``centroid`` and within resurrect_radius_m — or None. The entry
+        is removed on success so two fresh clusters can't both claim
+        the same dead ID in the same frame."""
+        if not self._graveyard:
+            return None
+        gate2 = self.params.resurrect_radius_m ** 2
+        best_tid: Optional[int] = None
+        best_d2 = float("inf")
+        for tid, (last_xyz, _, _) in self._graveyard.items():
+            d = last_xyz - centroid
+            d2 = float(d @ d)
+            if d2 < gate2 and d2 < best_d2:
+                best_d2 = d2
+                best_tid = tid
+        if best_tid is not None:
+            del self._graveyard[best_tid]
+        return best_tid
+
+    def _publish_all(self) -> List[RadarTarget]:
+        """Return confirmed tracklets — hit this frame or coasting."""
+        out: List[RadarTarget] = []
+        for trk in self._tracks.values():
+            if not trk.confirmed:
+                continue
+            coasting = trk.misses > 0
+            out.append(self._to_target(trk, coasting))
+        return out
+
+    def _publish_coasting_only(self) -> List[RadarTarget]:
+        """No-detection path: confirmed tracks that are still within
+        coast budget get published as coasting."""
+        return self._publish_all()
+
+    def _to_target(self, trk: _Tracklet, coasting: bool) -> RadarTarget:
+        c = trk.centroid
+        v = trk.velocity
+        sz = trk.size_half
+        conf = min(1.0, trk.hits / 10.0)
+        if coasting:
+            # Decay confidence while coasting so the GUI can dim it.
+            conf *= max(
+                0.3,
+                1.0 - trk.misses / max(1, self.params.coast_max_frames),
+            )
+        return RadarTarget(
+            tid=int(trk.tid),
+            pos_x_m=float(c[0]),
+            pos_y_m=float(c[1]),
+            pos_z_m=float(c[2]),
+            vel_x_mps=float(v[0]),
+            vel_y_mps=float(v[1]),
+            vel_z_mps=float(v[2]),
+            size_x_m=float(sz[0]),
+            size_y_m=float(sz[1]),
+            size_z_m=float(sz[2]),
+            confidence=float(conf),
+            source="kalman",
+            num_points=int(trk.hits),
+            coasting=bool(coasting),
+            hits=int(trk.hits),
+            misses=int(trk.misses),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -259,9 +565,6 @@ def _dbscan(
 
     Distance gate: ``(dx² + dy² + dz²) ≤ eps_pos²`` AND
                    ``|doppler_i - doppler_j| ≤ eps_dop``.
-    Doppler acts as a hard gate rather than a distance component so
-    two objects at the same position but different velocities split
-    into separate clusters.
     """
     n = pts.shape[0]
     labels = np.full(n, -1, dtype=np.int32)
@@ -271,8 +574,6 @@ def _dbscan(
     xyz = pts[:, :3]
     dop = pts[:, 3]
 
-    # Precompute pairwise position distances (vectorised, N×N). Safe
-    # for N up to ~1k — our mmw_demoDDM emits at most ~300 points.
     diff = xyz[:, None, :] - xyz[None, :, :]
     d2 = (diff * diff).sum(axis=-1)
     dop_ok = np.abs(dop[:, None] - dop[None, :]) <= eps_dop
@@ -285,35 +586,26 @@ def _dbscan(
         visited[i] = True
         neighbour_idxs = np.flatnonzero(nbrs[i])
         if len(neighbour_idxs) < min_samples:
-            # labels[i] stays -1 — may get re-assigned as a border
-            # point later if another core point expands into it.
             continue
-
-        # Start a new cluster.
         labels[i] = next_label
-        # Seed queue with i's neighbours.
         queue = list(neighbour_idxs)
         qi = 0
         while qi < len(queue):
             j = queue[qi]
             qi += 1
             if labels[j] == -1:
-                labels[j] = next_label  # border point → current cluster
+                labels[j] = next_label
             if visited[j]:
                 continue
             visited[j] = True
             j_nbrs = np.flatnonzero(nbrs[j])
             if len(j_nbrs) >= min_samples:
-                # j is also a core point — extend the frontier.
-                # Only add neighbours we haven't already queued/visited.
                 queue.extend(int(k) for k in j_nbrs if labels[k] == -1)
-                # Assign immediately so we don't queue duplicates.
                 for k in j_nbrs:
                     if labels[k] == -1:
                         labels[k] = next_label
             elif labels[j] == -1:
                 labels[j] = next_label
-
         next_label += 1
 
     return labels

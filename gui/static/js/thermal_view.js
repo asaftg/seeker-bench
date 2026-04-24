@@ -10,6 +10,7 @@ import {
   drawHeatTrackDebug,
   drawSyntheticTargetBox,
   drawRubberBand,
+  drawRadarBox,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -28,6 +29,7 @@ export class ThermalView {
     this._lastFused = [];
     this._mainTargetId = null;
     this._lastHeatTracks = [];
+    this._lastRadarTargets = [];
     this._devMode = false;
     // Draw-a-bbox state: when _drawMode is true, the canvas shows a
     // crosshair and click-drag paints a rubber-band rect used to seed a
@@ -37,6 +39,11 @@ export class ThermalView {
     this._drag = null;  // {x0,y0,x1,y1} in canvas pixels, or null
     // Called on successful drag commit with IMAGE-space bbox {x,y,w,h}.
     this._onCommit = null;
+    // Black-hot vs white-hot: applied only to the drawImage call, not
+    // to overlays (boxes/labels stay their original colours).
+    this._invert = false;
+    // Optional extra rendering knobs for a mini preview instance.
+    this._hideOverlays = false;
     if (this.img) {
       this.img.onload = () => this._draw();
     }
@@ -57,6 +64,19 @@ export class ThermalView {
   // When active, mousedown+drag+mouseup on the thermal canvas produces
   // an image-space bbox which is forwarded via onCommit to the caller
   // (which sends the WS command). ESC cancels an in-flight drag.
+  setInvert(on) {
+    const v = !!on;
+    if (v === this._invert) return;
+    this._invert = v;
+    this._draw();
+  }
+  setHideOverlays(on) {
+    this._hideOverlays = !!on;
+  }
+  // Public re-fit — call after the parent element becomes visible
+  // (e.g. tab switch) so the canvas resizes from its 1×1 initial state.
+  refit() { this._fitCanvas(); }
+
   setDrawMode(on, onCommit = null) {
     this._drawMode = !!on;
     this._onCommit = onCommit;
@@ -152,10 +172,11 @@ export class ThermalView {
     if (this._lastFrameW > 0) this._draw();
   }
 
-  update(thermal, mainTargetId = null, fused = [], devMode = false) {
+  update(thermal, mainTargetId = null, fused = [], devMode = false, radarTargets = []) {
     this._mainTargetId = mainTargetId;
     this._lastFused = fused || [];
     this._devMode = !!devMode;
+    this._lastRadarTargets = radarTargets || [];
     if (!thermal || !thermal.connected) {
       if (this.overlay) this.overlay.classList.remove("hidden");
       this._clear();
@@ -197,7 +218,23 @@ export class ThermalView {
     const dy = (ch - dh) / 2;
 
     if (this.img.complete && this.img.naturalWidth > 0) {
-      this.ctx.drawImage(this.img, dx, dy, dw, dh);
+      if (this._invert) {
+        this.ctx.save();
+        this.ctx.filter = "invert(1)";
+        this.ctx.drawImage(this.img, dx, dy, dw, dh);
+        this.ctx.restore();
+      } else {
+        this.ctx.drawImage(this.img, dx, dy, dw, dh);
+      }
+    }
+
+    // Mini-preview mode: image only, no boxes/labels.
+    if (this._hideOverlays) {
+      if (this._drag) {
+        drawRubberBand(this.ctx, this._drag.x0, this._drag.y0,
+                       this._drag.x1, this._drag.y1);
+      }
+      return;
     }
 
     // Raw detections — suppressed only when a 2+ sensor fused box is
@@ -235,6 +272,24 @@ export class ThermalView {
           drawProjectedBox(this.ctx, bbox, trk, scale, dx, dy);
         }
       }
+    }
+
+    // Radar overlay: cyan dashed bboxes projected from radar tracks.
+    // Projection-only (no fusion ID sharing) — label carries radar TID
+    // so a user can match it to the radar panel's trails. Coasting
+    // tracks render dimmer.
+    for (const rt of this._lastRadarTargets) {
+      const bbox = rt.bbox_thermal;
+      if (!bbox) continue;
+      const x = dx + bbox.x * scale;
+      const y = dy + bbox.y * scale;
+      const w = bbox.w * scale;
+      const h = bbox.h * scale;
+      const label = `R#${rt.tid}${rt.coasting ? " · coast" : ""}`;
+      this.ctx.save();
+      if (rt.coasting) this.ctx.globalAlpha = 0.55;
+      drawRadarBox(this.ctx, x, y, w, h, label);
+      this.ctx.restore();
     }
 
     // Developer overlay: every heat-blob tracker entry (incl. pending

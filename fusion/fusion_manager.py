@@ -76,6 +76,15 @@ class FusionManager:
         self.min_hits = int(fcfg.get("min_hits", min_hits))
         self.max_misses = int(fcfg.get("max_misses", max_misses))
 
+        # Software extrinsic for THERMAL → EO alignment. Applied to thermal
+        # observations' az/el only; EO stays as ground truth. Tuned live
+        # from GUI sliders via set_extrinsic().
+        tcfg = cfg.get("thermal", {}) or {}
+        tex = (tcfg.get("extrinsic") or {})
+        self.thermal_az_bias_deg = float(tex.get("az_bias_deg", 0.0))
+        self.thermal_el_bias_deg = float(tex.get("el_bias_deg", 0.0))
+        self._ext_lock = threading.Lock()
+
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._tracks: list[dict] = []
@@ -102,6 +111,31 @@ class FusionManager:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    # ─────────────────────── live extrinsic tuning ───────────────────────
+    def set_extrinsic(
+        self,
+        *,
+        thermal_az_bias_deg: Optional[float] = None,
+        thermal_el_bias_deg: Optional[float] = None,
+    ) -> None:
+        """Hot-update thermal az/el bias used to align thermal with EO.
+
+        EO is the ground-truth reference, so only thermal gets biased.
+        Applied in ``_observations_from_thermal`` on the next tick.
+        """
+        with self._ext_lock:
+            if thermal_az_bias_deg is not None:
+                self.thermal_az_bias_deg = float(thermal_az_bias_deg)
+            if thermal_el_bias_deg is not None:
+                self.thermal_el_bias_deg = float(thermal_el_bias_deg)
+
+    def get_extrinsic(self) -> dict:
+        with self._ext_lock:
+            return {
+                "thermal_az_bias_deg": self.thermal_az_bias_deg,
+                "thermal_el_bias_deg": self.thermal_el_bias_deg,
+            }
 
     # ───────────────────────── main loop ─────────────────────────
     def _loop(self) -> None:
@@ -209,6 +243,12 @@ class FusionManager:
                 d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h,
                 w, h, tf.hfov_deg, tf.vfov_deg,
             )
+            # Software extrinsic: bias thermal az/el to align with EO
+            # (ground truth). Read under the lock so a mid-tick GUI
+            # slider update doesn't tear the two reads.
+            with self._ext_lock:
+                az += self.thermal_az_bias_deg
+                el += self.thermal_el_bias_deg
             out.append({
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,

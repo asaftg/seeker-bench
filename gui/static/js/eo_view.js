@@ -7,6 +7,7 @@ import {
   drawDetectionBox,
   drawFusedBox,
   drawProjectedBox,
+  drawRadarBox,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -23,6 +24,7 @@ export class EOView {
     this._lastFrameH = 0;
     this._lastDetections = [];
     this._lastFused = [];
+    this._lastRadarTargets = [];
     this._mainTargetId = null;
     if (this.img) {
       this.img.onload = () => this._draw();
@@ -40,9 +42,10 @@ export class EOView {
     if (this._lastFrameW > 0) this._draw();
   }
 
-  update(eo, mainTargetId = null, fused = []) {
+  update(eo, mainTargetId = null, fused = [], radarTargets = []) {
     this._mainTargetId = mainTargetId;
     this._lastFused = fused || [];
+    this._lastRadarTargets = radarTargets || [];
     if (!eo || !eo.connected) {
       if (this.overlay) this.overlay.classList.remove("hidden");
       this._clear();
@@ -109,6 +112,22 @@ export class EOView {
           drawProjectedBox(this.ctx, bbox, trk, scale, dx, dy);
         }
       }
+    }
+
+    // Radar overlay (projection-only, pre-fusion). Bbox is pre-projected
+    // into EO pixel space server-side. Coasting tracks render dimmer.
+    for (const rt of this._lastRadarTargets) {
+      const bbox = rt.bbox_eo;
+      if (!bbox) continue;
+      const x = dx + bbox.x * scale;
+      const y = dy + bbox.y * scale;
+      const w = bbox.w * scale;
+      const h = bbox.h * scale;
+      const label = `R#${rt.tid}${rt.coasting ? " · coast" : ""}`;
+      this.ctx.save();
+      if (rt.coasting) this.ctx.globalAlpha = 0.55;
+      drawRadarBox(this.ctx, x, y, w, h, label);
+      this.ctx.restore();
     }
   }
 }

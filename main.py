@@ -27,6 +27,7 @@ from eo.eo_manager import EOManager
 from fusion.fusion_manager import FusionManager
 from gimbal.gimbal_manager import GimbalManager
 from gui.app import create_app
+from radar.clustering import ClusterParams
 from radar.radar_manager import RadarManager
 from thermal.thermal_manager import ThermalManager
 
@@ -139,6 +140,30 @@ def main() -> int:
     radar_cfg = (cfg.get("radar") or {})
     if not args.no_radar and bool(radar_cfg.get("enabled", False)):
         try:
+            # Build cluster params from YAML, falling back to ClusterParams
+            # defaults for anything not set — so a minimal radar: block still
+            # works.
+            _defaults = ClusterParams()
+            _trk = (radar_cfg.get("tracker") or {})
+            cluster_params = ClusterParams(
+                eps_pos_m=float(radar_cfg.get("cluster_eps_pos_m", _defaults.eps_pos_m)),
+                eps_dop_mps=float(radar_cfg.get("cluster_eps_dop_mps", _defaults.eps_dop_mps)),
+                min_samples=int(radar_cfg.get("cluster_min_samples", _defaults.min_samples)),
+                min_size_m=float(radar_cfg.get("cluster_min_size_m", _defaults.min_size_m)),
+                max_size_m=float(radar_cfg.get("cluster_max_size_m", _defaults.max_size_m)),
+                assoc_gate_m=float(_trk.get("assoc_gate_m", _defaults.assoc_gate_m)),
+                gate_growth_m_per_s=float(_trk.get("gate_growth_m_per_s", _defaults.gate_growth_m_per_s)),
+                merge_overlap_m=float(_trk.get("merge_overlap_m", _defaults.merge_overlap_m)),
+                coast_max_frames=int(_trk.get("coast_max_frames", _defaults.coast_max_frames)),
+                coast_vel_halflife_s=float(_trk.get("coast_vel_halflife_s", _defaults.coast_vel_halflife_s)),
+                confirm_min_hits=int(_trk.get("confirm_min_hits", _defaults.confirm_min_hits)),
+                confirm_window=int(_trk.get("confirm_window", _defaults.confirm_window)),
+                q_accel_mps2=float(_trk.get("q_accel_mps2", _defaults.q_accel_mps2)),
+                r_pos_m=float(_trk.get("r_pos_m", _defaults.r_pos_m)),
+                graveyard_ttl_s=float(_trk.get("graveyard_ttl_s", _defaults.graveyard_ttl_s)),
+                resurrect_radius_m=float(_trk.get("resurrect_radius_m", _defaults.resurrect_radius_m)),
+            )
+            _ext = (radar_cfg.get("extrinsic") or {})
             radar = RadarManager(
                 cli_port=radar_cfg["cli_port"],
                 data_port=radar_cfg["data_port"],
@@ -146,8 +171,14 @@ def main() -> int:
                 cli_baud=int(radar_cfg.get("cli_baud", 115200)),
                 data_baud=int(radar_cfg.get("data_baud", 921600)),
                 snr_min_db=float(radar_cfg.get("snr_min_db", 12.0)),
-                max_range_m=float(radar_cfg.get("max_range_m", 50.0)),
+                max_range_m=float(radar_cfg.get("max_range_m", 250.0)),
+                az_half_deg=float(radar_cfg.get("az_half_deg", 60.0)),
+                speed_min_mps=float(radar_cfg.get("speed_min_mps", 0.0)),
+                range_min_m=float(radar_cfg.get("range_min_m", 0.0)),
                 profile_name=str(radar_cfg.get("profile_name", "awr2944p_ddm")),
+                cluster_params=cluster_params,
+                az_bias_deg=float(_ext.get("az_bias_deg", 0.0)),
+                el_bias_deg=float(_ext.get("el_bias_deg", 0.0)),
             )
             radar.start()
         except KeyError as e:
@@ -171,7 +202,13 @@ def main() -> int:
 
     # Build FastAPI app. The managers are passed in so the runtime
     # config endpoints can mutate detector parameters live from the GUI.
-    app = create_app(thermal_manager=thermal, eo_manager=eo, gimbal_manager=gimbal)
+    app = create_app(
+        thermal_manager=thermal,
+        eo_manager=eo,
+        gimbal_manager=gimbal,
+        radar_manager=radar,
+        fusion_manager=fusion,
+    )
 
     host = args.host or str(cfg.get("gui", {}).get("host", "127.0.0.1"))
     port = args.port or int(cfg.get("gui", {}).get("port", 8080))

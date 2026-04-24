@@ -6,6 +6,15 @@
 # Changing a value here and restarting the app should be enough.
 
 thermal:
+  # Software extrinsic calibration vs. EO (ground truth). Applied to
+  # thermal detections' angular pose inside FusionManager before cross-
+  # sensor association so the fused/projected thermal bbox lines up on
+  # the EO panel. Live-tunable from the DEV-tab EXTRINSIC CALIBRATION
+  # sliders. Zero = thermal boresight perfectly co-aligned with EO.
+  extrinsic:
+    az_bias_deg: 0.0
+    el_bias_deg: 0.0
+
   # Camera
   device_index: auto            # auto | 0 | 1 | 2 | 3
   resolution: [640, 512]        # FLIR Boson 640
@@ -37,9 +46,9 @@ heat_detector:
   # threshold = median(residual) + k * 1.4826 * MAD(residual)
   # Defaults tuned for an INDOOR 8-bit AGC'd scene — raise threshold_k
   # or lower min_blob_area_px once you're pointing at sky backgrounds.
-  threshold_k: 8.0              # lower = more sensitive (x MAD)
+  threshold_k: 20.0             # lower = more sensitive (x MAD). Default = minimum sensitivity; tune up via the DEV tab.
   background_kernel: 31         # spatial background kernel (odd)
-  min_blob_area_px: 80          # ignores noise specks (< ~9x9 px)
+  min_blob_area_px: 500         # very conservative; slider in DEV tab drops it to ~3 for max sensitivity
   max_blob_area_px: 30000       # allow large targets (hot cup at narrow zoom)
   max_detections_per_frame: 6
   algorithm: tophat
@@ -174,8 +183,102 @@ radar:
   data_baud: 3125000            # verified by brute-forcing bauds until magic word aligned
   cfg_path: "C:/ti/mmwave_mcuplus_sdk_04_07_02_01/ti/demo/awr2x44P/mmw_ddm/profiles/awr2944P/profile_3d_3Azim_1ElevTx_DDMA_awr2944P_highRange.cfg"
   profile_name: awr2944p_ddm
-  snr_min_db: 12.0              # drop detections below this — kills noise floor
-  max_range_m: 50.0             # match .cfg's profileCfg max range
+  snr_min_db: 6.0               # lower = more returns. Sparse-vehicle clouds were being gated out at 12 dB.
+  # Project objective is long-range detection. The highRange .cfg's
+  # profileCfg (slope 8.883 MHz/µs, ADC 30 MHz) supports ~250 m max
+  # unambiguous range — we pin max_range_m to the full capability.
+  # If you ever need further: author a new .cfg with a shallower slope.
+  max_range_m: 250.0
+  # Narrow the useful azimuth window — the AWR2944P antenna has lobes
+  # well off-boresight but most of that energy is sidelobe clutter at
+  # long range. Gating to ±az_half_deg concentrates the displayed point
+  # cloud into the main lobe, where SNR per target is highest and the
+  # remaining points are the ones worth clustering.
+  az_half_deg: 60.0
+  # Speed filter — drop points whose radial velocity (|doppler|) is
+  # below this threshold. 0.0 = off (show static returns too). Set
+  # above ~0.3 m/s to suppress walls / trees / parked cars and leave
+  # only movers, which is usually what you want for drone / vehicle
+  # watch. Applied BEFORE DBSCAN so static points don't pad clusters.
+  speed_min_mps: 0.4
+  # Near-range blanking — drop points (and hence any clusters) closer
+  # than this. Useful when the sensor mount, tripod, vehicle hood, or
+  # your own body are generating fat reflections right on top of the
+  # radar. 0.0 = off.
+  range_min_m: 0.0
+  # Software extrinsic calibration vs. EO (ground truth). Tunable live
+  # from the DEV-tab EXTRINSIC CALIBRATION sliders. Zero = radar boresight
+  # perfectly co-aligned with EO. Use to nudge the projected radar bbox
+  # on the EO/thermal panels until it overlaps the detected target.
+  extrinsic:
+    az_bias_deg: 0.0   # + = radar reads too far left; subtract bias to shift right
+    el_bias_deg: 0.0   # + = radar reads too low; subtract to shift up
+  # DBSCAN tuning — loose defaults so sparse vehicle returns still cluster.
+  # Larger eps_pos_m stitches a thin scatter into a single box; min_samples
+  # 3 lets a 3-point vehicle return form a box while still rejecting
+  # singletons that would flicker the display.
+  cluster_eps_pos_m: 8.0
+  cluster_eps_dop_mps: 3.0
+  # Min-samples 2 lets a distant sparse human (often just 2 returns) form
+  # a box. Singleton noise is still rejected by DBSCAN (a lone point
+  # needs ≥2 neighbours to be a core point); frame-to-frame M-of-N
+  # confirmation below kills the rare 2-point coincidence false positive.
+  cluster_min_samples: 2
+
+  # Kalman tracker — stabilises bboxes through flicker and brief dropouts.
+  # The clusterer runs a 6D constant-velocity Kalman filter per tracklet,
+  # predicts forward on frames with no association (coasting), and only
+  # publishes tracks that survived M-of-N confirmation.
+  tracker:
+    # Drop a coasting tracklet after this many consecutive missed
+    # associations. At ~13 Hz radar rate, 30 frames ≈ 2.3 s — enough
+    # to bridge a vehicle passing behind a tree / sign and still hold
+    # the ID for re-association. Combined with coast_vel_halflife_s
+    # damping below, a longer coast budget doesn't cause predictions
+    # to fly off into clutter.
+    coast_max_frames: 30
+    # Velocity half-life during coast (seconds). A coasting Kalman
+    # track normally holds its last-measured velocity forever, so if
+    # the target slows or stops while invisible, the KF prediction
+    # overshoots and the reacquired cluster lands outside the gate →
+    # new ID. Decaying velocity toward 0 keeps the prediction near
+    # "where the target probably still is".
+    coast_vel_halflife_s: 1.0
+    # New tracks must hit this many times in the last `confirm_window`
+    # frames before they're published to the GUI. Kills single-frame
+    # false positives that would otherwise flash as boxes.
+    confirm_min_hits: 2
+    confirm_window: 3
+    # Nearest-neighbour gate for cluster → tracklet association at dt=0
+    # (fresh hit). Gate grows by `gate_growth_m_per_s` per second since
+    # the last measurement, so coasting tracks keep a wider catch radius.
+    assoc_gate_m: 5.0
+    gate_growth_m_per_s: 2.0
+    # Absorb-orphan radius. When DBSCAN fragments a single long object
+    # (vehicle, wall) into two clusters, the second cluster can't claim
+    # the first's track (one-track-per-frame rule) and would otherwise
+    # spawn a phantom ID beside the real one. If its centroid sits
+    # within this many metres of an already-matched track, we drop it
+    # as a split sibling instead. Raise if you see twin IDs on big
+    # targets; lower if adjacent objects are being incorrectly merged.
+    merge_overlap_m: 5.0
+    # Process-noise RMS acceleration for the CV model. Higher = track
+    # reacts faster but jitters more; lower = smoother but lags maneuvers.
+    # 3.0 is tuned for humans that pivot sharply — a pedestrian changing
+    # direction had the KF velocity lag badly at 2.0 and the reacquired
+    # cluster landed outside the gate, causing ID churn.
+    q_accel_mps2: 3.0
+    # Measurement-noise std on position. DBSCAN centroids jitter
+    # ~10-20 cm frame-to-frame — 0.4 m is a realistic conservative value.
+    r_pos_m: 0.4
+    # Track graveyard — when a tracklet is reaped (coast budget exceeded)
+    # its last state is stashed for graveyard_ttl_s. If a new cluster
+    # appears within resurrect_radius_m of a graveyard entry, we reuse
+    # the old ID instead of minting a new one. Fixes "ID churn" where a
+    # target that briefly disappears (occlusion, sharp pivot, human
+    # changing direction) comes back with a fresh ID.
+    graveyard_ttl_s: 4.0
+    resurrect_radius_m: 12.0
 
 fusion:
   # Cross-sensor fusion (Ticket 5). Reads Thermal + EO (+ Radar when

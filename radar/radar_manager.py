@@ -55,10 +55,15 @@ class RadarManager:
         data_baud: int = 921600,
         reconnect_interval_s: float = 2.0,
         snr_min_db: float = 12.0,
-        max_range_m: float = 50.0,
+        max_range_m: float = 250.0,
+        az_half_deg: float = 60.0,
+        speed_min_mps: float = 0.0,
+        range_min_m: float = 0.0,
         profile_name: str = "awr2944p_ddm",
         stream_timeout_s: float = 3.0,
         cluster_params: Optional[ClusterParams] = None,
+        az_bias_deg: float = 0.0,
+        el_bias_deg: float = 0.0,
     ) -> None:
         self.cli_port = cli_port
         self.data_port = data_port
@@ -68,8 +73,17 @@ class RadarManager:
         self.reconnect_interval_s = float(reconnect_interval_s)
         self.snr_min_db = float(snr_min_db)
         self.max_range_m = float(max_range_m)
+        self.az_half_deg = float(az_half_deg)
+        self.speed_min_mps = float(speed_min_mps)
+        self.range_min_m = float(range_min_m)
         self.profile_name = str(profile_name)
+        self._tune_lock = threading.Lock()
         self.stream_timeout_s = float(stream_timeout_s)
+        # Software extrinsic — applied to each radar target's az/el before
+        # projection onto EO/thermal panels. Tuned live from GUI sliders
+        # against EO as ground truth. Zero = boresight matches cameras.
+        self.az_bias_deg = float(az_bias_deg)
+        self.el_bias_deg = float(el_bias_deg)
 
         self._stop = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
@@ -83,6 +97,76 @@ class RadarManager:
         self._data_ser: Optional[serial.Serial] = None
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
+
+    # ─────────────────────── live tuning ─────────────────────
+    def set_tuning(
+        self,
+        *,
+        snr_min_db: Optional[float] = None,
+        max_range_m: Optional[float] = None,
+        az_half_deg: Optional[float] = None,
+        speed_min_mps: Optional[float] = None,
+        range_min_m: Optional[float] = None,
+        cluster_eps_pos_m: Optional[float] = None,
+        cluster_eps_dop_mps: Optional[float] = None,
+        cluster_min_samples: Optional[int] = None,
+    ) -> None:
+        """Hot-update filter + cluster knobs without a manager restart.
+
+        Called from the WS ``radar_tune`` command so the operator can
+        drag sliders in the DEV tab and see the effect next frame. All
+        args optional — unspecified fields are left alone.
+        """
+        with self._tune_lock:
+            if snr_min_db is not None:
+                self.snr_min_db = float(snr_min_db)
+            if max_range_m is not None:
+                self.max_range_m = float(max_range_m)
+            if az_half_deg is not None:
+                self.az_half_deg = float(az_half_deg)
+            if speed_min_mps is not None:
+                self.speed_min_mps = float(speed_min_mps)
+            if range_min_m is not None:
+                self.range_min_m = float(range_min_m)
+            cp = self._clusterer.params
+            if cluster_eps_pos_m is not None:
+                cp.eps_pos_m = float(cluster_eps_pos_m)
+            if cluster_eps_dop_mps is not None:
+                cp.eps_dop_mps = float(cluster_eps_dop_mps)
+            if cluster_min_samples is not None:
+                cp.min_samples = int(cluster_min_samples)
+
+    def set_extrinsic(
+        self,
+        *,
+        az_bias_deg: Optional[float] = None,
+        el_bias_deg: Optional[float] = None,
+    ) -> None:
+        """Hot-update software extrinsic (az/el bias applied at projection).
+
+        EO is the ground-truth reference; radar bias nudges projected
+        radar bboxes to match EO detections without remounting.
+        """
+        with self._tune_lock:
+            if az_bias_deg is not None:
+                self.az_bias_deg = float(az_bias_deg)
+            if el_bias_deg is not None:
+                self.el_bias_deg = float(el_bias_deg)
+
+    def get_tuning(self) -> dict:
+        cp = self._clusterer.params
+        return {
+            "snr_min_db": self.snr_min_db,
+            "max_range_m": self.max_range_m,
+            "az_half_deg": self.az_half_deg,
+            "speed_min_mps": self.speed_min_mps,
+            "range_min_m": self.range_min_m,
+            "cluster_eps_pos_m": cp.eps_pos_m,
+            "cluster_eps_dop_mps": cp.eps_dop_mps,
+            "cluster_min_samples": cp.min_samples,
+            "az_bias_deg": self.az_bias_deg,
+            "el_bias_deg": self.el_bias_deg,
+        }
 
     # ─────────────────────── lifecycle ───────────────────────
     def start(self) -> None:
@@ -325,10 +409,20 @@ class RadarManager:
         #    SNR-aware firmwares (TDM, or a rebuilt DDM with SideInfo)
         #    will populate the field and the gate takes effect.
         import math as _m
+        # Azimuth gate: drop off-axis points outside the ±az_half_deg
+        # wedge. The AWR2944P antenna radiates well past ±60° but at
+        # long range most of that is sidelobe clutter, so concentrating
+        # on the main lobe cleans the display AND lets DBSCAN cluster
+        # the actual target returns without noise diluting them.
+        az_gate = self.az_half_deg
+        speed_gate = self.speed_min_mps
         gated: List[RadarDetection] = [
             d for d in pkt.detections
             if (_m.isnan(d.snr_db) or d.snr_db >= self.snr_min_db)
                and d.range_m <= self.max_range_m
+               and d.range_m >= self.range_min_m
+               and abs(d.az_deg) <= az_gate
+               and abs(d.doppler_mps) >= speed_gate
         ]
 
         # 2. DBSCAN + tracklet association.
@@ -345,6 +439,7 @@ class RadarManager:
             num_points=len(gated),
             num_targets=len(targets),
             max_range_m=self.max_range_m,
+            fov_half_deg=self.az_half_deg,
         )
         BUS.publish(Topic.RADAR, rf)
 
@@ -357,4 +452,5 @@ class RadarManager:
             connected=False,
             profile=self.profile_name,
             max_range_m=self.max_range_m,
+            fov_half_deg=self.az_half_deg,
         ))

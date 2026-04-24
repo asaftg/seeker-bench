@@ -348,7 +348,17 @@ class GimbalManager:
     def set_manual_delta(self, d_pan_deg: float, d_tilt_deg: float) -> None:
         """Incremental nudge from the dpad. Implicitly releases any
         active TRACK lock (fused or heat) so the user's arrows always
-        take priority."""
+        take priority.
+
+        We clamp the accumulator to configured limits HERE, at the
+        source, rather than relying solely on the controller's apply-
+        time clamp. Otherwise repeated presses at the rail silently
+        accrue past the limit (e.g. 22° tilt cap + 5 extra "up"
+        presses parks the target at 47°), forcing the operator to
+        unwind those 5 presses in the opposite direction before the
+        servo visibly moves again. Clamping at accept-time means every
+        press maps 1:1 to visible motion whenever motion is available.
+        """
         with self._lock:
             if self._tracked_id is not None:
                 log.info("Manual nudge → releasing fused track lock on #%d", self._tracked_id)
@@ -356,8 +366,14 @@ class GimbalManager:
             if self._tracked_heat_id is not None:
                 log.info("Manual nudge → releasing heat track lock on H#%d", self._tracked_heat_id)
                 self._tracked_heat_id = None
-            self._manual_pan  = self._manual_pan  + float(d_pan_deg)
-            self._manual_tilt = self._manual_tilt + float(d_tilt_deg)
+            new_pan  = self._manual_pan  + float(d_pan_deg)
+            new_tilt = self._manual_tilt + float(d_tilt_deg)
+            pan_lo  = float(self._pan_cal.min_deg)
+            pan_hi  = float(self._pan_cal.max_deg)
+            tilt_lo = float(self._tilt_floor)
+            tilt_hi = float(self._tilt_ceil)
+            self._manual_pan  = max(pan_lo,  min(pan_hi,  new_pan))
+            self._manual_tilt = max(tilt_lo, min(tilt_hi, new_tilt))
 
     def set_manual_absolute(self, pan_deg: float, tilt_deg: float) -> None:
         with self._lock:

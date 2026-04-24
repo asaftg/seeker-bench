@@ -254,6 +254,14 @@ class RadarTarget:
     confidence: float = 1.0
     source: str = "dbscan"
     num_points: int = 0
+    # Tracker state — populated by RadarClusterer's Kalman tracker.
+    # ``coasting`` = True when this target was NOT matched to a fresh
+    # DBSCAN cluster this frame; its position is Kalman-predicted from
+    # the last hit. The GUI renders coasting boxes dashed/dim so the
+    # operator can tell a dead-reckoned track from a measured one.
+    coasting: bool = False
+    hits: int = 0
+    misses: int = 0
 
 
 @dataclass
@@ -276,6 +284,10 @@ class RadarFrame:
     # polar canvas by this. Defaults to 50 m (stock DDM highRange
     # profile range limit).
     max_range_m: float = 50.0
+    # Half-angle (deg) of the azimuth gate applied in radar_manager.
+    # The GUI uses this to draw the ±FOV sector lines so the operator
+    # sees exactly which wedge is "in-gate".
+    fov_half_deg: float = 60.0
 
 
 # ───────────────────────────────────────────────────────────────

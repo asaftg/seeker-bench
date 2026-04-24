@@ -38,17 +38,22 @@ def _static_dir() -> Path:
     return base / "static"
 
 
-def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> FastAPI:
+def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
+               radar_manager=None, fusion_manager=None) -> FastAPI:
     """Create the FastAPI app.
 
     `thermal_manager` and `eo_manager` are optional — when provided, the
     runtime config endpoints in this module can mutate detector
     parameters live and swap capture devices without restarting.
+    `radar_manager` likewise exposes a live-tune hook for the DEV-tab
+    sensitivity sliders.
     """
     app = FastAPI(title="Seeker-01 Bench Test", version="0.1.0")
     app.state.thermal_manager = thermal_manager
     app.state.eo_manager = eo_manager
     app.state.gimbal_manager = gimbal_manager
+    app.state.radar_manager = radar_manager
+    app.state.fusion_manager = fusion_manager
 
     static_dir = _static_dir()
     if static_dir.exists():
@@ -201,6 +206,10 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
             # back at us (proves the command took). Only then will a
             # subsequent gimbal-side clear unwind our client mirror.
             "_lock_confirmed": False,
+            # Recording toggle — stubbed until HDF5 session recording ships.
+            # The flag is echoed back on every WS frame so the REC pill
+            # reflects the truth even after a reconnect.
+            "recording": False,
         }
         gm = app.state.gimbal_manager
 
@@ -241,6 +250,11 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                                 state["_lock_confirmed"] = False
                         else:
                             state["_lock_confirmed"] = True
+                    # Radar extrinsic read lock-free — floats, so a torn
+                    # read just lands between two slider ticks; harmless.
+                    rm_for_bias = app.state.radar_manager
+                    r_az = float(rm_for_bias.az_bias_deg) if rm_for_bias is not None else 0.0
+                    r_el = float(rm_for_bias.el_bias_deg) if rm_for_bias is not None else 0.0
                     payload = build_ws_message(
                         tf=tf,
                         ef=ef,
@@ -250,10 +264,41 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                         nir_mode=state["nir_mode"],
                         tracked_target_id=state["tracked_target_id"],
                         tracked_heat_id=state["tracked_heat_id"],
+                        radar_az_bias_deg=r_az,
+                        radar_el_bias_deg=r_el,
                     )
                     # `default=str` is a safety net for numpy scalars that
                     # slip through the dataclass contracts — better to ship
                     # a stringified value than kill the WS connection.
+                    # Attach the recording-state echo so the REC pill can
+                    # reconcile after reconnects. (No-op for downstream
+                    # consumers of build_ws_message — they don't inspect
+                    # this field.)
+                    payload["recording"] = bool(state.get("recording", False))
+                    # Attach current radar tuning so the DEV-tab sliders
+                    # can load correct initial positions (first frame only
+                    # — tiny cost, keeps the sender branchless).
+                    rm = app.state.radar_manager
+                    if rm is not None:
+                        try:
+                            payload["radar_tuning"] = rm.get_tuning()
+                        except Exception:
+                            pass
+                    # Extrinsic calibration (software bias vs. EO) — feed
+                    # the DEV-tab sliders so they hydrate with current
+                    # values on the first frame.
+                    ext = {}
+                    if rm is not None:
+                        ext["radar_az_bias_deg"] = float(rm.az_bias_deg)
+                        ext["radar_el_bias_deg"] = float(rm.el_bias_deg)
+                    fm = app.state.fusion_manager
+                    if fm is not None:
+                        try:
+                            ext.update(fm.get_extrinsic())
+                        except Exception:
+                            pass
+                    if ext:
+                        payload["extrinsic"] = ext
                     text = json.dumps(payload, default=str)
                 except WebSocketDisconnect:
                     raise
@@ -385,10 +430,74 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None) -> Fa
                             gm.set_track_heat(None)
 
                 elif command == "nir":
+                    # Retained for backwards-compat with older GUI builds
+                    # that still ship the NIR toggle. The current GUI no
+                    # longer sends this (NIR is a manual flashlight), but
+                    # accepting it silently avoids noisy "unknown command"
+                    # warnings during the transition.
                     mode = str(cmd.get("mode", "auto")).lower()
                     if mode in ("auto", "on", "off"):
                         state["nir_mode"] = mode
-                    log.info("NIR mode → %s (no hardware — display only)", mode)
+
+                elif command == "radar_tune":
+                    # Live-update radar filter + cluster knobs from the
+                    # DEV-tab sliders. Any subset may be present — the
+                    # RadarManager.set_tuning contract ignores None.
+                    rm = app.state.radar_manager
+                    if rm is None:
+                        pass  # radar disabled — ignore silently
+                    else:
+                        try:
+                            rm.set_tuning(
+                                snr_min_db=cmd.get("snr_min_db"),
+                                max_range_m=cmd.get("max_range_m"),
+                                az_half_deg=cmd.get("az_half_deg"),
+                                speed_min_mps=cmd.get("speed_min_mps"),
+                                range_min_m=cmd.get("range_min_m"),
+                                cluster_eps_pos_m=cmd.get("cluster_eps_pos_m"),
+                                cluster_eps_dop_mps=cmd.get("cluster_eps_dop_mps"),
+                                cluster_min_samples=cmd.get("cluster_min_samples"),
+                            )
+                        except Exception as e:
+                            log.warning("radar_tune failed: %s", e)
+
+                elif command == "extrinsic_tune":
+                    # Live-update software extrinsic (az/el bias) used
+                    # to align radar + thermal to EO (ground truth).
+                    # Any subset of the four knobs may be present.
+                    rm = app.state.radar_manager
+                    fm = app.state.fusion_manager
+                    if rm is not None:
+                        r_az = cmd.get("radar_az_bias_deg")
+                        r_el = cmd.get("radar_el_bias_deg")
+                        if r_az is not None or r_el is not None:
+                            try:
+                                rm.set_extrinsic(
+                                    az_bias_deg=r_az,
+                                    el_bias_deg=r_el,
+                                )
+                            except Exception as e:
+                                log.warning("radar extrinsic_tune failed: %s", e)
+                    if fm is not None:
+                        t_az = cmd.get("thermal_az_bias_deg")
+                        t_el = cmd.get("thermal_el_bias_deg")
+                        if t_az is not None or t_el is not None:
+                            try:
+                                fm.set_extrinsic(
+                                    thermal_az_bias_deg=t_az,
+                                    thermal_el_bias_deg=t_el,
+                                )
+                            except Exception as e:
+                                log.warning("thermal extrinsic_tune failed: %s", e)
+
+                elif command == "record":
+                    # Stubbed: no HDF5 writer yet. We toggle the flag so
+                    # the WS echo lights the REC pill, and log the intent
+                    # so future recording plumbing can hook in here.
+                    on = bool(cmd.get("on", False))
+                    state["recording"] = on
+                    log.info("Record toggle → %s (stub — no disk I/O yet)",
+                             "ON" if on else "OFF")
 
                 else:
                     log.warning("Unknown WS command: %s", command)
