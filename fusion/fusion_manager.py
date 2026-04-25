@@ -96,6 +96,12 @@ class FusionManager:
         # the same target. Tunable via YAML; promote to DEV-tab slider
         # once we know the right operating range.
         self.radar_iou_gate = float(fcfg.get("radar_iou_gate", 0.05))
+        # Per-sensor grace window: how many fusion ticks a sensor can
+        # miss a track before it's removed from the published `sensors`
+        # list. Larger = more "sticky" (fewer green→red flickers from
+        # 1-frame dropouts), smaller = the displayed sensor set tracks
+        # ground truth more tightly. Default 5 ticks = ~333ms at 15Hz.
+        self.sensor_grace_ticks = int(fcfg.get("sensor_grace_ticks", 5))
 
         # Software extrinsic for THERMAL → EO alignment. Applied to thermal
         # observations' az/el only; EO stays as ground truth. Tuned live
@@ -263,12 +269,20 @@ class FusionManager:
         # sees the target in the top-5 list. Uses self.radar_iou_gate
         # (more permissive than XSENSOR_IOU because radar bboxes are
         # cluster-extent-derived and tend to be coarser).
-        used_c = [False] * len(candidates)
+        # Snapshot the camera-candidate count BEFORE the outer loop
+        # because the unmatched-radar `else` branch appends to
+        # `candidates`, and the next outer iteration would otherwise
+        # walk past the end of `used_c`. Radar-vs-radar matching is
+        # already handled at radar-track level; only camera candidates
+        # are association targets here.
+        n_cam_cands = len(candidates)
+        used_c = [False] * n_cam_cands
         for r in radar_obs:
             best_i, best_iou = -1, 0.0
-            for i, c in enumerate(candidates):
+            for i in range(n_cam_cands):
                 if used_c[i]:
                     continue
+                c = candidates[i]
                 iou = angular_iou(
                     r["az"], r["el"], r["ang_w"], r["ang_h"],
                     c["az"], c["el"], c["ang_w"], c["ang_h"],
@@ -458,13 +472,21 @@ class FusionManager:
                 # (per Phase 2 design — EO/thermal classification wins).
                 if trk["class"] == rt and c["class"] != rt:
                     trk["class"] = c["class"]
-                # Sensor set accumulates — a track that has ever been
-                # fused stays "2-sensor" if the next tick only saw EO.
-                # Resetting per tick would make the green box flicker.
-                trk["sensors_now"] = list(c["sensors"])
+                # Per-sensor decay: bump everyone's miss count first,
+                # then reset to 0 for sensors actually seen this tick.
+                # Sensors that exceed the grace window get pruned, so
+                # `sensors` reflects WHO IS CURRENTLY SEEING IT (with
+                # a small grace) rather than who has ever seen it. The
+                # green "2+ sensor" pill therefore decays back to single-
+                # sensor automatically when radar leaves the scene.
+                for s in list(trk["sensor_misses"].keys()):
+                    trk["sensor_misses"][s] += 1
                 for s in c["sensors"]:
-                    if s not in trk["sensors_ever"]:
-                        trk["sensors_ever"].append(s)
+                    trk["sensor_misses"][s] = 0
+                trk["sensor_misses"] = {
+                    s: m for s, m in trk["sensor_misses"].items()
+                    if m <= self.sensor_grace_ticks
+                }
                 # Don't let a radar-only update steal `primary` from
                 # a real-class track — cameras own the primary sensor
                 # for any track that's been seen by EO/thermal.
@@ -480,8 +502,7 @@ class FusionManager:
                     "class": c["class"],
                     "az": c["az"], "el": c["el"],
                     "ang_w": c["ang_w"], "ang_h": c["ang_h"],
-                    "sensors_now": list(c["sensors"]),
-                    "sensors_ever": list(c["sensors"]),
+                    "sensor_misses": {s: 0 for s in c["sensors"]},
                     "primary": c["primary"],
                     "conf": c["conf"],
                     "hits": 1, "misses": 0,
@@ -494,10 +515,17 @@ class FusionManager:
                 kept.append(trk)
             else:
                 trk["misses"] += 1
-                # A track that isn't seen this tick is still alive, but
-                # its "current sensor set" drops to empty so the GUI
-                # knows to dim it.
-                trk["sensors_now"] = []
+                # No sensor saw this track this tick — bump every
+                # contributing sensor's miss counter and prune any that
+                # crossed the grace threshold. This is what makes the
+                # "RADAR" tag drop off ~333ms after radar stops seeing
+                # it, even while EO/thermal still hold the track alive.
+                for s in list(trk["sensor_misses"].keys()):
+                    trk["sensor_misses"][s] += 1
+                trk["sensor_misses"] = {
+                    s: m for s, m in trk["sensor_misses"].items()
+                    if m <= self.sensor_grace_ticks
+                }
                 if trk["misses"] <= self.max_misses:
                     kept.append(trk)
         self._tracks = kept
@@ -598,10 +626,12 @@ class FusionManager:
                     b["az"], b["el"], b["ang_w"], b["ang_h"],
                 )
                 if iou >= MERGE_IOU:
-                    # Fold b into a: union the sensor sets, bump hits.
-                    for s in b["sensors_ever"]:
-                        if s not in a["sensors_ever"]:
-                            a["sensors_ever"].append(s)
+                    # Fold b into a: union the active-sensor dict
+                    # taking min misses for any shared sensor (so a
+                    # freshly-seen sensor on either track wins).
+                    for s, m in b["sensor_misses"].items():
+                        cur = a["sensor_misses"].get(s)
+                        a["sensor_misses"][s] = m if cur is None else min(cur, m)
                     a["conf"] = max(a["conf"], b["conf"])
                     # If `a` is RADAR_TARGET and `b` carries a real
                     # class, promote — class always upgrades, never
@@ -622,11 +652,16 @@ class FusionManager:
                 tc = TargetClass(trk["class"])
             except ValueError:
                 tc = TargetClass.UNKNOWN
+            # Currently-active sensors only (per Phase 2: a sensor that
+            # stops contributing for > sensor_grace_ticks is pruned, so
+            # the "2+ sensor" outline decays back to single-sensor when
+            # e.g. radar leaves the scene).
+            active_sensors = sorted(trk["sensor_misses"].keys())
             out.append(FusedTrack(
                 id=int(trk["id"]),
                 target_class=tc,
                 confidence=float(trk["conf"]),
-                sensors=list(trk["sensors_ever"]),
+                sensors=active_sensors,
                 primary=str(trk["primary"]),
                 az_deg=float(trk["az"]),
                 el_deg=float(trk["el"]),

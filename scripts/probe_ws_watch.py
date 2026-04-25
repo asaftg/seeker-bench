@@ -77,7 +77,8 @@ async def main(duration_s: float = 300.0) -> None:
                             # Class locked? (track went radar-only AFTER having a real class)
                             if key[0] == ("radar",) and key[1] not in ("radar_target", "?"):
                                 class_locked_after_radar_only.append((tid, key[1]))
-                                print(f"          └─ class LOCKED at '{key[1]}' while only radar sees it ✓")
+                                # ASCII only — Windows cp1252 console can't encode box-drawing chars.
+                                print(f"          -> class LOCKED at '{key[1]}' while only radar sees it [OK]")
                     state[tid] = key
             # Track death
             for tid in list(state.keys()):
