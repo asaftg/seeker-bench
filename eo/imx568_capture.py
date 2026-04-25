@@ -69,26 +69,121 @@ def _fourcc_to_str(fourcc_int: int) -> str:
         return "?"
 
 
-def _clamp_exposure_for_g_saturation(cap: "cv2.VideoCapture") -> None:
-    """No-op stub. The 2026-04-24 attempt to manually clamp exposure by
-    flipping to AE=manual and walking CAP_PROP_EXPOSURE / CAP_PROP_GAIN
-    made the live image WORSE — every test value drove G further into
-    saturation, ending in "exposure clamp ran out of room" + a fully
-    blown-out white frame on the GUI.
+def _measure_frame_brightness(frame: np.ndarray) -> tuple[float, float]:
+    """Return (recovered Y mean, G-saturation fraction) on a 16× subsample.
 
-    Either this bridge interprets CAP_PROP_EXPOSURE in reverse vs. the
-    UVC log₂-seconds convention, or it ignores the writes entirely while
-    the gain write (set first) bumped to MAX gain on a 0..10 scale.
-    Without hardware introspection I can't tell which. Until I have a
-    safe way to probe direction (e.g. test +/- one stop and only commit
-    if mean brightness moved the expected direction), do nothing here
-    so the bridge's internal AE stays in charge and the image is at
-    least as good as before this function existed.
-
-    Kept as a named no-op so the call site in start() and any future
-    re-introduction path is obvious.
+    Mirrors the trust-weighted recovery in eo_processor._to_luma so the
+    AE loop sees the same "true Y" the user sees on screen, not the raw
+    BGR mean (which is ~150 for a saturated green frame whose true Y is
+    actually 240+).
     """
-    return
+    if frame is None or frame.size == 0:
+        return 0.0, 0.0
+    slab = frame[::16, ::16]
+    if slab.ndim == 3 and slab.shape[2] == 3:
+        g = slab[..., 1].astype(np.float32)
+        r = slab[..., 2].astype(np.float32)
+        gw = np.clip((255.0 - g) / 15.0, 0.0, 1.0)
+        rw = np.clip(r / 15.0, 0.0, 1.0)
+        yg = np.clip(g - 135.0, 0.0, 255.0)
+        yr = np.clip(r + 179.0, 0.0, 255.0)
+        tw = np.maximum(gw + rw, 1e-3)
+        y = (yg * gw + yr * rw) / tw
+        sat = float((g >= 254.0).mean())
+        return float(y.mean()), sat
+    # 2-D fallback (raw YUY2 mode shouldn't reach here, but be safe).
+    return float(slab.astype(np.float32).mean()), 0.0
+
+
+def _probe_software_ae_direction(
+    cap: "cv2.VideoCapture",
+) -> tuple[int, float]:
+    """One-shot startup probe: does CAP_PROP_EXPOSURE respond, and which
+    direction is brighter?
+
+    Strategy: flip to manual AE, write two test exposures separated by
+    several stops, and watch the recovered-Y mean move. Returns:
+        (sign, baseline_value) where
+            sign = +1  if higher CAP_PROP_EXPOSURE → brighter (UVC convention)
+            sign = -1  if higher CAP_PROP_EXPOSURE → dimmer (some bridges)
+            sign =  0  if neither test value moved the mean — bridge
+                       ignores the writes; software AE is hopeless on
+                       this hardware and we restore bridge AE.
+
+    Total cost ~1 s. Logs are explicit so the developer can SEE which
+    branch fired without re-running with a debugger.
+    """
+    def _settle_and_sample(value: float) -> Optional[tuple[float, float]]:
+        try:
+            cap.set(cv2.CAP_PROP_EXPOSURE, float(value))
+        except Exception:
+            return None
+        time.sleep(0.25)
+        last_frame = None
+        for _ in range(5):
+            ok, fr = cap.read()
+            if ok and fr is not None:
+                last_frame = fr
+        if last_frame is None:
+            return None
+        return _measure_frame_brightness(last_frame)
+
+    # Flip to manual AE first — without this, the bridge's internal AE
+    # may overwrite our exposure writes inside the 250 ms settle window.
+    try:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    except Exception as e:
+        log.info("software AE probe: AE=manual write threw %r", e)
+        return 0, -7.0
+
+    # Two probe values, ~3 stops apart. -7 ≈ 7.8 ms (typical indoor),
+    # -10 ≈ 1 ms (much darker). On a working bridge with conventional
+    # UVC sign, -7 should be brighter than -10.
+    sample_low = _settle_and_sample(-10.0)
+    sample_high = _settle_and_sample(-7.0)
+
+    if sample_low is None or sample_high is None:
+        log.info("software AE probe: no frames after exposure write — disabling")
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+        except Exception:
+            pass
+        return 0, -7.0
+
+    y_low, sat_low = sample_low
+    y_high, sat_high = sample_high
+    delta = y_high - y_low
+
+    if abs(delta) < 5.0:
+        log.warning(
+            "software AE probe: bridge does not respond to CAP_PROP_EXPOSURE "
+            "(Y at -10s=%.1f, Y at -7s=%.1f, delta=%.1f) — leaving bridge AE on",
+            y_low, y_high, delta,
+        )
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+        except Exception:
+            pass
+        return 0, -7.0
+
+    sign = 1 if delta > 0 else -1
+    # Pick the start exposure so we don't begin saturated. If the brighter
+    # of the two samples is already saturated, start from the darker.
+    if sat_high < 0.05 and y_high < 200:
+        baseline = -7.0
+    elif sat_low < 0.05 and y_low < 200:
+        baseline = -10.0
+    else:
+        baseline = -11.0  # darker still — sensor was hot at both
+    try:
+        cap.set(cv2.CAP_PROP_EXPOSURE, baseline)
+    except Exception:
+        pass
+    log.info(
+        "software AE probe: sign=%+d (delta=%.1f), baseline exposure=%.1f log₂s",
+        sign, delta, baseline,
+    )
+    return sign, baseline
 
 
 def _frame_has_spatial_content(frame: np.ndarray) -> bool:
@@ -140,6 +235,32 @@ class IMX568Capture:
         # when False, grab() falls back to BGR-with-broken-color-decode and
         # eo_processor's _to_luma has to recover from the green tint.
         self._raw_yuy2_mode: bool = False
+
+        # ── Software AE state ─────────────────────────────────────────────
+        #
+        # The bridge's internal AE is unreliable on this rig — it routinely
+        # drives the sensor far enough that DirectShow's YUY2→BGR decode
+        # clips G across most of the frame, which the YUY2 dead-zone
+        # recovery cannot undo. So after open we do a one-shot probe to
+        # learn whether CAP_PROP_EXPOSURE actually responds and in which
+        # direction (the convention varies by bridge), then run a closed-
+        # loop tick from grab() that nudges exposure to keep:
+        #     * G-saturation fraction below ~5%
+        #     * recovered Y mean roughly in [80, 160]
+        #
+        # If the probe finds the bridge ignores writes, we re-enable
+        # bridge AE and disable software AE — never end up worse than
+        # before this code existed.
+        self._sw_ae_enabled: bool = False    # set True after successful probe
+        self._sw_ae_sign: int = 0            # +1 conventional, -1 reversed, 0 broken
+        self._sw_ae_value: float = -7.0      # current exposure (UVC log₂-seconds)
+        self._sw_ae_min: float = -13.0       # ~0.12 ms
+        self._sw_ae_max: float = -3.0        # ~125 ms
+        self._sw_ae_frame_counter: int = 0
+        self._sw_ae_target_low: float = 80.0
+        self._sw_ae_target_high: float = 160.0
+        self._sw_ae_sat_limit: float = 0.05  # 5% G-clipped pixels triggers dim
+        self._sw_ae_tick_period: int = 10    # adjust at ~3 Hz on a 30 fps stream
 
     # ───────────────────────── lifecycle ─────────────────────────
 
@@ -238,25 +359,20 @@ class IMX568Capture:
                     )
                     has_content = _frame_has_spatial_content(test)
 
-                    # ── Saturation clamp ─────────────────────────────
+                    # ── Software AE bring-up ─────────────────────────
                     #
-                    # The bridge's internal AE regularly drives Y so
-                    # high that DirectShow's YUY2→BGR decode saturates
-                    # the G channel across most of the frame (G pegged
-                    # at 255). Everything past that point is lost to
-                    # the [120,179] dead zone — no amount of software
-                    # recovery brings it back.
-                    #
-                    # Fix: flip to manual exposure, walk the exposure
-                    # value down until G's 95th percentile drops below
-                    # 245 on a 16× subsample. We start at UVC log₂-s
-                    # = -6 (≈ 15 ms, a typical indoor target) and drop
-                    # 1 stop at a time; cap the search at 6 steps so a
-                    # bridge that ignores the writes doesn't stall us.
-                    # If the bridge rejects manual mode entirely, log
-                    # and fall through — recovery still works on the
-                    # saturated frame, it just looks noisier.
-                    _clamp_exposure_for_g_saturation(cap)
+                    # Probe whether CAP_PROP_EXPOSURE actually responds
+                    # and in which direction (UVC convention varies by
+                    # bridge), pick a sane starting exposure if so, and
+                    # leave software AE armed so grab() can keep the
+                    # frame out of G-saturation. If the probe finds the
+                    # bridge ignores writes, this falls back to bridge
+                    # AE and disables software AE so we never end up
+                    # worse than before this code existed.
+                    sw_ae_sign, sw_ae_baseline = _probe_software_ae_direction(cap)
+                    self._sw_ae_sign = sw_ae_sign
+                    self._sw_ae_value = sw_ae_baseline
+                    self._sw_ae_enabled = (sw_ae_sign != 0)
 
                     # ── Raw YUY2 attempt ───────────────────────────────
                     #
@@ -394,6 +510,9 @@ class IMX568Capture:
             return None
 
         if not self._raw_yuy2_mode:
+            # Run the software-AE feedback loop on the BGR fallback path.
+            # No-op if the startup probe disabled it.
+            self._software_ae_tick(frame)
             return frame
 
         # Raw YUY2 → mono Y plane → BGR (replicated luma).
@@ -414,6 +533,65 @@ class IMX568Capture:
 
     def is_open(self) -> bool:
         return self._cap is not None and self._cap.isOpened()
+
+    # ───────────────────────── software AE ───────────────────────
+
+    def _software_ae_tick(self, frame: np.ndarray) -> None:
+        """One feedback step of the closed-loop software AE.
+
+        Called once per ``grab()`` on the BGR fallback path. Throttles
+        itself to ``_sw_ae_tick_period`` frames so we adjust at ~3 Hz,
+        not 30 Hz (gives the sensor time to commit the new exposure
+        between pokes — UVC commits asynchronously).
+
+        Logic:
+          * G-clip > 5%  OR  recovered Y mean > 160 → step DIM
+          * recovered Y mean < 80                   → step BRIGHT
+          * otherwise                                → in-band, no change
+
+        Step size is 1 UVC stop (×2 / ÷2 in seconds). Direction is
+        determined at startup by ``_probe_software_ae_direction``; we
+        multiply by ``_sw_ae_sign`` so a reversed-convention bridge
+        gets the same effective behaviour.
+        """
+        if not self._sw_ae_enabled or self._cap is None:
+            return
+        self._sw_ae_frame_counter += 1
+        if self._sw_ae_frame_counter < self._sw_ae_tick_period:
+            return
+        self._sw_ae_frame_counter = 0
+
+        y_mean, sat = _measure_frame_brightness(frame)
+
+        # Dim if either: too bright, OR G channel is clipping (which
+        # destroys recoverable dynamic range regardless of mean).
+        too_bright = (y_mean > self._sw_ae_target_high) or (sat > self._sw_ae_sat_limit)
+        too_dark = y_mean < self._sw_ae_target_low
+
+        if not (too_bright or too_dark):
+            return
+
+        # 1 stop = ±1.0 in log₂-seconds. Sign is the bridge's convention.
+        # If conventional (sign=+1): brighter means LARGER exposure value;
+        # so to dim we subtract 1, to brighten we add 1.
+        # If reversed (sign=-1): we flip the math.
+        step = -1.0 if too_bright else 1.0
+        new_value = self._sw_ae_value + step * float(self._sw_ae_sign)
+        new_value = max(self._sw_ae_min, min(self._sw_ae_max, new_value))
+        if new_value == self._sw_ae_value:
+            return  # already railed against the limit
+        try:
+            self._cap.set(cv2.CAP_PROP_EXPOSURE, float(new_value))
+        except Exception as e:
+            log.debug("software AE write threw %r — disabling", e)
+            self._sw_ae_enabled = False
+            return
+        log.debug(
+            "AE %s: Y=%.1f sat=%.1f%% exposure %.1f→%.1f log₂s",
+            "dim" if too_bright else "bright",
+            y_mean, sat * 100.0, self._sw_ae_value, new_value,
+        )
+        self._sw_ae_value = new_value
 
     # ───────────────────────── controls ──────────────────────────
     #

@@ -137,8 +137,14 @@ def _recover_y_from_yuy2_bgr(bgr: np.ndarray) -> np.ndarray:
     g = bgr[..., 1].astype(np.float32)
     r = bgr[..., 2].astype(np.float32)
 
-    g_weight = np.clip((255.0 - g) / 15.0, 0.0, 1.0)
-    r_weight = np.clip(r / 15.0, 0.0, 1.0)
+    # Trust ramp width: 30 codes (was 15). A narrower ramp produced
+    # visible discontinuity stripes at the trust-transition boundaries
+    # — the "shattered glass on a leather chair" artifact in the live
+    # GUI (2026-04-24). 30 codes overlaps both estimators across a wide
+    # transition so neighboring pixels' alpha blends drift smoothly.
+    RAMP = 30.0
+    g_weight = np.clip((255.0 - g) / RAMP, 0.0, 1.0)
+    r_weight = np.clip(r / RAMP, 0.0, 1.0)
     y_from_g = np.clip(g - 135.0, 0.0, 255.0)
     y_from_r = np.clip(r + 179.0, 0.0, 255.0)
 
@@ -146,15 +152,22 @@ def _recover_y_from_yuy2_bgr(bgr: np.ndarray) -> np.ndarray:
     safe_w = np.maximum(total_w, 1e-3)
     y_blend = (y_from_g * g_weight + y_from_r * r_weight) / safe_w
 
-    # Spatially smooth fill: Gaussian-interpolate trusted pixels into
-    # low-confidence ones. 41 px kernel is wider than any typical
-    # transition-band stripe; den==0 protection keeps pure dead zones
-    # at a sane fallback (≈ mid-grey of the useful range).
+    # Spatially smooth fill for low-trust pixels.
+    # Two-scale fill: a wide kernel (81 px) carries broad illumination
+    # and a tight kernel (15 px) preserves nearer-neighbor structure.
+    # Combine 50/50 — the wide one alone produced posterized dead-zone
+    # fills (the leather-chair artifact); the tight one alone bled
+    # untrusted pixels into trusted ones.
     trust = np.clip(total_w, 0.0, 1.0)
-    k = 41
-    num = cv2.GaussianBlur((y_blend * trust).astype(np.float32), (k, k), 0)
-    den = cv2.GaussianBlur(trust.astype(np.float32), (k, k), 0)
-    fill = num / np.maximum(den, 1e-3)
+    weighted = (y_blend * trust).astype(np.float32)
+    trust_f = trust.astype(np.float32)
+    num_wide = cv2.GaussianBlur(weighted, (81, 81), 0)
+    den_wide = cv2.GaussianBlur(trust_f, (81, 81), 0)
+    num_tight = cv2.GaussianBlur(weighted, (15, 15), 0)
+    den_tight = cv2.GaussianBlur(trust_f, (15, 15), 0)
+    fill_wide = num_wide / np.maximum(den_wide, 1e-3)
+    fill_tight = num_tight / np.maximum(den_tight, 1e-3)
+    fill = 0.5 * fill_wide + 0.5 * fill_tight
 
     alpha = trust
     out = alpha * y_blend + (1.0 - alpha) * fill
@@ -319,22 +332,45 @@ def passthrough(bgr: np.ndarray) -> np.ndarray:
     # 3×3 median — cheap, edge-preserving, never hurts. ksize must be odd.
     y = cv2.medianBlur(y, 3)
     # Bilateral filter — smooths mid-tone speckle from the bridge's high
-    # analog gain while preserving text/structure edges. d=5, sigmaColor=20,
-    # sigmaSpace=5 is a conservative "photographer's denoise" — wipes the
-    # salt-and-pepper without wiping readable text. ~4 ms at 1236×1029.
-    y = cv2.bilateralFilter(y, 5, 20, 5)
-    # Percentile stretch (1..99 — safer than 0.5..99.5 on a recovered
-    # frame where outlier pixels can exist in either dead-zone fill or
-    # saturated bright highlights). Falls back to absolute min/max, then
-    # to pass-through, so a flat frame is never hidden from the operator.
+    # analog gain AND the YUY2 dead-zone fill discontinuities. d=9,
+    # sigmaColor=40, sigmaSpace=9 is strong enough to dissolve the
+    # "shattered glass" pattern on smooth surfaces (leather, walls)
+    # while preserving text and high-contrast edges. ~12 ms at
+    # 1236×1029 — still fits the 30 fps budget, easily.
+    y = cv2.bilateralFilter(y, 9, 40, 9)
+    # Adaptive AGC stretch.
+    #
+    # The naive "stretch p1..p99 to 0..255" path EXPLODES on this bridge
+    # the moment AE drives the sensor to saturation: the recovered Y
+    # collapses to a near-constant ~235 with std≈0.3, so p99-p1 is 1-2
+    # codes, the implied scale is 200x, and per-pixel read noise gets
+    # turned into a snow-globe of full-black and full-white speckle. The
+    # GUI then shows a uniform white panel with thousands of tiny dark
+    # dots — exactly the failure mode we hit on 2026-04-24.
+    #
+    # Three guards:
+    #   1. Use [2, 98] instead of [1, 99] — more outlier-tolerant on the
+    #      saturated bridge frame where 1% can sit in a clipped tail.
+    #   2. CAP the stretch gain at 6×. If the input dynamic range is
+    #      smaller than ~42 codes, we don't fully renormalize to 0..255;
+    #      we lift it ~6× and let it sit in whatever band it lands in.
+    #      This stops noise amplification cold.
+    #   3. If dynamic range is below 8 codes (essentially flat — lens
+    #      capped, sensor saturated, or dark room), skip stretch
+    #      entirely; just centre the histogram on 128 by subtracting
+    #      mean and adding 128. The operator sees a uniform mid-gray
+    #      with a faint texture, NOT noise turned to static.
     sample = y[::4, ::4]
-    lo, hi = np.percentile(sample, [1.0, 99.0])
-    if hi <= lo:
-        lo = float(sample.min())
-        hi = float(sample.max())
-    if hi > lo:
-        scale = 255.0 / (hi - lo)
-        y = np.clip((y.astype(np.float32) - lo) * scale, 0, 255).astype(np.uint8)
+    lo, hi = np.percentile(sample, [2.0, 98.0])
+    dyn = float(hi) - float(lo)
+    if dyn < 8.0:
+        # Flat frame — recenter histogram, no stretch, no amplification.
+        mean = float(sample.mean())
+        y = np.clip(y.astype(np.float32) - mean + 128.0, 0, 255).astype(np.uint8)
+    else:
+        scale = min(255.0 / dyn, 6.0)
+        y = np.clip((y.astype(np.float32) - float(lo)) * scale,
+                    0, 255).astype(np.uint8)
     # Gamma 0.85 — gentle midtone lift.
     y = cv2.LUT(y, _gamma_lut(0.85))
     return cv2.cvtColor(y, cv2.COLOR_GRAY2BGR)
