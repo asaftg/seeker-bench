@@ -330,48 +330,39 @@ def passthrough(bgr: np.ndarray) -> np.ndarray:
         return bgr
     y = _to_luma(bgr)
     # 3×3 median — cheap, edge-preserving, never hurts. ksize must be odd.
+    # Removes salt-and-pepper sensor speckle from the analog gain stage.
     y = cv2.medianBlur(y, 3)
-    # Bilateral filter — smooths mid-tone speckle from the bridge's high
-    # analog gain AND the YUY2 dead-zone fill discontinuities. d=9,
-    # sigmaColor=40, sigmaSpace=9 is strong enough to dissolve the
-    # "shattered glass" pattern on smooth surfaces (leather, walls)
-    # while preserving text and high-contrast edges. ~12 ms at
-    # 1236×1029 — still fits the 30 fps budget, easily.
-    y = cv2.bilateralFilter(y, 9, 40, 9)
     # Adaptive AGC stretch.
     #
-    # The naive "stretch p1..p99 to 0..255" path EXPLODES on this bridge
-    # the moment AE drives the sensor to saturation: the recovered Y
-    # collapses to a near-constant ~235 with std≈0.3, so p99-p1 is 1-2
-    # codes, the implied scale is 200x, and per-pixel read noise gets
-    # turned into a snow-globe of full-black and full-white speckle. The
-    # GUI then shows a uniform white panel with thousands of tiny dark
-    # dots — exactly the failure mode we hit on 2026-04-24.
+    # With the PyAV raw-YUY2 path now in place, the input Y plane is
+    # already a clean 0..255 mono stream from the sensor — the broken-
+    # decode era's "uniform-white-with-dots" and "shattered-glass on
+    # leather" failure modes are gone. The stretch is here to lift
+    # underexposed scenes (Y mean ≈40..80) into the 0..255 display
+    # range without amplifying noise on a high-contrast frame that's
+    # already well-distributed.
     #
-    # Three guards:
-    #   1. Use [2, 98] instead of [1, 99] — more outlier-tolerant on the
-    #      saturated bridge frame where 1% can sit in a clipped tail.
-    #   2. CAP the stretch gain at 6×. If the input dynamic range is
-    #      smaller than ~42 codes, we don't fully renormalize to 0..255;
-    #      we lift it ~6× and let it sit in whatever band it lands in.
-    #      This stops noise amplification cold.
-    #   3. If dynamic range is below 8 codes (essentially flat — lens
-    #      capped, sensor saturated, or dark room), skip stretch
-    #      entirely; just centre the histogram on 128 by subtracting
-    #      mean and adding 128. The operator sees a uniform mid-gray
-    #      with a faint texture, NOT noise turned to static.
+    # Two guards remain (both genuine corner cases):
+    #   1. If the dynamic range is below 8 codes (lens cap, total dark
+    #      room, sensor stuck), skip the stretch entirely and centre
+    #      the histogram on 128. The operator sees a uniform mid-gray
+    #      with faint texture instead of noise turned to static.
+    #   2. CAP the stretch gain at 4×. Even on a clean Y plane, an
+    #      indoor frame with one tiny bright LED can produce a tight
+    #      lo..hi band; ungated stretch would amplify the rest of the
+    #      noise floor visibly. 4× covers the realistic dim-but-usable
+    #      indoor case (lo=20 hi=80 → ×3.2) without going wild.
     sample = y[::4, ::4]
-    lo, hi = np.percentile(sample, [2.0, 98.0])
+    lo, hi = np.percentile(sample, [1.0, 99.0])
     dyn = float(hi) - float(lo)
     if dyn < 8.0:
-        # Flat frame — recenter histogram, no stretch, no amplification.
         mean = float(sample.mean())
         y = np.clip(y.astype(np.float32) - mean + 128.0, 0, 255).astype(np.uint8)
     else:
-        scale = min(255.0 / dyn, 6.0)
+        scale = min(255.0 / dyn, 4.0)
         y = np.clip((y.astype(np.float32) - float(lo)) * scale,
                     0, 255).astype(np.uint8)
-    # Gamma 0.85 — gentle midtone lift.
+    # Gamma 0.85 — gentle midtone lift for the human eye's response.
     y = cv2.LUT(y, _gamma_lut(0.85))
     return cv2.cvtColor(y, cv2.COLOR_GRAY2BGR)
 

@@ -167,14 +167,15 @@ def _probe_software_ae_direction(
         return 0, -7.0
 
     sign = 1 if delta > 0 else -1
-    # Pick the start exposure so we don't begin saturated. If the brighter
-    # of the two samples is already saturated, start from the darker.
-    if sat_high < 0.05 and y_high < 200:
-        baseline = -7.0
-    elif sat_low < 0.05 and y_low < 200:
-        baseline = -10.0
+    # Pick the start exposure on the DIM side. The AE loop will brighten
+    # if we overshoot, but starting bright + walking down means we spend
+    # the first few frames in saturation — visible as a momentary white
+    # flash on the GUI. Start at the darker end and let the loop find
+    # the target mean from below.
+    if sign > 0:
+        baseline = -12.0  # conventional bridge: darker = more negative
     else:
-        baseline = -11.0  # darker still — sensor was hot at both
+        baseline = -3.0   # reversed bridge: darker = more positive
     try:
         cap.set(cv2.CAP_PROP_EXPOSURE, baseline)
     except Exception:
@@ -184,6 +185,194 @@ def _probe_software_ae_direction(
         sign, delta, baseline,
     )
     return sign, baseline
+
+
+# ───────────────────── PyAV / ffmpeg-dshow backend ────────────────────────
+#
+# OpenCV's DirectShow path on this OpenCV build silently ignores
+# CAP_PROP_CONVERT_RGB=0 on this bridge's UVC stream, so it ALWAYS hands
+# us the destructive YUY2->BGR auto-decode (B=Y-227, G=Y+135, R=Y-179
+# clipped) which permanently destroys the Y∈[120,179] band. Probed
+# 2026-04-24 across {DSHOW, MSMF} × {flag-before-open, after-format,
+# after-grab} × {refourcc on/off}: every combo gave broken BGR.
+#
+# PyAV bypasses OpenCV entirely — it goes through ffmpeg's libavdevice
+# dshow input, which honors `pixel_format=yuyv422` and hands back the
+# raw YUY2 bytes. That gives us the same clean Y plane Leopard's
+# CameraTool sees (verified by scripts/eo_probe_pyav.py: min=0 max=255
+# mean=79 std=71 on a real workshop scene where the OpenCV path
+# delivered min=0 max=255 mean=202 with G saturated everywhere).
+#
+# This wrapper exposes the cv2.VideoCapture-shaped subset that grab()
+# relies on (read / release / isOpened) so the rest of IMX568Capture
+# is unchanged. read() returns the raw (H, 2*W) YUY2 packed buffer;
+# the existing _raw_yuy2_mode path slices Y from it.
+
+try:
+    import av as _av  # PyAV — pip-installable, bundles libavdevice
+    _PYAV_AVAILABLE = True
+except Exception:  # pragma: no cover — env-specific
+    _av = None
+    _PYAV_AVAILABLE = False
+
+
+class _PyAVDshowBackend:
+    """cv2.VideoCapture-lookalike that pipes raw YUY2 from ffmpeg-dshow.
+
+    The interface is intentionally narrow — only what IMX568Capture.grab()
+    and stop() touch — so swapping it in for ``cv2.VideoCapture`` is
+    transparent to the rest of the class. set()/get() are no-ops because
+    DirectShow exposure control lives in IAMCameraControl, which ffmpeg's
+    dshow demuxer does not expose; software AE on the PyAV path is left
+    for a follow-up (the bridge's hardware AE already produces a usable
+    image, the dead-zone problem is what we came here to fix).
+    """
+
+    def __init__(self, device_name: str, width: int, height: int) -> None:
+        self._device_name = device_name
+        self._w = width
+        self._h = height
+        self._container: Optional["_av.container.InputContainer"] = None
+        self._stream = None
+        self._demux_iter = None
+        # Buffer one decoded packet's worth of frames so we can return
+        # them on subsequent read() calls without re-demuxing.
+        self._frame_queue: list[np.ndarray] = []
+
+    def open(self) -> bool:
+        if not _PYAV_AVAILABLE:
+            return False
+        try:
+            self._container = _av.open(
+                f"video={self._device_name}",
+                format="dshow",
+                options={
+                    "pixel_format": "yuyv422",
+                    "video_size": f"{self._w}x{self._h}",
+                    "rtbufsize": "256M",
+                },
+            )
+        except Exception as e:
+            log.info("PyAV dshow open failed for %r: %r", self._device_name, e)
+            self._container = None
+            return False
+        streams = [s for s in self._container.streams if s.type == "video"]
+        if not streams:
+            self._container.close()
+            self._container = None
+            return False
+        self._stream = streams[0]
+        # Confirm the demuxer actually negotiated YUY2 — if it fell back
+        # to something else, abort so we use the OpenCV fallback path
+        # instead of silently producing garbage.
+        if self._stream.codec_context.pix_fmt != "yuyv422":
+            log.info(
+                "PyAV dshow opened but pix_fmt=%s (expected yuyv422)",
+                self._stream.codec_context.pix_fmt,
+            )
+            self._container.close()
+            self._container = None
+            self._stream = None
+            return False
+        self._demux_iter = self._container.demux(self._stream)
+        return True
+
+    def read(self) -> tuple[bool, Optional[np.ndarray]]:
+        """Return (ok, raw_yuy2_buf) where the buffer is a contiguous
+        ``(H, 2*W)`` uint8 array — the same shape the existing
+        ``_raw_yuy2_mode`` slicing in grab() expects."""
+        if self._container is None or self._demux_iter is None:
+            return False, None
+        if self._frame_queue:
+            return True, self._frame_queue.pop(0)
+        try:
+            for packet in self._demux_iter:
+                # Drain decoded frames into our queue; usually exactly one
+                # per packet for raw video.
+                for frame in packet.decode():
+                    if frame.format.name != "yuyv422":
+                        continue
+                    plane = frame.planes[0]
+                    line_size = plane.line_size
+                    raw = np.frombuffer(bytes(plane), dtype=np.uint8)
+                    raw = raw[: line_size * frame.height].reshape(
+                        frame.height, line_size,
+                    )
+                    # If line_size has padding past 2*W, drop it.
+                    if line_size > 2 * frame.width:
+                        raw = raw[:, : 2 * frame.width]
+                    self._frame_queue.append(np.ascontiguousarray(raw))
+                if self._frame_queue:
+                    return True, self._frame_queue.pop(0)
+        except StopIteration:
+            return False, None
+        except Exception as e:
+            log.debug("PyAV demux/decode threw %r", e)
+            return False, None
+        return False, None
+
+    def release(self) -> None:
+        try:
+            if self._container is not None:
+                self._container.close()
+        except Exception:
+            pass
+        self._container = None
+        self._stream = None
+        self._demux_iter = None
+        self._frame_queue.clear()
+
+    def isOpened(self) -> bool:  # noqa: N802 (cv2 spelling)
+        return self._container is not None
+
+    # cv2.VideoCapture API stubs — IMX568Capture occasionally calls .set()
+    # for exposure / gain on the OpenCV path. On PyAV path these are no-ops
+    # (return False) because ffmpeg's dshow input doesn't expose camera
+    # control and we'd need a separate IAMCameraControl COM call to drive
+    # exposure. Returning False is the documented "the property could not
+    # be set" signal, which is exactly what software AE wants to hear.
+
+    def set(self, prop: int, value: float) -> bool:  # noqa: A003
+        return False
+
+    def get(self, prop: int) -> float:
+        return 0.0
+
+
+def _find_dshow_video_device(name_hint: str = "imx") -> Optional[str]:
+    """Locate an FX3 / IMX568 dshow device name via ffmpeg's device list.
+
+    Returns the first device whose name contains *any* of the hints
+    'imx', 'leopard', 'li-', 'fx3' (case-insensitive). Returns None if
+    no matching device is found, in which case the caller falls back
+    to the OpenCV path.
+    """
+    if not _PYAV_AVAILABLE:
+        return None
+    try:
+        import subprocess
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        cp = subprocess.run(
+            [exe, "-hide_banner", "-list_devices", "true",
+             "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        log.debug("ffmpeg device-list call failed: %r", e)
+        return None
+    text = (cp.stderr or "") + "\n" + (cp.stdout or "")
+    candidates: list[str] = []
+    for line in text.splitlines():
+        if "(video)" not in line.lower() or '"' not in line:
+            continue
+        candidates.append(line.split('"', 2)[1])
+    hints = ("imx", "leopard", "li-", "fx3")
+    for c in candidates:
+        cl = c.lower()
+        if any(h in cl for h in hints):
+            return c
+    return None
 
 
 def _frame_has_spatial_content(frame: np.ndarray) -> bool:
@@ -257,6 +446,16 @@ class IMX568Capture:
         self._sw_ae_min: float = -13.0       # ~0.12 ms
         self._sw_ae_max: float = -3.0        # ~125 ms
         self._sw_ae_frame_counter: int = 0
+        # Target band: keep recovered Y mean roughly mid-frame so the
+        # operator sees a normal-brightness image, and dim the bridge
+        # the moment G starts clipping at 255 (G saturates well before Y
+        # reaches the top of its band, see _measure_frame_brightness).
+        # An earlier guess pushed the band down to 25..55 on the theory
+        # that Leopard CameraTool runs the sensor very dim — that was
+        # based on a misread of Leopard's R/G/B histogram (those three
+        # numbers being equal just means Leopard's output is mono Y
+        # replicated to BGR, NOT that the sensor is at low exposure).
+        # Reverted to a normal mid-band target.
         self._sw_ae_target_low: float = 80.0
         self._sw_ae_target_high: float = 160.0
         self._sw_ae_sat_limit: float = 0.05  # 5% G-clipped pixels triggers dim
@@ -289,6 +488,60 @@ class IMX568Capture:
         """
         if self._cap is not None:
             return
+
+        # ── PyAV / ffmpeg-dshow first ─────────────────────────────────
+        #
+        # Try to open the bridge through ffmpeg's dshow demuxer with an
+        # explicit yuyv422 request before falling back to OpenCV. This
+        # is the ONLY path on this rig that delivers a clean Y plane —
+        # OpenCV's DirectShow always swaps in a destructive YUY2->BGR
+        # auto-decode regardless of CAP_PROP_CONVERT_RGB. See the
+        # _PyAVDshowBackend docstring above for the probe trail.
+        if _PYAV_AVAILABLE:
+            device_name = _find_dshow_video_device()
+            if device_name:
+                pyav_cap = _PyAVDshowBackend(device_name, NATIVE_W, NATIVE_H)
+                if pyav_cap.open():
+                    # Read one settle frame to confirm the stream is alive.
+                    ok, test = pyav_cap.read()
+                    if ok and test is not None:
+                        self._cap = pyav_cap  # type: ignore[assignment]
+                        # Best-effort device index for telemetry; PyAV
+                        # opens by name, so we don't really know the index.
+                        self.device_index = 0
+                        self.actual_width = NATIVE_W
+                        self.actual_height = NATIVE_H
+                        self._fourcc = "YUY2"
+                        self._raw_yuy2_mode = True   # grab() will slice Y
+                        # Software AE on the PyAV path needs a separate
+                        # IAMCameraControl COM hook (PyAV's dshow demuxer
+                        # doesn't expose UVC camera-control). Disabled
+                        # for now — bridge hardware AE is producing a
+                        # clean image without our intervention.
+                        self._sw_ae_enabled = False
+                        log.info(
+                            "IMX568Capture mode: PYAV_RAW_YUY2 (device "
+                            "%r, raw Y plane via ffmpeg-dshow yuyv422)",
+                            device_name,
+                        )
+                        return
+                    else:
+                        log.info(
+                            "PyAV opened %r but first read returned no "
+                            "frame — falling back to OpenCV",
+                            device_name,
+                        )
+                        pyav_cap.release()
+                else:
+                    log.info(
+                        "PyAV could not open dshow device %r — falling "
+                        "back to OpenCV", device_name,
+                    )
+            else:
+                log.info(
+                    "PyAV: no IMX568/Leopard/FX3 device found in dshow "
+                    "device list — falling back to OpenCV",
+                )
 
         candidates = self._candidate_indices()
         last_err: Optional[str] = None
