@@ -70,87 +70,25 @@ def _fourcc_to_str(fourcc_int: int) -> str:
 
 
 def _clamp_exposure_for_g_saturation(cap: "cv2.VideoCapture") -> None:
-    """Walk exposure down until G p95 drops below 245 on a subsample.
+    """No-op stub. The 2026-04-24 attempt to manually clamp exposure by
+    flipping to AE=manual and walking CAP_PROP_EXPOSURE / CAP_PROP_GAIN
+    made the live image WORSE — every test value drove G further into
+    saturation, ending in "exposure clamp ran out of room" + a fully
+    blown-out white frame on the GUI.
 
-    The FX3 bridge's internal AE on this sensor drives scene brightness
-    up until G pegs at 255 across most of the frame — which is what
-    kills the YUY2→BGR decode (no data past G saturation). Leopard's
-    CameraTool gets a clean image at a MUCH lower exposure; we replicate
-    that by switching to manual AE and sweeping exposure down until G
-    has real unsaturated range to work with.
+    Either this bridge interprets CAP_PROP_EXPOSURE in reverse vs. the
+    UVC log₂-seconds convention, or it ignores the writes entirely while
+    the gain write (set first) bumped to MAX gain on a 0..10 scale.
+    Without hardware introspection I can't tell which. Until I have a
+    safe way to probe direction (e.g. test +/- one stop and only commit
+    if mean brightness moved the expected direction), do nothing here
+    so the bridge's internal AE stays in charge and the image is at
+    least as good as before this function existed.
 
-    Parameters are UVC log₂-seconds (CAP_PROP_EXPOSURE convention):
-      -4 ≈ 62.5 ms  (way too long, motion blur)
-      -5 ≈ 31 ms
-      -6 ≈ 15.6 ms  (typical indoor starting point)
-      -7 ≈ 7.8 ms
-      -8 ≈ 3.9 ms
-      -9 ≈ 2 ms
-      -10 ≈ 1 ms   (bright outdoor)
-      -11 ≈ 0.5 ms
-
-    Strategy:
-      1. Set AE=manual (0.25 on DSHOW). If the bridge refuses, bail —
-         stick with whatever it was doing, eo_processor will recover.
-      2. Start exposure at -6. Read a frame. If G's 95th percentile on a
-         16× subsample < 245 → exposure is good, commit.
-      3. Else drop 1 stop (exposure -= 1). Cap at 6 iterations so a
-         bridge that ignores the writes doesn't hang startup.
-      4. Also cap gain at a low value if supported — high gain is the
-         noise amplifier, exposure controls photon count.
-
-    Verified offline 2026-04-24 against saved raw_bridge frame where
-    G p95 = 255: the bridge was definitely in runaway-AE territory.
+    Kept as a named no-op so the call site in start() and any future
+    re-introduction path is obvious.
     """
-    # DSHOW: 0.25 = manual, 0.75 = auto. Try to read it back to confirm.
-    if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25):
-        # Bridge rejected the manual toggle. Put AE back on and leave.
-        try:
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-        except Exception:
-            pass
-        return
-
-    # Clamp gain first — high analog gain is what turns every shadow
-    # into salt-and-pepper. 0..100 range is DSHOW convention; many
-    # bridges ignore values outside 0..1. Try both.
-    for gain_try in (8.0, 0.1):
-        try:
-            if cap.set(cv2.CAP_PROP_GAIN, gain_try):
-                break
-        except Exception:
-            continue
-
-    for step, exposure in enumerate([-6, -7, -8, -9, -10, -11]):
-        try:
-            cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
-        except Exception:
-            return
-        # Flush one frame so the new exposure setting is in effect.
-        cap.read()
-        ok, frame = cap.read()
-        if not ok or frame is None or frame.ndim != 3:
-            # Can't read — give up on the walk, leave the last setting.
-            return
-        # G p95 on a 16× subsample (fast).
-        sub = frame[::16, ::16, 1]
-        try:
-            g_p95 = float(np.percentile(sub, 95.0))
-        except Exception:
-            return
-        if g_p95 < 245.0:
-            # Exposure is good — scene fits in G's useful range.
-            log.info(
-                "IMX568 exposure clamp settled at %d log2s (step %d, "
-                "G p95=%.0f<245)", exposure, step + 1, g_p95)
-            return
-        log.debug(
-            "IMX568 exposure %d: G p95=%.0f still saturated, dropping",
-            exposure, g_p95)
-    log.warning(
-        "IMX568 exposure clamp ran out of room; G still saturated at "
-        "shortest tested exposure. Image will work but have reduced "
-        "dynamic range. Consider reducing scene brightness.")
+    return
 
 
 def _frame_has_spatial_content(frame: np.ndarray) -> bool:
@@ -265,12 +203,14 @@ class IMX568Capture:
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, NATIVE_W)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, NATIVE_H)
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        # Note: we do NOT flip AE on here any more.
-                        # The saturation clamp below switches to
-                        # manual AE and walks exposure down until G
-                        # stops saturating — running a brief pass of
-                        # AUTO first just lets the bridge latch a hot
-                        # exposure we then have to undo.
+                        # Force AE ON. Without this, a previous run that
+                        # set MANUAL mode (CAP_PROP_AUTO_EXPOSURE=0.25)
+                        # can leave the bridge stuck at a fixed exposure
+                        # across reboots — image looks dark or blown
+                        # depending on what value it last latched. The
+                        # 0.75 = AUTO convention is DSHOW-specific.
+                        # Bridge may ignore the write; harmless either way.
+                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
                     except Exception as e:
                         cap.release()
                         last_err = f"{label}: set-props threw {e!r}"
