@@ -32,6 +32,11 @@ class TargetClass(str, Enum):
     # Phase B — human+vehicle classifier (Ticket 1)
     PERSON  = "person"    # human detected by h/v classifier
     VEHICLE = "vehicle"   # vehicle detected by h/v classifier
+    # Phase 2 fusion — radar contributor with no classification of its own.
+    # A FusedTrack born from a radar-only observation carries this class
+    # until EO/thermal confirms it (at which point the class is upgraded
+    # to PERSON/VEHICLE/DRONE and locked).
+    RADAR_TARGET = "radar_target"
 
 
 # ───────────────────────────────────────────────────────────────

@@ -236,15 +236,17 @@ function setPill(id, state, label) {
 // and replaces the lock. When no row is tracked, gimbal stays manual.
 // ─────────────────────────────────────────────────────────────────────────
 const _CLASS_COLORS = {
-  drone:   "#378ADD",
-  person:  "#AFA9EC",
-  vehicle: "#E24B4A",
-  unknown: "#ff6b35",
+  drone:        "#378ADD",
+  person:       "#AFA9EC",
+  vehicle:      "#E24B4A",
+  unknown:      "#ff6b35",
+  radar_target: "#33d6ff",   // matches the cyan radar-overlay stroke
 };
 
 function _clsLabel(cls) {
   if (!cls) return "TARGET";
   if (cls === "person") return "HUMAN";
+  if (cls === "radar_target") return "RADAR TARGET";
   return cls.toUpperCase();
 }
 

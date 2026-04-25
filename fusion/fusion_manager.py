@@ -36,6 +36,7 @@ from common.frame_bus import BUS
 from common.frames import (
     EOFrame,
     FusedTrack,
+    RadarFrame,
     TargetClass,
     ThermalFrame,
     Topic,
@@ -48,7 +49,21 @@ log = get_logger(__name__)
 
 # ─── Only these classes get fused. Raw "heat" / UNKNOWN detections
 # ─── don't have a reliable class to associate on.
+# RADAR_TARGET is a class-agnostic sentinel: radar contributes position
+# but no classifier output, so it's allowed in but treated as a wildcard
+# during cross-sensor association (see _tick).
 _FUSABLE_CLASSES = {
+    TargetClass.PERSON,
+    TargetClass.VEHICLE,
+    TargetClass.DRONE,
+    TargetClass.RADAR_TARGET,
+}
+
+# Real, classifier-derived classes. Used to decide whether a hit can
+# upgrade a track's class — radar's RADAR_TARGET is NOT real, so it
+# never overwrites an existing real class (per Phase 2: once
+# EO/thermal say "vehicle", radar can't downgrade that).
+_REAL_CLASSES = {
     TargetClass.PERSON,
     TargetClass.VEHICLE,
     TargetClass.DRONE,
@@ -75,6 +90,12 @@ class FusionManager:
         )
         self.min_hits = int(fcfg.get("min_hits", min_hits))
         self.max_misses = int(fcfg.get("max_misses", max_misses))
+        # Phase 2 — radar association uses a more permissive IoU gate
+        # because radar bboxes are derived from 3D cluster size at slant
+        # range and can barely brush an EO/thermal pixel-detector box on
+        # the same target. Tunable via YAML; promote to DEV-tab slider
+        # once we know the right operating range.
+        self.radar_iou_gate = float(fcfg.get("radar_iou_gate", 0.05))
 
         # Software extrinsic for THERMAL → EO alignment. Applied to thermal
         # observations' az/el only; EO stays as ground truth. Tuned live
@@ -83,6 +104,15 @@ class FusionManager:
         tex = (tcfg.get("extrinsic") or {})
         self.thermal_az_bias_deg = float(tex.get("az_bias_deg", 0.0))
         self.thermal_el_bias_deg = float(tex.get("el_bias_deg", 0.0))
+        # Phase 2 — software extrinsic for RADAR → EO alignment. Mirrors
+        # thermal pattern. RadarManager also holds its own copy of these
+        # biases (used in the projection-overlay path); the GUI's
+        # extrinsic_tune handler keeps them in sync by routing radar
+        # fields to BOTH managers. EO remains the ground-truth reference.
+        rcfg = cfg.get("radar", {}) or {}
+        rex = (rcfg.get("extrinsic") or {})
+        self.radar_az_bias_deg = float(rex.get("az_bias_deg", 0.0))
+        self.radar_el_bias_deg = float(rex.get("el_bias_deg", 0.0))
         self._ext_lock = threading.Lock()
 
         self._stop = threading.Event()
@@ -118,23 +148,33 @@ class FusionManager:
         *,
         thermal_az_bias_deg: Optional[float] = None,
         thermal_el_bias_deg: Optional[float] = None,
+        radar_az_bias_deg: Optional[float] = None,
+        radar_el_bias_deg: Optional[float] = None,
     ) -> None:
-        """Hot-update thermal az/el bias used to align thermal with EO.
+        """Hot-update thermal/radar az/el bias used to align them with EO.
 
-        EO is the ground-truth reference, so only thermal gets biased.
-        Applied in ``_observations_from_thermal`` on the next tick.
+        EO is the ground-truth reference, so only thermal and radar get
+        biased. Applied in ``_observations_from_{thermal,radar}`` on the
+        next tick. Radar bias is kept in sync with RadarManager's own
+        copy by the GUI's extrinsic_tune handler.
         """
         with self._ext_lock:
             if thermal_az_bias_deg is not None:
                 self.thermal_az_bias_deg = float(thermal_az_bias_deg)
             if thermal_el_bias_deg is not None:
                 self.thermal_el_bias_deg = float(thermal_el_bias_deg)
+            if radar_az_bias_deg is not None:
+                self.radar_az_bias_deg = float(radar_az_bias_deg)
+            if radar_el_bias_deg is not None:
+                self.radar_el_bias_deg = float(radar_el_bias_deg)
 
     def get_extrinsic(self) -> dict:
         with self._ext_lock:
             return {
                 "thermal_az_bias_deg": self.thermal_az_bias_deg,
                 "thermal_el_bias_deg": self.thermal_el_bias_deg,
+                "radar_az_bias_deg":   self.radar_az_bias_deg,
+                "radar_el_bias_deg":   self.radar_el_bias_deg,
             }
 
     # ───────────────────────── main loop ─────────────────────────
@@ -153,9 +193,11 @@ class FusionManager:
     def _tick(self) -> None:
         tf: Optional[ThermalFrame] = BUS.get_latest(Topic.THERMAL)
         ef: Optional[EOFrame] = BUS.get_latest(Topic.EO)
+        rf: Optional[RadarFrame] = BUS.get_latest(Topic.RADAR)
 
         thermal_obs = self._observations_from_thermal(tf)
         eo_obs = self._observations_from_eo(ef)
+        radar_obs = self._observations_from_radar(rf)
 
         # ── Cross-sensor association (EO primary) ──
         # Produce a list of "candidates" per tick. Each candidate is a
@@ -213,6 +255,50 @@ class FusionManager:
                 "conf":    t["conf"],
             })
 
+        # ── Pass 3: radar joins ──
+        # Each radar observation tries to attach to the best existing
+        # EO/thermal candidate by angular IoU (class wildcard — radar
+        # has no classifier). Surviving radar obs become standalone
+        # candidates with class=RADAR_TARGET so the operator still
+        # sees the target in the top-5 list. Uses self.radar_iou_gate
+        # (more permissive than XSENSOR_IOU because radar bboxes are
+        # cluster-extent-derived and tend to be coarser).
+        used_c = [False] * len(candidates)
+        for r in radar_obs:
+            best_i, best_iou = -1, 0.0
+            for i, c in enumerate(candidates):
+                if used_c[i]:
+                    continue
+                iou = angular_iou(
+                    r["az"], r["el"], r["ang_w"], r["ang_h"],
+                    c["az"], c["el"], c["ang_w"], c["ang_h"],
+                )
+                if iou > best_iou:
+                    best_iou, best_i = iou, i
+            if best_i >= 0 and best_iou >= self.radar_iou_gate:
+                c = candidates[best_i]
+                used_c[best_i] = True
+                if "radar" not in c["sensors"]:
+                    c["sensors"].append("radar")
+                # Don't move the angular pose — EO/thermal pixels are
+                # finer than radar's cluster centroid. Just take the
+                # max confidence so the row score (sensors+conf) ranks
+                # correctly.
+                c["conf"] = max(c["conf"], r["conf"])
+            else:
+                # Standalone radar candidate. Class is the sentinel —
+                # the persistence tracker will keep it as RADAR_TARGET
+                # until an EO/thermal observation joins later and
+                # promotes the class (see _update_tracks).
+                candidates.append({
+                    "sensors": ["radar"],
+                    "primary": "radar",
+                    "class":   r["class"],
+                    "az":      r["az"],   "el":    r["el"],
+                    "ang_w":   r["ang_w"],"ang_h": r["ang_h"],
+                    "conf":    r["conf"],
+                })
+
         # Collapse near-duplicate candidates within this tick before
         # they hit the persistence tracker. Without this, two YOLO
         # boxes on the same car (one per sensor, or two from EO) each
@@ -256,6 +342,55 @@ class FusionManager:
             })
         return out
 
+    def _observations_from_radar(self, rf: Optional[RadarFrame]) -> list[dict]:
+        """Convert RadarTargets into angular observations (az/el/extent).
+
+        Radar observations carry class=RADAR_TARGET (sentinel) — radar
+        has no classifier, so association uses IoU only and class is a
+        wildcard at match time. Coasting targets are skipped to keep
+        cross-sensor fusion conservative; the projection-overlay path
+        (gui/sensor_bridge.py) still draws them so the operator can
+        tell a dead-reckoned radar box from a fresh one.
+        """
+        import math
+        if rf is None or not rf.connected:
+            return []
+        out = []
+        # Pull the bias once under the lock — match _observations_from_thermal
+        # so a mid-tick GUI slider update doesn't tear the two reads.
+        with self._ext_lock:
+            az_bias = self.radar_az_bias_deg
+            el_bias = self.radar_el_bias_deg
+        for t in rf.targets:
+            # Skip coasting (Kalman-only) targets — fusion shouldn't
+            # drag a cross-sensor lock around on dead-reckoned positions.
+            if getattr(t, "coasting", False):
+                continue
+            # Behind/below sensor — skip (also avoids atan2 weirdness).
+            if t.pos_y_m <= 0.1:
+                continue
+            slant = math.sqrt(t.pos_x_m * t.pos_x_m
+                              + t.pos_y_m * t.pos_y_m
+                              + t.pos_z_m * t.pos_z_m)
+            if slant < 0.1:
+                continue
+            # Cartesian → angular (radar convention: x=right, y=forward, z=up).
+            az = math.degrees(math.atan2(t.pos_x_m, t.pos_y_m)) + az_bias
+            el = math.degrees(math.atan2(
+                t.pos_z_m,
+                math.sqrt(t.pos_x_m * t.pos_x_m + t.pos_y_m * t.pos_y_m)
+            )) + el_bias
+            # Bbox angular extent from physical half-size at slant range.
+            # Floor at 0.4° so a tiny cluster still gates against EO/thermal.
+            ang_w = max(0.4, math.degrees(2.0 * math.atan2(t.size_x_m, slant)))
+            ang_h = max(0.4, math.degrees(2.0 * math.atan2(t.size_z_m, slant)))
+            out.append({
+                "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
+                "class": TargetClass.RADAR_TARGET.value,
+                "conf": float(t.confidence),
+            })
+        return out
+
     def _observations_from_eo(self, ef: Optional[EOFrame]) -> list[dict]:
         if ef is None or not ef.connected or ef.bgr is None:
             return []
@@ -277,6 +412,17 @@ class FusionManager:
         return out
 
     # ───────────────────────── persistence tracker ───────────────
+    @staticmethod
+    def _class_compatible(a: str, b: str) -> bool:
+        """Two tracks/candidates can match if classes are equal OR
+        either side is the radar sentinel (radar has no classifier so
+        it's a wildcard). Pure equality otherwise — we don't want
+        person↔vehicle association."""
+        if a == b:
+            return True
+        rt = TargetClass.RADAR_TARGET.value
+        return a == rt or b == rt
+
     def _update_tracks(self, candidates: list[dict]) -> None:
         # Snapshot the count BEFORE iterating — unmatched candidates
         # append new tracks below, and `matched` only covers pre-existing.
@@ -286,11 +432,12 @@ class FusionManager:
         # smoothed bbox drifts, a new observation that clearly overlaps
         # the track still matches, so we don't spawn a duplicate ID.
         TRACK_IOU = 0.15
+        rt = TargetClass.RADAR_TARGET.value
         for c in candidates:
             best_i, best_iou = -1, 0.0
             for i in range(n_existing):
                 trk = self._tracks[i]
-                if matched[i] or trk["class"] != c["class"]:
+                if matched[i] or not self._class_compatible(trk["class"], c["class"]):
                     continue
                 iou = angular_iou(
                     c["az"], c["el"], c["ang_w"], c["ang_h"],
@@ -305,6 +452,12 @@ class FusionManager:
                 trk["el"]    = a * trk["el"]    + (1 - a) * c["el"]
                 trk["ang_w"] = a * trk["ang_w"] + (1 - a) * c["ang_w"]
                 trk["ang_h"] = a * trk["ang_h"] + (1 - a) * c["ang_h"]
+                # Class promotion: a radar-born track stays RADAR_TARGET
+                # until an EO/thermal observation joins, at which point
+                # we lock in the real class. Once locked, never overwrite
+                # (per Phase 2 design — EO/thermal classification wins).
+                if trk["class"] == rt and c["class"] != rt:
+                    trk["class"] = c["class"]
                 # Sensor set accumulates — a track that has ever been
                 # fused stays "2-sensor" if the next tick only saw EO.
                 # Resetting per tick would make the green box flicker.
@@ -312,7 +465,11 @@ class FusionManager:
                 for s in c["sensors"]:
                     if s not in trk["sensors_ever"]:
                         trk["sensors_ever"].append(s)
-                trk["primary"] = c["primary"]
+                # Don't let a radar-only update steal `primary` from
+                # a real-class track — cameras own the primary sensor
+                # for any track that's been seen by EO/thermal.
+                if not (c["primary"] == "radar" and trk["class"] != rt):
+                    trk["primary"] = c["primary"]
                 trk["conf"] = max(trk["conf"] * 0.9, c["conf"])
                 trk["hits"] += 1
                 trk["misses"] = 0
@@ -407,9 +564,17 @@ class FusionManager:
         if len(self._tracks) <= 1:
             return
         # Elder first: more hits, then lower id.
+        # Prefer real-class tracks over RADAR_TARGET when picking the
+        # survivor — if a vehicle track and a radar-only track collapse,
+        # the vehicle track's class must win.
+        rt = TargetClass.RADAR_TARGET.value
         order = sorted(
             range(len(self._tracks)),
-            key=lambda i: (self._tracks[i]["hits"], -self._tracks[i]["id"]),
+            key=lambda i: (
+                self._tracks[i]["class"] != rt,        # real class first
+                self._tracks[i]["hits"],
+                -self._tracks[i]["id"],
+            ),
             reverse=True,
         )
         drop = [False] * len(self._tracks)
@@ -421,7 +586,7 @@ class FusionManager:
                 if drop[j]:
                     continue
                 b = self._tracks[j]
-                if a["class"] != b["class"]:
+                if not self._class_compatible(a["class"], b["class"]):
                     continue
                 # IoU-based merge: two live tracks collapse only when
                 # their angular bboxes substantially overlap. A small
@@ -438,6 +603,11 @@ class FusionManager:
                         if s not in a["sensors_ever"]:
                             a["sensors_ever"].append(s)
                     a["conf"] = max(a["conf"], b["conf"])
+                    # If `a` is RADAR_TARGET and `b` carries a real
+                    # class, promote — class always upgrades, never
+                    # downgrades.
+                    if a["class"] == rt and b["class"] != rt:
+                        a["class"] = b["class"]
                     drop[j] = True
         if any(drop):
             self._tracks = [t for k, t in enumerate(self._tracks) if not drop[k]]

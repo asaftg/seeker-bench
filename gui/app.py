@@ -465,30 +465,37 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     # Live-update software extrinsic (az/el bias) used
                     # to align radar + thermal to EO (ground truth).
                     # Any subset of the four knobs may be present.
+                    # Phase 2: radar bias has TWO consumers — RadarManager
+                    # (projection-overlay path) and FusionManager (late-
+                    # fusion observation path). Route to both so the
+                    # cyan radar bbox and the green fused bbox shift
+                    # together when the slider moves.
                     rm = app.state.radar_manager
                     fm = app.state.fusion_manager
-                    if rm is not None:
-                        r_az = cmd.get("radar_az_bias_deg")
-                        r_el = cmd.get("radar_el_bias_deg")
-                        if r_az is not None or r_el is not None:
-                            try:
-                                rm.set_extrinsic(
-                                    az_bias_deg=r_az,
-                                    el_bias_deg=r_el,
-                                )
-                            except Exception as e:
-                                log.warning("radar extrinsic_tune failed: %s", e)
+                    r_az = cmd.get("radar_az_bias_deg")
+                    r_el = cmd.get("radar_el_bias_deg")
+                    if rm is not None and (r_az is not None or r_el is not None):
+                        try:
+                            rm.set_extrinsic(
+                                az_bias_deg=r_az,
+                                el_bias_deg=r_el,
+                            )
+                        except Exception as e:
+                            log.warning("radar extrinsic_tune (rm) failed: %s", e)
                     if fm is not None:
                         t_az = cmd.get("thermal_az_bias_deg")
                         t_el = cmd.get("thermal_el_bias_deg")
-                        if t_az is not None or t_el is not None:
+                        if (t_az is not None or t_el is not None
+                                or r_az is not None or r_el is not None):
                             try:
                                 fm.set_extrinsic(
                                     thermal_az_bias_deg=t_az,
                                     thermal_el_bias_deg=t_el,
+                                    radar_az_bias_deg=r_az,
+                                    radar_el_bias_deg=r_el,
                                 )
                             except Exception as e:
-                                log.warning("thermal extrinsic_tune failed: %s", e)
+                                log.warning("extrinsic_tune (fm) failed: %s", e)
 
                 elif command == "record":
                     # Stubbed: no HDF5 writer yet. We toggle the flag so

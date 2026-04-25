@@ -298,6 +298,12 @@ fusion:
                                 # (~1s at 15Hz). ByteTrack (per-sensor) already
                                 # coasts through brief dropouts via Kalman, so
                                 # fusion's grace can stay short.
+  # Phase 2 — radar as third late-fusion sensor.
+  # Radar bboxes are derived from 3D cluster size projected at slant
+  # range, so they're coarser than EO/thermal pixel-detector boxes.
+  # A more permissive IoU gate keeps radar associating with EO/thermal
+  # tracks even when its bbox barely brushes the camera box.
+  radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
 
 gimbal:
   # Pan/tilt via Pololu Micro Maestro 6-Channel (Ticket 4).
