@@ -233,9 +233,18 @@ def radar_to_wire(
 
     targets_wire = []
     for t in rf.targets:
-        bt, be = _radar_target_to_panel_bboxes(
-            t, tf, ef, radar_az_bias_deg, radar_el_bias_deg,
-        )
+        # Skip the EO/thermal projection for coasting targets — the
+        # radar panel still shows them (the operator wants to know the
+        # tracker is dead-reckoning), but stale coasting overlays make
+        # the camera panels noisy when traffic passes through. Only
+        # `bbox_thermal` and `bbox_eo` are gated; the target itself
+        # stays in the wire payload so its tid persists for re-acquire.
+        if bool(t.coasting):
+            bt, be = None, None
+        else:
+            bt, be = _radar_target_to_panel_bboxes(
+                t, tf, ef, radar_az_bias_deg, radar_el_bias_deg,
+            )
         targets_wire.append({
             "tid": int(t.tid),
             "x": round(t.pos_x_m, 3),
