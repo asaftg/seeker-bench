@@ -47,17 +47,18 @@ thermal:
                                 # for hot-spot triage scenarios.
     # CLAHE on the AGC'd 8-bit before colormap.
     #
-    # 2026-04-27 second tuning pass: ENABLED by default. Live A/B at
-    # 18 deg zoom against the operator's grayscale baseline showed that
-    # without CLAHE the dynamic-range expansion at zoom is marginal —
-    # the operator-perceived "resolution" gain is mostly local-contrast
-    # work. clip_limit=2.0 with 8×8 tiles keeps the contrast pump
-    # bounded so it doesn't HDR-torture flat areas. Drop clip_limit to
-    # 1.0 if you see grain getting amplified; disable entirely if the
-    # noise floor turns up on a low-light scene.
+    # DEFAULT OFF (2026-04-27, third pass). Briefly enabled in the
+    # second tuning pass; live operator review on the bench scene at
+    # 18 deg zoom showed it pumped grain into "oil-painting ridges" on
+    # foliage and gave bright targets a blooming halo — the exact
+    # failure mode the EO comments above warn about. CLAHE on a clean
+    # already-contrasty thermal scene amplifies noise more than it
+    # adds useful contrast. Re-enable only on a genuinely flat scene
+    # (long-range dusk vehicle in thermal equilibrium) and start at
+    # clip_limit=1.0, NOT 2.0.
     clahe:
-      enabled: true
-      clip_limit: 2.0
+      enabled: false
+      clip_limit: 1.0
       tile_grid: 8
 
   # Post-AGC display enhancement chain — runs in order:
@@ -78,7 +79,14 @@ thermal:
     # warm-but-not-hot pixels (running engines, daylight road surface)
     # up out of the lower half of the histogram where they otherwise
     # sit after the percentile stretch.
-    gamma: 0.90
+    #
+    # 1.0 default (2026-04-27, third pass). Even mild lift (0.9)
+    # combined with unsharp turns a clean Boson frame into a
+    # "processed" looking image that the operator does not prefer.
+    # Adjust to 0.85-0.95 only if you specifically want to bring up
+    # the mid-warm zone of the histogram and you've verified the
+    # result on a comparison capture.
+    gamma: 1.0
     # Bilateral denoise on the 8-bit display image.
     #
     # DEFAULT OFF (2026-04-27, second tuning pass): live A/B at 18 deg
@@ -95,15 +103,20 @@ thermal:
       d: 3
       sigma_color: 10.0
       sigma_space: 10.0
-    # Unsharp mask. amount=1.0 with bilateral OFF and CLAHE ON gives
-    # an unmistakeable sharpening pass at 18 deg / mid-zoom. The
-    # combination (CLAHE + 1.0 unsharp) is the operator-perceived
-    # "resolution" win the user was asking for. radius=1.0 keeps the
-    # halo close to the edge — drop to 0.85 if you see "etched"
-    # double-lines on bright silhouettes.
+    # Unsharp mask.
+    #
+    # DEFAULT OFF (2026-04-27, third pass). Briefly bumped to 1.0 in
+    # the second tuning pass; live operator review showed visible
+    # halos on bright thermal targets (vehicles against cool ground)
+    # and a generally "etched" look on foliage edges. The Boson 640
+    # is already sharper than the operator's 18 deg zoom can resolve
+    # without artifacts — adding unsharp on top creates the artifacts
+    # without adding genuine resolution. Re-enable at amount=0.30
+    # only on a side-by-side comparison that confirms it's actually
+    # helping; never go above 0.50 on this rig.
     unsharp_mask:
-      enabled: true
-      amount: 1.0
+      enabled: false
+      amount: 0.30
       radius: 1.0
 
   # Digital zoom presets (emulated narrow FOV)
