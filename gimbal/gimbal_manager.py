@@ -26,7 +26,7 @@ from algorithms import track_predictor
 from common.config import load_config
 from common.events import emit as emit_event
 from common.frame_bus import BUS
-from common.frames import GimbalState, ThermalFrame, Topic
+from common.frames import EOFrame, GimbalState, ThermalFrame, Topic
 from common.logging_setup import get_logger
 from gimbal.gimbal_controller import (
     GimbalController,
@@ -34,6 +34,7 @@ from gimbal.gimbal_controller import (
     ServoCalibration,
 )
 from gimbal.maestro_driver import MaestroDriver
+from gimbal.optical_residual import OpticalResidualTracker
 
 log = get_logger(__name__)
 
@@ -541,6 +542,20 @@ class GimbalManager:
         self._synth_slew_dps: float = float(
             gcfg.get("synth_slew_dps", 25.0))
 
+        # Optical-residual trackers (Stage A: diagnostic only). One per
+        # sensor. EO is the primary source — higher resolution + more
+        # texture than thermal. Thermal is the fallback when EO loses
+        # features (e.g. low-light, target outside narrow EO FOV after
+        # a big slip). Anchors are captured at synth-lock commit; reset
+        # on track release. Per-tick measurement is emitted as the
+        # `optical_residual` event so we can A/B closed-loop work
+        # against the open-loop baseline using the existing replay
+        # infrastructure.
+        self._opt_eo = OpticalResidualTracker(name="eo")
+        self._opt_thermal = OpticalResidualTracker(name="thermal")
+        self._opt_last_eo_frame_id: Optional[int] = None
+        self._opt_last_thermal_frame_id: Optional[int] = None
+
         # Heat-track (synthetic_target / draw-target) freshness signal.
         # Same shape of bug as fused tracks had, different cause:
         # the OF tracker that propagates a synthetic bbox is much
@@ -828,6 +843,10 @@ class GimbalManager:
                                  heat_obs.az_deg, heat_obs.el_deg,
                                  self._synth_slew_window_s,
                                  self._synth_slew_dps)
+                        # Capture optical-residual anchors on both
+                        # sensors. Best-effort — failures are silent
+                        # (no cv2, frame missing, no features).
+                        self._opt_capture_anchors(cur_pan, cur_tilt)
                     target_sp_pan  = self._synth_world_az_deg
                     target_sp_tilt = self._synth_world_el_deg
                     # Slew dampening window. During the first
@@ -884,6 +903,10 @@ class GimbalManager:
                     )
                     self._last_sp_pan   = sp_pan
                     self._last_sp_tilt  = sp_tilt
+                    # Stage A: measure visual residual against anchor
+                    # and emit an event. No effect on the gimbal yet.
+                    self._opt_measure_and_emit(cur_pan, cur_tilt,
+                                               tracked_id=tracked_heat_id)
                 elif fresh_heat:
                     # ── REAL HEAT-BLOB PATH (CLOSED-LOOP) ──
                     if self._cameras_on_gimbal:
@@ -1196,6 +1219,12 @@ class GimbalManager:
             self._synth_world_az_deg = None
             self._synth_world_el_deg = None
             self._synth_lock_t = None
+            # Reset optical-residual anchors so the next lock starts
+            # fresh against the new scene.
+            self._opt_eo.reset()
+            self._opt_thermal.reset()
+            self._opt_last_eo_frame_id = None
+            self._opt_last_thermal_frame_id = None
             # Reset alpha-beta tracker so the next engage starts
             # fresh, no stale velocity from a prior target.
             self._track_world_az = None
@@ -1314,6 +1343,106 @@ class GimbalManager:
             cx_px=float(cx),
             cy_px=float(cy),
         )
+
+    # ── Optical residual (Stage A: diagnostic only) ─────────────
+    def _opt_capture_anchors(self, cur_pan: float, cur_tilt: float) -> None:
+        """Snapshot the latest EO + thermal frames as residual anchors.
+
+        Called once when synth lock commits. Best-effort — logs but
+        does not raise on missing frames or cv2.
+        """
+        now = time.time()
+        ef = BUS.get_latest(Topic.EO)
+        if isinstance(ef, EOFrame) and ef.connected and ef.bgr is not None:
+            ok = self._opt_eo.set_anchor(
+                ef.bgr, hfov_deg=float(ef.hfov_deg),
+                vfov_deg=float(ef.vfov_deg),
+                cur_pan=cur_pan, cur_tilt=cur_tilt, t=now)
+            self._opt_last_eo_frame_id = int(ef.frame_id) if ok else None
+            if ok:
+                log.info("Optical anchor (EO) captured: %dx%d hfov=%.1f vfov=%.1f",
+                         ef.bgr.shape[1], ef.bgr.shape[0],
+                         ef.hfov_deg, ef.vfov_deg)
+        tf = BUS.get_latest(Topic.THERMAL)
+        if isinstance(tf, ThermalFrame) and tf.connected and tf.agc8 is not None:
+            ok = self._opt_thermal.set_anchor(
+                tf.agc8, hfov_deg=float(tf.hfov_deg),
+                vfov_deg=float(tf.vfov_deg),
+                cur_pan=cur_pan, cur_tilt=cur_tilt, t=now)
+            self._opt_last_thermal_frame_id = int(tf.frame_id) if ok else None
+            if ok:
+                log.info("Optical anchor (thermal) captured: %dx%d hfov=%.1f vfov=%.1f",
+                         tf.agc8.shape[1], tf.agc8.shape[0],
+                         tf.hfov_deg, tf.vfov_deg)
+
+    def _opt_measure_and_emit(self, cur_pan: float, cur_tilt: float,
+                              tracked_id: Optional[int]) -> None:
+        """Measure visual residual on EO + thermal against anchors and
+        emit `optical_residual` event. No effect on the gimbal — this
+        is Stage A diagnostic only.
+
+        Skips a tick when no fresh frame has arrived for the sensor
+        (matched by frame_id) — avoids reprocessing the same frame at
+        60 Hz when the camera publishes at ~20 Hz.
+        """
+        eo_metrics = None
+        thermal_metrics = None
+        # EO
+        if self._opt_eo.has_anchor:
+            ef = BUS.get_latest(Topic.EO)
+            if (isinstance(ef, EOFrame) and ef.connected
+                    and ef.bgr is not None
+                    and int(ef.frame_id) != self._opt_last_eo_frame_id):
+                self._opt_last_eo_frame_id = int(ef.frame_id)
+                eo_metrics = self._opt_eo.measure(
+                    ef.bgr, cur_pan=cur_pan, cur_tilt=cur_tilt,
+                    hfov_deg=float(ef.hfov_deg),
+                    vfov_deg=float(ef.vfov_deg))
+        # Thermal
+        if self._opt_thermal.has_anchor:
+            tf = BUS.get_latest(Topic.THERMAL)
+            if (isinstance(tf, ThermalFrame) and tf.connected
+                    and tf.agc8 is not None
+                    and int(tf.frame_id) != self._opt_last_thermal_frame_id):
+                self._opt_last_thermal_frame_id = int(tf.frame_id)
+                thermal_metrics = self._opt_thermal.measure(
+                    tf.agc8, cur_pan=cur_pan, cur_tilt=cur_tilt,
+                    hfov_deg=float(tf.hfov_deg),
+                    vfov_deg=float(tf.vfov_deg))
+        if eo_metrics is None and thermal_metrics is None:
+            return
+        payload: dict = {"tracked_heat_id": tracked_id,
+                         "cur_pan": float(cur_pan),
+                         "cur_tilt": float(cur_tilt)}
+        if eo_metrics is not None and eo_metrics.valid:
+            payload["eo"] = {
+                "n_features": eo_metrics.n_features,
+                "dx_px": eo_metrics.dx_px, "dy_px": eo_metrics.dy_px,
+                "daz_actual_deg": eo_metrics.daz_actual_deg,
+                "del_actual_deg": eo_metrics.del_actual_deg,
+                "daz_cmd_deg": eo_metrics.daz_cmd_deg,
+                "del_cmd_deg": eo_metrics.del_cmd_deg,
+                "daz_residual_deg": eo_metrics.daz_residual_deg,
+                "del_residual_deg": eo_metrics.del_residual_deg,
+                "note": eo_metrics.note,
+            }
+        if thermal_metrics is not None and thermal_metrics.valid:
+            payload["thermal"] = {
+                "n_features": thermal_metrics.n_features,
+                "dx_px": thermal_metrics.dx_px, "dy_px": thermal_metrics.dy_px,
+                "daz_actual_deg": thermal_metrics.daz_actual_deg,
+                "del_actual_deg": thermal_metrics.del_actual_deg,
+                "daz_cmd_deg": thermal_metrics.daz_cmd_deg,
+                "del_cmd_deg": thermal_metrics.del_cmd_deg,
+                "daz_residual_deg": thermal_metrics.daz_residual_deg,
+                "del_residual_deg": thermal_metrics.del_residual_deg,
+                "note": thermal_metrics.note,
+            }
+        if "eo" in payload or "thermal" in payload:
+            try:
+                emit_event("optical_residual", payload)
+            except Exception:
+                pass
 
     def _command_now(self, pan_deg: float, tilt_deg: float) -> None:
         if not self._connected:
