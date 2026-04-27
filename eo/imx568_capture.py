@@ -375,137 +375,6 @@ def _find_dshow_video_device(name_hint: str = "imx") -> Optional[str]:
     return None
 
 
-def _set_uvc_manual_exposure(
-    device_index: int,
-    exposure_log2: float = -6.0,
-    gain: Optional[float] = None,
-) -> dict:
-    """Briefly open the camera with cv2-DSHOW to write manual exposure.
-
-    On Windows DirectShow, UVC camera-control properties (auto-exposure
-    flag, exposure time, gain, brightness) are persistent in the device
-    across a close/reopen so long as the device is not power-cycled or
-    re-enumerated. So the trick is:
-
-        1. cv2.VideoCapture(idx, CAP_DSHOW)          ← brief open
-        2. cap.set(CAP_PROP_AUTO_EXPOSURE, 0.25)     ← manual mode
-        3. cap.set(CAP_PROP_EXPOSURE, exposure_log2) ← lock exposure
-        4. cap.release()                             ← properties stay
-        5. PyAV opens & grabs                        ← stable frames
-
-    The user observed visible "breathing" on a static scene — bridge AE
-    was hunting frame-to-frame. With AE off and a fixed exposure, the
-    image stops drifting and we can tune one knob to match Leopard.
-
-    Returns a dict of {prop_name: (set_value, readback)} for the log so
-    we can tell whether the bridge accepted the writes (some FX3 firmware
-    silently ignores property writes — hence the log).
-
-    Why log2 for exposure_log2: cv2's DSHOW backend reports exposure in
-    "log2 seconds" (UVC EXPOSURE_TIME_ABSOLUTE convention). -6 ≈ 1/64s
-    ≈ 16 ms, -7 ≈ 8 ms, -5 ≈ 32 ms. Adjust to taste.
-    """
-    result: dict = {}
-    try:
-        cap = cv2.VideoCapture(int(device_index), cv2.CAP_DSHOW)
-    except Exception as e:
-        result["open_error"] = repr(e)
-        return result
-    if not cap.isOpened():
-        result["open_error"] = "isOpened()==False"
-        try:
-            cap.release()
-        except Exception:
-            pass
-        return result
-    try:
-        # 0.25 = manual (V4L2 convention DSHOW sometimes inherits).
-        # 1 = manual / 3 = auto on some DirectShow drivers.
-        # Try 0.25 first, then 1, log both readbacks.
-        for ae_value in (0.25, 1.0):
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, ae_value)
-            rb = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-            result[f"AUTO_EXPOSURE={ae_value}"] = rb
-        cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure_log2))
-        result["EXPOSURE_set"] = float(exposure_log2)
-        result["EXPOSURE_readback"] = cap.get(cv2.CAP_PROP_EXPOSURE)
-        if gain is not None:
-            cap.set(cv2.CAP_PROP_GAIN, float(gain))
-            result["GAIN_set"] = float(gain)
-            result["GAIN_readback"] = cap.get(cv2.CAP_PROP_GAIN)
-    finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-    return result
-
-
-def _set_leopard_exposure_ext(
-    exposure_ext: int,
-    ae_off: bool = True,
-    gain: Optional[int] = None,
-) -> dict:
-    """Spawn the 32-bit helper to write LPCamera.ExposureExt via the
-    Leopard SDK's vendor-extension I2C path.
-
-    This is the path that ACTUALLY works on this bridge. The standard
-    UVC properties (CAP_PROP_AUTO_EXPOSURE, CAP_PROP_EXPOSURE, etc) are
-    silently ignored by the FX3 firmware — proven exhaustively in
-    scripts/eo_probe_uvc_props.py. ExposureExt is a vendor-extension
-    register that the FX3 actually honors; setting it disables bridge
-    AE and pins the sensor exposure to a stable value.
-
-    Empirically (scripts/eo_probe_breathing_at_fixed_expext.py): with
-    ExposureExt=1000 the recovered Y mean is rock-stable across 30 s
-    (span=1.7, std=0.6) — was wildly drifting before. The "static
-    scene keeps changing" complaint is solved by this single write.
-
-    The 32-bit subprocess split is forced because LeopardCamera.dll is
-    PE machine 0x14c (x86) and our seeker is 64-bit. tools/python311-x86
-    is an embeddable Python with pythonnet pre-installed for this.
-
-    Returns the helper's JSON result dict for logging. The helper closes
-    the SDK session before returning; the FX3 retains the manual-exposure
-    state across that close, and PyAV can immediately reopen the device.
-    """
-    import json as _json
-    import os as _os
-    import subprocess as _subprocess
-
-    # Resolve helper paths relative to this file so it works from any cwd.
-    here = _os.path.dirname(_os.path.abspath(__file__))
-    repo = _os.path.dirname(here)
-    py32 = _os.path.join(repo, "tools", "python311-x86", "python.exe")
-    helper = _os.path.join(here, "leopard_sdk_helper.py")
-
-    if not _os.path.exists(py32):
-        return {"helper_unavailable": f"32-bit Python missing at {py32}"}
-    if not _os.path.exists(helper):
-        return {"helper_unavailable": f"helper script missing at {helper}"}
-
-    cmd = [py32, helper,
-           "--exposure-ext", str(int(exposure_ext)),
-           "--ae", "off" if ae_off else "on",
-           "--json"]
-    if gain is not None:
-        cmd.extend(["--gain", str(int(gain))])
-
-    try:
-        cp = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception as e:
-        return {"helper_threw": repr(e)}
-
-    if cp.returncode != 0 and not cp.stdout.strip():
-        return {"helper_failed": cp.returncode, "stderr": cp.stderr[-500:]}
-
-    try:
-        return _json.loads(cp.stdout)
-    except Exception:
-        return {"helper_unparsable_stdout": cp.stdout[-500:],
-                "stderr": cp.stderr[-500:]}
-
-
 def _frame_has_spatial_content(frame: np.ndarray) -> bool:
     """True iff the frame carries real scene data (not a flat fake buffer).
 
@@ -536,43 +405,9 @@ class IMX568Capture:
         self,
         device_index: int | str = "auto",
         exclude_indices: Optional[list[int]] = None,
-        manual_exposure_log2: Optional[float] = None,
-        manual_gain: Optional[float] = None,
-        manual_exposure_ext: Optional[int] = None,
-        use_sdk_stream: bool = True,
-        stream_fps: float = 20.0,
     ) -> None:
         self.requested_index = device_index
         self.exclude_indices = list(exclude_indices or [])
-        # PRIMARY path: 32-bit Leopard SDK helper streaming RAW12 over a
-        # subprocess pipe. This is the only path that delivers true
-        # Leopard-CameraTool image quality on this FX3 bridge — verified
-        # 2026-04-24 with frame-to-frame B/G/R diff < 0.03 vs the
-        # reference BMP. PyAV/OpenCV YUY2 paths produce visible breathing
-        # and YUY2-decode artifacts and are now fallback-only.
-        self._use_sdk_stream = bool(use_sdk_stream)
-        self._sdk_stream_mode: bool = False  # set True if SDK path opens
-        # Cap to 25 fps — beyond that the FX3 USB3 bus saturates under
-        # RAW12 (10 MB/frame * 25 = 250 MB/s, near the link's practical
-        # ceiling). 10 was the historical default and bottlenecks moving
-        # targets visibly.
-        self._stream_fps = float(max(1.0, min(25.0, stream_fps)))
-        # When set, we lock the bridge to manual exposure with this value
-        # (UVC log2 seconds, e.g. -6 ≈ 16ms) before PyAV opens the device.
-        # Killing AE hunting was the single biggest "image stops breathing
-        # frame to frame" win — see _set_uvc_manual_exposure docstring.
-        # NOTE: this is the LEGACY UVC path. On this FX3 bridge it does
-        # nothing — bridge ignores all UVC writes. Kept as a fallback for
-        # other hardware. Prefer manual_exposure_ext on the IMX568 rig.
-        self._manual_exposure_log2 = manual_exposure_log2
-        self._manual_gain = manual_gain
-        # PRIMARY exposure-lock path: Leopard SDK ExposureExt. When set,
-        # we spawn the 32-bit helper subprocess before PyAV opens, write
-        # ExposureExt via the vendor I2C extension, and the FX3 retains
-        # the manual-exposure lock across the helper close + PyAV open.
-        # See _set_leopard_exposure_ext docstring + the empirical proof
-        # in scripts/eo_probe_breathing_at_fixed_expext.py.
-        self._manual_exposure_ext = manual_exposure_ext
 
         self.device_index: Optional[int] = None
         self.actual_width: int = 0
@@ -654,100 +489,6 @@ class IMX568Capture:
         if self._cap is not None:
             return
 
-        # ── Leopard SDK RAW12 stream FIRST (preferred path) ───────────
-        #
-        # Spawns a 32-bit subprocess running leopard_sdk_helper.py
-        # --stream which drives LeopardCamera.dll directly, captures
-        # RAW12 (2472×2064 packed Bayer mosaic), and pipes [length][bytes]
-        # frames back over stdout. We decode (uint16>>4) → debayer
-        # cv2.COLOR_BAYER_BG2BGR → 8-bit BGR. Empirically matches
-        # Leopard CameraTool's BMP output to sub-decimal-point per
-        # channel (B/G/R diff < 0.03 vs reference, 2026-04-24).
-        #
-        # If anything goes wrong (32-bit Python missing, SDK DLL
-        # missing, helper crashes, header timeout), we fall through
-        # to the legacy PyAV / OpenCV YUY2 paths.
-        if self._use_sdk_stream:
-            try:
-                from eo.leopard_stream_capture import LeopardSDKStreamCapture
-                # AE policy:
-                #   manual_exposure_ext=None  →  bridge auto-exposure ON
-                #     (safe default — handles dim-indoor → sunlit-outdoor
-                #      without blowing the frame to white).
-                #   manual_exposure_ext=<int> →  bridge AE OFF + manual lock
-                #     (used to reproduce the calibration reference exactly,
-                #      or to freeze exposure for engineering tests).
-                if self._manual_exposure_ext is None:
-                    exp_ext = None
-                    ae_mode = "on"
-                else:
-                    exp_ext = int(self._manual_exposure_ext)
-                    ae_mode = "off"
-                sdk = LeopardSDKStreamCapture(
-                    exposure_ext=exp_ext,
-                    width=NATIVE_W,
-                    height=NATIVE_H,
-                    # bayer_pattern=None → mono sensor (LI-IMX568-GMSL2-M).
-                    # The IMX568 monochrome variant has no Bayer filter
-                    # array — every pixel is uniform luma. Running a 2×2
-                    # demosaic on uniform mono pixels is wrong (phantom
-                    # color + half resolution). The previous default
-                    # cv2.COLOR_BAYER_BG2BGR was a leftover from when the
-                    # rig was tested against a color variant.
-                    bayer_pattern=None,
-                    ae=ae_mode,
-                    stream_fps=self._stream_fps,
-                    warmup=12,
-                )
-                # Header timeout extended to 20s (was 12s) — observed
-                # 2026-04-25 that when the FX3 bridge has been left in a
-                # different resolution mode by a prior CameraTool session,
-                # the first stream renegotiation can take ~15s.
-                sdk.start(header_timeout_s=20.0)
-                # Verify by grabbing one settle frame.
-                test = sdk.grab()
-                if test is None:
-                    log.warning("SDK stream: header arrived but first "
-                                "grab returned None — falling back")
-                    sdk.stop()
-                else:
-                    self._cap = sdk  # type: ignore[assignment]
-                    self.device_index = 0  # SDK opens by handle, not index
-                    self.actual_width = NATIVE_W
-                    self.actual_height = NATIVE_H
-                    self._fourcc = "RAW12"
-                    self._sdk_stream_mode = True
-                    self._raw_yuy2_mode = False
-                    self._sw_ae_enabled = False  # SDK pins exposure
-                    log.info(
-                        "IMX568Capture mode: SDK_RAW12_STREAM "
-                        "(exposure_ext=%s, ae=%s, %dx%d, Bayer BG, "
-                        "first frame mean=%.1f)",
-                        ("auto" if exp_ext is None else str(exp_ext)),
-                        ae_mode, NATIVE_W, NATIVE_H, float(test.mean()),
-                    )
-                    return
-            except Exception as e:
-                log.warning("SDK stream backend unavailable (%r) — "
-                            "falling back to PyAV/OpenCV", e)
-                # CRITICAL: kill the orphaned helper subprocess. Without
-                # this, a STREAM_HDR timeout leaves the helper alive
-                # holding the camera, and the PyAV/DSHOW fallback below
-                # then fails with "device already in use by other
-                # application". Verified 2026-04-25 against a stuck-in-
-                # 2592x1944 bridge state from a prior CameraTool session.
-                try:
-                    sdk_local = locals().get("sdk")
-                    if sdk_local is not None:
-                        sdk_local.stop()
-                except Exception as cleanup_e:
-                    log.warning("SDK stream cleanup also threw %r "
-                                "— camera may be stuck; USB replug "
-                                "may be required.", cleanup_e)
-                # Brief settle so the bridge releases the device handle
-                # before PyAV grabs it.
-                time.sleep(0.5)
-
         # ── PyAV / ffmpeg-dshow first ─────────────────────────────────
         #
         # Try to open the bridge through ffmpeg's dshow demuxer with an
@@ -759,45 +500,6 @@ class IMX568Capture:
         if _PYAV_AVAILABLE:
             device_name = _find_dshow_video_device()
             if device_name:
-                # Lock bridge AE BEFORE PyAV opens the device. PyAV holds
-                # the device exclusive once open() succeeds, so we have
-                # exactly one window to write the manual-exposure command.
-                #
-                # PRIMARY: Leopard SDK ExposureExt via 32-bit subprocess
-                # helper. This is the only path that actually works on
-                # this FX3 bridge — proven in eo_probe_uvc_props.py (UVC
-                # writes ignored) and eo_probe_breathing_at_fixed_expext.py
-                # (ExposureExt → mean stable across 30s).
-                if self._manual_exposure_ext is not None:
-                    rep = _set_leopard_exposure_ext(
-                        exposure_ext=int(self._manual_exposure_ext),
-                        ae_off=True,
-                        gain=int(self._manual_gain) if self._manual_gain is not None else None,
-                    )
-                    log.info("Leopard SDK exposure prelude: %s", rep)
-                # FALLBACK: legacy UVC log2 path. Kept for non-IMX568
-                # hardware; on the FX3 bridge it's a known no-op.
-                elif self._manual_exposure_log2 is not None:
-                    locked = False
-                    for probe_idx in range(4):
-                        rep = _set_uvc_manual_exposure(
-                            probe_idx,
-                            exposure_log2=float(self._manual_exposure_log2),
-                            gain=self._manual_gain,
-                        )
-                        if "open_error" in rep:
-                            continue
-                        log.info(
-                            "UVC manual-exposure prelude on idx %d: %s",
-                            probe_idx, rep,
-                        )
-                        locked = True
-                        break
-                    if not locked:
-                        log.warning(
-                            "UVC manual-exposure prelude could not open "
-                            "any cv2 dshow index — bridge AE will run free"
-                        )
                 pyav_cap = _PyAVDshowBackend(device_name, NATIVE_W, NATIVE_H)
                 if pyav_cap.open():
                     # Read one settle frame to confirm the stream is alive.
@@ -1025,15 +727,10 @@ class IMX568Capture:
     def stop(self) -> None:
         if self._cap is not None:
             try:
-                # SDK stream uses .stop(); cv2/PyAV use .release().
-                if self._sdk_stream_mode:
-                    self._cap.stop()
-                else:
-                    self._cap.release()
+                self._cap.release()
             except Exception:
                 pass
             self._cap = None
-            self._sdk_stream_mode = False
 
     def __enter__(self) -> "IMX568Capture":
         self.start()
@@ -1058,17 +755,6 @@ class IMX568Capture:
         """
         if self._cap is None:
             return None
-
-        # SDK RAW12 stream path: the consumer already delivers BGR uint8
-        # from a Bayer-BG debayer; no YUY2 slicing, no software AE
-        # needed (the helper pinned ExposureExt at start).
-        if self._sdk_stream_mode:
-            try:
-                return self._cap.grab()  # LeopardSDKStreamCapture.grab()
-            except Exception as e:
-                log.warning("SDK stream grab threw %r", e)
-                return None
-
         try:
             ok, frame = self._cap.read()
         except Exception:
@@ -1099,24 +785,7 @@ class IMX568Capture:
         return cv2.cvtColor(y, cv2.COLOR_GRAY2BGR)
 
     def is_open(self) -> bool:
-        if self._cap is None:
-            return False
-        if self._sdk_stream_mode:
-            return bool(getattr(self._cap, "is_alive", False))
-        return self._cap.isOpened()
-
-    @property
-    def last_raw_stats(self) -> Optional[dict]:
-        """Forward LeopardSDKStreamCapture's per-frame raw u16 stats
-        when we're in SDK-stream mode. Returns None on the legacy
-        PyAV/YUY2 paths — those don't have access to the underlying
-        12-bit data because the FX3 bridge has already done its own
-        AGC and debayer in those modes. The software AE in EOManager
-        polls this; if it's None, AE simply doesn't engage (which is
-        the right behaviour — non-SDK paths use the bridge's AE)."""
-        if self._sdk_stream_mode and self._cap is not None:
-            return getattr(self._cap, "last_raw_stats", None)
-        return None
+        return self._cap is not None and self._cap.isOpened()
 
     # ───────────────────────── software AE ───────────────────────
 
@@ -1207,27 +876,6 @@ class IMX568Capture:
                                       0.75 if enabled else 0.25))
         except Exception:
             return False
-
-    def set_exposure_ext(self, exposure_ext: Optional[int]) -> bool:
-        """Deprecated. Do NOT call from API/GUI threads.
-
-        This method used to do its own stop()+start() of the SDK helper.
-        That ran on the FastAPI request thread while the EO capture
-        thread was independently observing the gap and ALSO calling
-        ``_open_source()`` — two SDK helpers ended up fighting for the
-        FX3 bridge and one orphan locked the camera hard enough to
-        require a USB replug.
-
-        Source-lifecycle changes are now owned exclusively by
-        ``EOManager.set_exposure_ext()`` which serializes them under
-        ``_source_lock`` + the ``_switching_exposure`` flag so the
-        capture loop can't race. This method intentionally does
-        nothing so any old caller is a silent no-op rather than a
-        device lockup.
-        """
-        log.warning("IMX568Capture.set_exposure_ext is a no-op; route "
-                    "through EOManager.set_exposure_ext instead.")
-        return False
 
     def set_gain(self, gain: float) -> bool:
         """Request analog gain. Range depends on bridge; typically 0..100."""

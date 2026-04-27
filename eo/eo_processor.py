@@ -329,22 +329,41 @@ def passthrough(bgr: np.ndarray) -> np.ndarray:
     if bgr is None:
         return bgr
     y = _to_luma(bgr)
-    # That's it. No stretch, no gamma, no bilateral filter, no median.
+    # 3×3 median — cheap, edge-preserving, never hurts. ksize must be odd.
+    # Removes salt-and-pepper sensor speckle from the analog gain stage.
+    y = cv2.medianBlur(y, 3)
+    # Adaptive AGC stretch.
     #
-    # Explicit anti-history note 2026-04-24: every stage we used to do
-    # here was either fighting the broken DSHOW YUY2->BGR decode (now
-    # bypassed by the PyAV raw path in imx568_capture.py) or amplifying
-    # contrast on a dim scene. On an indoor frame with mean ≈33 the
-    # percentile+gamma chain stretched the histogram ~4× and turned
-    # JPEG quantization into visible wave/ripple artefacts on flat
-    # surfaces (washer doors, walls). Side-by-side vs Leopard's
-    # CameraTool the unprocessed Y plane was indistinguishable from
-    # the manufacturer's render — Leopard does NOT apply AGC stretch,
-    # they show what the sensor sees and let bridge AE handle exposure.
+    # With the PyAV raw-YUY2 path now in place, the input Y plane is
+    # already a clean 0..255 mono stream from the sensor — the broken-
+    # decode era's "uniform-white-with-dots" and "shattered-glass on
+    # leather" failure modes are gone. The stretch is here to lift
+    # underexposed scenes (Y mean ≈40..80) into the 0..255 display
+    # range without amplifying noise on a high-contrast frame that's
+    # already well-distributed.
     #
-    # If the user wants brightness or contrast knobs, those belong in
-    # ``enhance()`` (opt-in via config), not in passthrough. Passthrough
-    # is reserved for "show me what the sensor actually delivered".
+    # Two guards remain (both genuine corner cases):
+    #   1. If the dynamic range is below 8 codes (lens cap, total dark
+    #      room, sensor stuck), skip the stretch entirely and centre
+    #      the histogram on 128. The operator sees a uniform mid-gray
+    #      with faint texture instead of noise turned to static.
+    #   2. CAP the stretch gain at 4×. Even on a clean Y plane, an
+    #      indoor frame with one tiny bright LED can produce a tight
+    #      lo..hi band; ungated stretch would amplify the rest of the
+    #      noise floor visibly. 4× covers the realistic dim-but-usable
+    #      indoor case (lo=20 hi=80 → ×3.2) without going wild.
+    sample = y[::4, ::4]
+    lo, hi = np.percentile(sample, [1.0, 99.0])
+    dyn = float(hi) - float(lo)
+    if dyn < 8.0:
+        mean = float(sample.mean())
+        y = np.clip(y.astype(np.float32) - mean + 128.0, 0, 255).astype(np.uint8)
+    else:
+        scale = min(255.0 / dyn, 4.0)
+        y = np.clip((y.astype(np.float32) - float(lo)) * scale,
+                    0, 255).astype(np.uint8)
+    # Gamma 0.85 — gentle midtone lift for the human eye's response.
+    y = cv2.LUT(y, _gamma_lut(0.85))
     return cv2.cvtColor(y, cv2.COLOR_GRAY2BGR)
 
 
