@@ -636,12 +636,16 @@ gimbal:
   # residual into an integrator that biases the synth-target world-
   # frame setpoint, closing the loop visually. Enable to A/B against
   # the open-loop baseline. Disable while debugging Stage A.
-  optical_correction_enabled: false   # default OFF — flip true to engage
-  optical_correction_alpha: 0.3       # integrator gain per residual sample
-  optical_correction_max_deg: 8.0     # anti-windup cap on cumulative bias
-  optical_correction_min_features: 8  # below this, skip update (LK noisy)
-  optical_correction_warmup_s: 0.5    # ignore residual for first N s post
-                                      # lock — gimbal is still slewing
+  optical_correction_enabled: true       # ON for A/B test (will revert)
+  optical_correction_alpha: 0.2          # integrator gain per residual sample
+  optical_correction_max_deg: 5.0        # anti-windup cap on cumulative bias
+  optical_correction_min_features: 12    # below this, skip update (LK noisy)
+  optical_correction_warmup_s: 1.0       # ignore residual for first N s
+                                         # post-lock (synth slew still running)
+  optical_correction_step_max_deg: 0.3   # per-tick cap on integrator change
+                                         # so the synth-OF tracker can follow
+  optical_correction_settled_deg: 0.7    # only update when |cur - cmd| < this
+                                         # (gimbal has reached current target)
 
   # Software safety envelope & slew rate.
   #

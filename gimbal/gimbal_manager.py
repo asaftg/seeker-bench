@@ -567,13 +567,25 @@ class GimbalManager:
         self._opt_corr_enabled: bool = bool(
             gcfg.get("optical_correction_enabled", False))
         self._opt_corr_alpha: float = float(
-            gcfg.get("optical_correction_alpha", 0.3))
+            gcfg.get("optical_correction_alpha", 0.2))
         self._opt_corr_max_deg: float = float(
-            gcfg.get("optical_correction_max_deg", 8.0))
+            gcfg.get("optical_correction_max_deg", 5.0))
         self._opt_corr_min_features: int = int(
-            gcfg.get("optical_correction_min_features", 8))
+            gcfg.get("optical_correction_min_features", 12))
         self._opt_corr_warmup_s: float = float(
-            gcfg.get("optical_correction_warmup_s", 0.5))
+            gcfg.get("optical_correction_warmup_s", 1.0))
+        # Per-tick step limit on the cumulative correction. Without
+        # this, alpha * large_residual on the first post-warmup tick
+        # can jump correction by several degrees instantly, which
+        # the synth-OF tracker can't follow (visible bbox drift).
+        self._opt_corr_step_max_deg: float = float(
+            gcfg.get("optical_correction_step_max_deg", 0.3))
+        # "Settled" gate: only update integrator when the controller
+        # is close to its current setpoint (gimbal has substantially
+        # completed the slew). Prevents the integrator from interpreting
+        # in-progress slew motion as undershoot.
+        self._opt_corr_settled_deg: float = float(
+            gcfg.get("optical_correction_settled_deg", 0.7))
         # Cumulative correction applied to the synth-target world angle.
         # Reset on lock release.
         self._opt_corr_az: float = 0.0
@@ -609,6 +621,8 @@ class GimbalManager:
         # Driver — may or may not actually open.
         self._driver = MaestroDriver(port=port or gcfg.get("port"))
         self._connected = False
+        # Counter for consecutive write failures (auto-reconnect logic).
+        self._consec_write_fail = 0
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -1416,11 +1430,17 @@ class GimbalManager:
     def _opt_pick_best(self, eo_metrics, thermal_metrics):
         """Choose which sensor's measurement to feed into the integrator.
 
-        EO is primary when it has enough features and isn't stale
-        (higher angular resolution at narrow FOV gives finer correction).
-        Thermal at wider FOV is the fallback when EO loses features
-        during a big slew — common when the world target shifts far
-        enough in the EO frame that LK can't track all features.
+        EO is primary when it has enough features and isn't stale AND
+        the world target is within the EO FOV (otherwise the original
+        anchor scene is off-frame and LK matches noise to noise,
+        producing spurious data — observed live in the first A/B run
+        where corr_az saturated at -8 because EO LK reported false
+        small motion during a 25 deg slew that put the anchor scene
+        completely outside the 11 deg EO frame).
+
+        Thermal at 75/37.5/18.75/12.5 deg is the fallback. Even at
+        the narrowest preset (12.5 deg), thermal sees ~6x more world
+        than EO.
 
         Returns (label, metrics) or (None, None) when neither is usable.
         """
@@ -1433,7 +1453,23 @@ class GimbalManager:
                 return False
             return True
 
-        if _ok(eo_metrics):
+        # FOV gate for EO. The required slew = (synth_world - anchor_pan)
+        # if anchor exists. Anything bigger than ~40% of EO half-FOV
+        # means the anchor scene is mostly off-frame in EO.
+        eo_in_range = True
+        if (_ok(eo_metrics) and self._synth_world_az_deg is not None
+                and self._opt_eo.anchor_pan is not None):
+            req_az = abs(self._synth_world_az_deg - self._opt_eo.anchor_pan)
+            req_el = abs(self._synth_world_el_deg - self._opt_eo.anchor_tilt)
+            # Use the metrics' anchored FOV (we stored hfov/vfov at
+            # anchor time). Half-FOV * 0.4 = "comfortable" range.
+            eo_hfov_half = self._opt_eo._anchor.hfov * 0.5 if self._opt_eo._anchor else 5.5
+            eo_vfov_half = self._opt_eo._anchor.vfov * 0.5 if self._opt_eo._anchor else 4.6
+            if (req_az > 0.4 * eo_hfov_half * 2  # i.e. 0.4 * full hfov
+                    or req_el > 0.4 * eo_vfov_half * 2):
+                eo_in_range = False
+
+        if _ok(eo_metrics) and eo_in_range:
             return "eo", eo_metrics
         if _ok(thermal_metrics):
             return "thermal", thermal_metrics
@@ -1476,16 +1512,50 @@ class GimbalManager:
         target_resid_az = required_az - float(m.daz_actual_deg)
         target_resid_el = required_el - float(m.del_actual_deg)
 
+        cur_pan, cur_tilt = self._controller.current
+        # Settled gate: don't run integrator while gimbal is still
+        # slewing to the current setpoint. Otherwise the LK actual_delta
+        # is mid-slew and "looks like" undershoot, kicking the integrator.
+        cmd_pan = self._synth_world_az_deg + self._opt_corr_az
+        cmd_tilt = self._synth_world_el_deg + self._opt_corr_el
+        if (abs(cur_pan - cmd_pan) > self._opt_corr_settled_deg
+                or abs(cur_tilt - cmd_tilt) > self._opt_corr_settled_deg):
+            return  # still slewing — skip update this tick
+        # Saturation-aware update. If the controller is at a mechanical
+        # pan/tilt limit AND the residual would push further into the
+        # limit, skip the update on that axis. Otherwise the integrator
+        # winds up against the wall (observed first A/B run: world
+        # target at -43 deg with pan limit -45 deg, integrator
+        # saturated at -8 deg correction trying to push a camera that
+        # was already clamped).
+        pan_sat_lo = (cmd_pan <= self._pan_floor + 0.1
+                      and target_resid_az < 0)
+        pan_sat_hi = (cmd_pan >= self._pan_ceil - 0.1
+                      and target_resid_az > 0)
+        tilt_sat_lo = (cmd_tilt <= self._tilt_floor + 0.1
+                       and target_resid_el < 0)
+        tilt_sat_hi = (cmd_tilt >= self._tilt_ceil - 0.1
+                       and target_resid_el > 0)
+
         a = self._opt_corr_alpha
-        new_az = self._opt_corr_az + a * target_resid_az
-        new_el = self._opt_corr_el + a * target_resid_el
         cap = self._opt_corr_max_deg
-        if   new_az >  cap: new_az =  cap
-        elif new_az < -cap: new_az = -cap
-        if   new_el >  cap: new_el =  cap
-        elif new_el < -cap: new_el = -cap
-        self._opt_corr_az = new_az
-        self._opt_corr_el = new_el
+        step_cap = self._opt_corr_step_max_deg
+        if not (pan_sat_lo or pan_sat_hi):
+            delta = a * target_resid_az
+            if   delta >  step_cap: delta =  step_cap
+            elif delta < -step_cap: delta = -step_cap
+            new_az = self._opt_corr_az + delta
+            if   new_az >  cap: new_az =  cap
+            elif new_az < -cap: new_az = -cap
+            self._opt_corr_az = new_az
+        if not (tilt_sat_lo or tilt_sat_hi):
+            delta = a * target_resid_el
+            if   delta >  step_cap: delta =  step_cap
+            elif delta < -step_cap: delta = -step_cap
+            new_el = self._opt_corr_el + delta
+            if   new_el >  cap: new_el =  cap
+            elif new_el < -cap: new_el = -cap
+            self._opt_corr_el = new_el
         self._opt_corr_last_source = source
 
     def _opt_measure_and_emit(self, cur_pan: float, cur_tilt: float,
@@ -1575,14 +1645,44 @@ class GimbalManager:
                 pass
 
     def _command_now(self, pan_deg: float, tilt_deg: float) -> None:
+        # Auto-reconnect on transient failures. The Pololu Maestro's
+        # USB-CDC driver on Windows occasionally raises a "device
+        # doesn't recognize the command" PermissionError 13 under
+        # sustained 60 Hz writes — this is a known Windows USB-CDC
+        # quirk, not a real fault. Permanently marking the gimbal
+        # disconnected after one transient failure (the previous
+        # behaviour) caused the open-loop gimbal to silently go offline
+        # ~8 s into a session, with `_controller.current` continuing to
+        # advance based on commanded setpoints, so gimbal/state lied
+        # about reality. Confirmed in recordings/ab2_off_mid.jsonl:
+        # connected=False for all 1363 gimbal/state samples while
+        # commanded pan moved -15 -> -27.6, but thermal LK reported
+        # zero scene shift.
         if not self._connected:
-            return
+            # Try to re-open the port. Cheap when there's no Maestro
+            # plugged in (returns False fast).
+            self._connected = self._driver.open()
+            if not self._connected:
+                return
+            log.info("Maestro re-connected after transient failure")
+            self._consec_write_fail = 0
         us_p, us_t = self._controller.angles_to_us(pan_deg, tilt_deg)
         ok1 = self._driver.set_target_us(self._pan_cal.channel,  us_p)
         ok2 = self._driver.set_target_us(self._tilt_cal.channel, us_t)
         if not (ok1 and ok2):
-            # Mark disconnected on a write failure; a subsequent
-            # open() attempt could be added here but it keeps things
-            # simple to just sit idle.
-            log.warning("Maestro write failed — marking disconnected")
-            self._connected = False
+            self._consec_write_fail += 1
+            if self._consec_write_fail >= 3:
+                # Several consecutive failures: drop the handle so the
+                # next tick will attempt a fresh open(). pyserial seems
+                # to recover after a close+open cycle even when the
+                # underlying USB-CDC driver is in a stuck state.
+                log.warning("Maestro: %d consec write fails — dropping "
+                            "handle for re-open on next tick",
+                            self._consec_write_fail)
+                try:
+                    self._driver.close()
+                except Exception:
+                    pass
+                self._connected = False
+        else:
+            self._consec_write_fail = 0
