@@ -274,23 +274,10 @@ export class ThermalView {
       }
     }
 
-    // Radar overlay: cyan dashed bboxes projected from radar tracks.
-    // Projection-only (no fusion ID sharing) — label carries radar TID
-    // so a user can match it to the radar panel's trails. Coasting
-    // tracks render dimmer.
-    for (const rt of this._lastRadarTargets) {
-      const bbox = rt.bbox_thermal;
-      if (!bbox) continue;
-      const x = dx + bbox.x * scale;
-      const y = dy + bbox.y * scale;
-      const w = bbox.w * scale;
-      const h = bbox.h * scale;
-      const label = `R#${rt.tid}${rt.coasting ? " · coast" : ""}`;
-      this.ctx.save();
-      if (rt.coasting) this.ctx.globalAlpha = 0.55;
-      drawRadarBox(this.ctx, x, y, w, h, label);
-      this.ctx.restore();
-    }
+    // (Radar overlay removed — radar-only targets are now FusedTrack
+    //  entries with sensors=["radar"] and get drawn by the fused loop
+    //  above in their class colour. Drawing both was duplicating every
+    //  box on the thermal/EO panels.)
 
     // Developer overlay: every heat-blob tracker entry (incl. pending
     // + coasting). Drawn AFTER production boxes so the magenta lines

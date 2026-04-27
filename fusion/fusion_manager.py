@@ -648,15 +648,23 @@ class FusionManager:
         for trk in self._tracks:
             if trk["hits"] < self.min_hits:
                 continue
-            try:
-                tc = TargetClass(trk["class"])
-            except ValueError:
-                tc = TargetClass.UNKNOWN
             # Currently-active sensors only (per Phase 2: a sensor that
             # stops contributing for > sensor_grace_ticks is pruned, so
             # the "2+ sensor" outline decays back to single-sensor when
             # e.g. radar leaves the scene).
             active_sensors = sorted(trk["sensor_misses"].keys())
+            # Skip publishing tracks whose active-sensor set is empty.
+            # The track stays in self._tracks (Kalman-style coasting up
+            # to max_misses) so a re-acquire keeps the same id, but
+            # without active sensors it has nothing to project from
+            # confidently — drawing a stale dashed bbox on every panel
+            # was misleading.
+            if not active_sensors:
+                continue
+            try:
+                tc = TargetClass(trk["class"])
+            except ValueError:
+                tc = TargetClass.UNKNOWN
             out.append(FusedTrack(
                 id=int(trk["id"]),
                 target_class=tc,

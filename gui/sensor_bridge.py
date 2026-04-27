@@ -233,18 +233,13 @@ def radar_to_wire(
 
     targets_wire = []
     for t in rf.targets:
-        # Skip the EO/thermal projection for coasting targets — the
-        # radar panel still shows them (the operator wants to know the
-        # tracker is dead-reckoning), but stale coasting overlays make
-        # the camera panels noisy when traffic passes through. Only
-        # `bbox_thermal` and `bbox_eo` are gated; the target itself
-        # stays in the wire payload so its tid persists for re-acquire.
-        if bool(t.coasting):
-            bt, be = None, None
-        else:
-            bt, be = _radar_target_to_panel_bboxes(
-                t, tf, ef, radar_az_bias_deg, radar_el_bias_deg,
-            )
+        # Phase 2 fusion path now produces FusedTrack entries with
+        # sensors=["radar"] for radar-only targets, and the fused-track
+        # projection draws those onto the EO / thermal panels in the
+        # canonical class-coloured style. So we no longer pre-project
+        # raw radar targets into camera pixel space here — that was
+        # duplicating every box once the fusion path was wired in. The
+        # radar PANEL still renders this targets payload via radar_view.js.
         targets_wire.append({
             "tid": int(t.tid),
             "x": round(t.pos_x_m, 3),
@@ -263,11 +258,6 @@ def radar_to_wire(
             "hits": int(t.hits),
             "misses": int(t.misses),
             "class": "radar_detection",
-            # Pre-projected into each sensor's pixel grid for the radar-
-            # overlay option on EO / thermal panels. Either may be null
-            # (target outside FOV or that sensor disconnected).
-            "bbox_thermal": bt,
-            "bbox_eo": be,
         })
 
     return {

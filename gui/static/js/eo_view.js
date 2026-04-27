@@ -114,20 +114,9 @@ export class EOView {
       }
     }
 
-    // Radar overlay (projection-only, pre-fusion). Bbox is pre-projected
-    // into EO pixel space server-side. Coasting tracks render dimmer.
-    for (const rt of this._lastRadarTargets) {
-      const bbox = rt.bbox_eo;
-      if (!bbox) continue;
-      const x = dx + bbox.x * scale;
-      const y = dy + bbox.y * scale;
-      const w = bbox.w * scale;
-      const h = bbox.h * scale;
-      const label = `R#${rt.tid}${rt.coasting ? " · coast" : ""}`;
-      this.ctx.save();
-      if (rt.coasting) this.ctx.globalAlpha = 0.55;
-      drawRadarBox(this.ctx, x, y, w, h, label);
-      this.ctx.restore();
-    }
+    // (Radar overlay removed — radar-only targets are now FusedTrack
+    //  entries with sensors=["radar"] and get drawn by the fused loop
+    //  above in their class colour. Drawing both was duplicating every
+    //  box on the EO panel.)
   }
 }
