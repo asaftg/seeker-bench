@@ -1,25 +1,45 @@
 # Next up
 
-Living roadmap — tomorrow's priorities on top, parked items below.
+Living roadmap — top priorities first, parked items below.
 
 ---
 
-## Tomorrow (2026-04-24)
+## Recently shipped
 
-### P0 — Finish calibration workflow
-- **Persist extrinsic sliders to YAML.** Right now `extrinsic_tune`
-  only updates the live managers — a restart reverts to YAML values.
-  Options:
-  - Add a "SAVE" button in the DEV card that POSTs a patch back into
-    `config/app_config.yaml` (write via `ruamel.yaml` to preserve
-    comments/formatting), OR
-  - Auto-write on debounced settle (risk: clobbers manual YAML edits
-    someone made in parallel).
-  - Lean toward the explicit SAVE button.
-- **Calibrate on the bench.** Put a target in the scene, line up the
-  EO bbox, drag radar az/el until the cyan radar bbox sits on top,
-  then drag thermal az/el until the thermal bbox agrees. Capture the
-  numbers and commit them to YAML.
+- **2026-04-23** — Radar overlay on EO/thermal, software extrinsic
+  calibration sliders, unified OVERLAY SCREEN. (`b2debe1`)
+- **2026-04-26** — **Phase 2 late fusion landed.** Radar is a
+  first-class FusionManager contributor; per-sensor decay; coasting
+  filter; unified single-overlay-per-target rendering.
+  (`8361dc9`, `107cb81`, `1d0bcc3`, `98005eb` — see
+  `docs/DAY_LOG_2026-04-26.md`)
+
+---
+
+## Now
+
+### P0 — Bench-calibrate the radar
+The radar az/el bias is still 0° — it has to be dialled in before
+class-promotion (`radar_target` → `vehicle`) will fire reliably.
+Once a radar target's projected bbox sits on top of the same
+real-world target's EO bbox, the cross-sensor IoU will exceed
+`radar_iou_gate=0.05` and tracks will merge.
+
+- Park a known target in the FOV. Drag radar az/el sliders until
+  the dashed `RADAR_TARGET` bbox sits on the EO image of the same
+  target. Then drag thermal az/el until the thermal box agrees.
+- Verify class-promotion fires: radar-only born → EO sees → label
+  flips from "RADAR TARGET" to "VEHICLE" on the same row id.
+- Once happy with values, save them (see P0.5).
+
+### P0.5 — Persist extrinsic sliders to YAML
+Live `extrinsic_tune` updates the managers but restart reverts to
+YAML defaults. Pick:
+- SAVE button in the DEV card that POSTs a patch back into
+  `config/app_config.yaml` via `ruamel.yaml` (preserve comments).
+- Or auto-write on debounced settle (risk: clobbers manual YAML
+  edits made in parallel).
+Lean toward the explicit SAVE button.
 
 ### P1 — Overlay screen polish
 - **Verify thermal-only / EO-only fused tracks** behave correctly on
@@ -30,26 +50,6 @@ Living roadmap — tomorrow's priorities on top, parked items below.
   on the thermal/EO panel that an overlay is suppressed. Consider a
   small "overlays: R T E" legend in the panel corner with dimmed
   letters for off sensors.
-
-### P2 — Phase 2 late fusion (radar contributor)
-Start the real work: extend `FusionManager` to consume `RadarTarget`s
-alongside EO/thermal detections, producing unified `FusedTrack`s where
-`sensors` can include "radar". This is the actual late-fusion (vs.
-today's projection overlay).
-
-**Why late (not early/mid):** all three sensors already produce tracked
-outputs — plugging radar into `FusionManager`'s existing track-to-track
-association is a local extension, not a rewrite. Early fusion discards
-radar's temporal smoothing; mid fusion (radar-points-into-image +
-shared detector) is a real win for detection at range but needs a
-joint model we don't have yet — revisit as Phase 3.
-
-Requires:
-- Observation model for radar (az, el from pos; range as extra gating
-  feature the EO/thermal path doesn't have).
-- Track-to-track association gate for radar vs. existing tracks.
-- GUI row rendering already handles multi-sensor "sensors" lists, so
-  minimal UI churn.
 
 ### P1.5 — Gimbal tracking / PID tuning (separate ticket, non-radar)
 Target-lock tracking is functional but not tight. Action items:
