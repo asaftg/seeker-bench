@@ -22,6 +22,7 @@ from typing import Optional
 import uvicorn
 
 from common.config import load_config
+from common.frame_bus import BUS
 from common.logging_setup import configure, get_logger
 from eo.eo_manager import EOManager
 from fusion.fusion_manager import FusionManager
@@ -29,6 +30,7 @@ from gimbal.gimbal_manager import GimbalManager
 from gui.app import create_app
 from radar.clustering import ClusterParams
 from radar.radar_manager import RadarManager
+from recording.jsonl_recorder import JSONLRecorder
 from thermal.thermal_manager import ThermalManager
 
 
@@ -52,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eo-device", default=None,
                    help="EO camera device index (auto|0|1|...). "
                         "Defaults to config eo.device_index.")
+    p.add_argument("--auto-record", action="store_true",
+                   help="Begin recording immediately at app launch "
+                        "(overrides config recording.auto_start). Useful "
+                        "for unattended capture and remote/CI runs.")
     return p.parse_args()
 
 
@@ -72,59 +78,94 @@ def main() -> int:
              args.fake_thermal, args.fake_eo, args.no_eo)
     log.info("=" * 50)
 
-    # Start thermal manager (unless --no-thermal). Skipping it avoids the
-    # DirectShow 4-index probe that can leave the webcam in a flaky state
-    # on Windows, so EO-only runs start cleanly.
+    # Startup order depends on the EO backend:
+    #   sensor=imx568 — start EO first, then exclude EO's index from thermal's
+    #     probe. The IMX568 opens reliably at a known native resolution, and
+    #     once it's streaming we must NOT let thermal's DirectShow probe
+    #     open+configure the same index or the IMX568's handle gets kicked.
+    #   sensor=webcam (or fake-eo) — keep the legacy order (thermal first,
+    #     then EO waits up to 8s for thermal's index). This order was the
+    #     only way that worked before the IMX568 was online.
+    eo_cfg = (cfg.get("eo") or {})
+    eo_enabled_in_cfg = bool(eo_cfg.get("enabled", True))
+    eo_is_imx568 = (str(eo_cfg.get("sensor", "webcam")).lower() == "imx568"
+                    and not args.fake_eo and not args.no_eo and eo_enabled_in_cfg)
+
     thermal: ThermalManager | None = None
-    if not args.no_thermal:
+    eo: EOManager | None = None
+
+    def _start_thermal(exclude_indices: list[int]) -> None:
+        nonlocal thermal
+        if args.no_thermal:
+            log.info("Thermal disabled (--no-thermal): skipping ThermalManager")
+            return
         thermal = ThermalManager(
             use_fake=args.fake_thermal,
             device_index=args.device,
             enable_classifier=not args.no_classifier,
+            exclude_indices=exclude_indices,
         )
         thermal.start()
-    else:
-        log.info("Thermal disabled (--no-thermal): skipping ThermalManager")
 
-    # Start EO manager (optional). Disabling leaves the GUI's EO panel in
-    # DISCONNECTED state; rest of the app is unaffected.
-    eo: EOManager | None = None
-    eo_cfg = (cfg.get("eo") or {})
-    eo_enabled_in_cfg = bool(eo_cfg.get("enabled", True))
-    if not args.no_eo and eo_enabled_in_cfg:
+    def _start_eo(exclude_indices: list[int]) -> None:
+        nonlocal eo
+        if args.no_eo or not eo_enabled_in_cfg:
+            return
         eo_device = args.eo_device if args.eo_device is not None else eo_cfg.get("device_index", "auto")
-        # Wait briefly for thermal to finish opening its camera so we can
-        # exclude that index from EO's auto-probe. cv2/DirectShow does NOT
-        # reliably lock devices on Windows — without this, both managers
-        # race for index 0 and one ends up with a broken handle whose
-        # grabs return None, leaving both panels in DISCONNECTED.
-        thermal_idx: Optional[int] = None
-        if thermal is not None and not args.fake_thermal:
-            deadline = time.time() + 8.0
-            while time.time() < deadline:
-                src = getattr(thermal, "_source", None)
-                if src is not None:
-                    idx = getattr(src, "device_index", None)
-                    if isinstance(idx, int):
-                        thermal_idx = idx
-                        break
-                time.sleep(0.1)
-            if thermal_idx is not None:
-                log.info("Thermal opened on index %d — excluding from EO probe", thermal_idx)
-            else:
-                log.warning("Thermal not opened within 8s — EO probe may collide")
         try:
-            excludes = [thermal_idx] if thermal_idx is not None else []
             eo = EOManager(
                 use_fake=args.fake_eo,
                 device_index=eo_device,
                 enable_classifier=not args.no_classifier,
-                exclude_indices=excludes,
+                exclude_indices=exclude_indices,
             )
             eo.start()
         except Exception as e:
             log.warning("EO manager failed to start: %s — continuing without EO", e)
             eo = None
+
+    def _wait_for_device_index(mgr, deadline_s: float) -> Optional[int]:
+        deadline = time.time() + deadline_s
+        while time.time() < deadline:
+            src = getattr(mgr, "_source", None)
+            if src is not None:
+                idx = getattr(src, "device_index", None)
+                if isinstance(idx, int):
+                    return idx
+            time.sleep(0.1)
+        return None
+
+    if eo_is_imx568:
+        # EO-first order: IMX568 claims its index, then thermal is told to
+        # skip it.
+        _start_eo(exclude_indices=[])
+        eo_idx: Optional[int] = None
+        if eo is not None:
+            # 25s — covers SDK stream cold-start (~5s nominal, ~15s if
+            # the FX3 bridge is stuck in a prior CameraTool resolution)
+            # AND the PyAV fallback path (~10s prelude + open). Without
+            # this, thermal index-probe starts in parallel and the
+            # DSHOW VideoCapture::open warnings on the EO USB device
+            # disturb the SDK helper handshake → STREAM_HDR timeout →
+            # whole EO path fails over to PyAV which then can't open
+            # because the helper is still alive holding the camera.
+            eo_idx = _wait_for_device_index(eo, 25.0)
+            if eo_idx is not None:
+                log.info("EO(IMX568) opened on index %d — excluding from thermal probe", eo_idx)
+            else:
+                log.warning("EO(IMX568) not opened within 25s — thermal probe may collide")
+        _start_thermal(exclude_indices=[eo_idx] if eo_idx is not None else [])
+    else:
+        # Legacy order: thermal first, EO excludes thermal's index.
+        _start_thermal(exclude_indices=[])
+        thermal_idx: Optional[int] = None
+        if thermal is not None and not args.fake_thermal:
+            thermal_idx = _wait_for_device_index(thermal, 8.0)
+            if thermal_idx is not None:
+                log.info("Thermal opened on index %d — excluding from EO probe", thermal_idx)
+            else:
+                log.warning("Thermal not opened within 8s — EO probe may collide")
+        _start_eo(exclude_indices=[thermal_idx] if thermal_idx is not None else [])
 
     # Start fusion manager — reads from the bus only, no hardware.
     # Safe to run even if only one sensor is connected.
@@ -200,6 +241,33 @@ def main() -> int:
             log.warning("Gimbal manager failed to start: %s — continuing without gimbal", e)
             gimbal = None
 
+    # Load persisted extrinsic calibration (if any) and apply it to the
+    # live managers BEFORE the GUI starts pushing frames. This is what
+    # makes the SAVE button on the EXTRINSIC CALIBRATION card useful:
+    # values survive restarts. Missing file = use YAML defaults; corrupt
+    # file = warning logged, fall back to YAML. Never blocks startup.
+    try:
+        from common import calibration_store
+        applied = calibration_store.apply_to_managers(
+            radar_manager=radar, fusion_manager=fusion,
+        )
+        if applied:
+            log.info("Loaded persisted extrinsic calibration: %s", applied)
+    except Exception as e:
+        log.warning("Calibration load skipped: %s", e)
+
+    # Construct the JSONL recorder. Always exists so the WS "record"
+    # button is wired even when recording.enabled=false (in which case
+    # start() is a no-op). Lifecycle is driven by gui.app's WS handler
+    # OR --auto-record below.
+    rec_cfg = (cfg.get("recording") or {})
+    recorder = JSONLRecorder(
+        BUS,
+        output_dir=str(rec_cfg.get("output_dir", "./recordings")),
+        jpeg_quality=int(rec_cfg.get("jpeg_quality", 92)),
+        channel_enable=dict(rec_cfg.get("channels") or {}),
+    )
+
     # Build FastAPI app. The managers are passed in so the runtime
     # config endpoints can mutate detector parameters live from the GUI.
     app = create_app(
@@ -208,7 +276,22 @@ def main() -> int:
         gimbal_manager=gimbal,
         radar_manager=radar,
         fusion_manager=fusion,
+        recorder=recorder,
+        config_snapshot=cfg,
     )
+
+    # Auto-start recording if either the YAML or the CLI says so. The
+    # CLI flag is sticky — it overrides config=false. We DO respect
+    # recording.enabled=false as a hard kill switch (logged + skipped).
+    auto = bool(args.auto_record) or bool(rec_cfg.get("auto_start", False))
+    if auto and bool(rec_cfg.get("enabled", True)):
+        try:
+            path = recorder.start(config_snapshot=cfg)
+            log.info("--auto-record on: writing %s", path)
+        except Exception as e:
+            log.warning("--auto-record failed: %s", e)
+    elif auto:
+        log.info("--auto-record requested but recording.enabled=false; skipping")
 
     host = args.host or str(cfg.get("gui", {}).get("host", "127.0.0.1"))
     port = args.port or int(cfg.get("gui", {}).get("port", 8080))
@@ -225,6 +308,11 @@ def main() -> int:
 
     def _shutdown(*_):
         log.info("Shutdown signal received, stopping sensors")
+        try:
+            if recorder.is_recording:
+                recorder.stop()
+        except Exception:
+            log.exception("recorder stop failed during shutdown")
         if gimbal is not None:
             gimbal.stop()
         if fusion is not None:
@@ -247,6 +335,11 @@ def main() -> int:
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
+        try:
+            if recorder.is_recording:
+                recorder.stop()
+        except Exception:
+            log.exception("recorder stop failed at shutdown")
         if gimbal is not None:
             gimbal.stop()
         if fusion is not None:

@@ -177,16 +177,20 @@ export class RadarView {
       ctx.stroke();
     }
     ctx.lineWidth = 1;
-    // ±FOV sector lines — mark the host-side azimuth gate wedge.
-    // Azimuth convention: 0° = boresight (+y), + = right (+x), so screen
-    // angle is measured from straight-up at (cx, cy).
+    // ±FOV sector lines — mark the radar's host-side azimuth gate.
+    // Now drawn ROTATED by the gimbal pan so the wedge follows where
+    // the radar is actually pointing in world frame. Screen-up =
+    // bench-forward (world +y); positive angle goes right (world +x).
     const fovHalf = this._fovHalfDeg;
-    const fovRad = (fovHalf * Math.PI) / 180;
+    const fovRad  = (fovHalf * Math.PI) / 180;
+    const panRad  = this._gimbalPanRad || 0;
+    const panDeg  = this._gimbalPanDeg || 0;
     ctx.strokeStyle = "rgba(0, 212, 255, 0.22)";
     ctx.setLineDash([4, 4]);
     for (const sign of [-1, 1]) {
-      const ex = cx + Math.sin(sign * fovRad) * maxR;
-      const ey = cy - Math.cos(sign * fovRad) * maxR;
+      const a = panRad + sign * fovRad;
+      const ex = cx + Math.sin(a) * maxR;
+      const ey = cy - Math.cos(a) * maxR;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.lineTo(ex, ey);
@@ -194,23 +198,58 @@ export class RadarView {
     }
     ctx.setLineDash([]);
 
-    // Boresight tick (solid, stronger).
-    ctx.strokeStyle = "rgba(0, 212, 255, 0.30)";
+    // Translucent fill inside the wedge so the eye lands on
+    // "where the radar is currently looking" without effort.
+    ctx.fillStyle = "rgba(0, 212, 255, 0.07)";
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, maxR,
+            -Math.PI / 2 + (panRad - fovRad),
+            -Math.PI / 2 + (panRad + fovRad),
+            false);
+    ctx.closePath();
+    ctx.fill();
+
+    // Boresight tick (solid, stronger) at the gimbal pan direction.
+    ctx.strokeStyle = "rgba(0, 212, 255, 0.45)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.sin(panRad) * maxR,
+               cy - Math.cos(panRad) * maxR);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+
+    // Bench north tick (faint, always points to screen-up).
+    // World +y = bench forward = where pan=0 looks. Operator uses
+    // this as a stable reference for "which way is the bench facing"
+    // even as the gimbal swings.
+    ctx.strokeStyle = "rgba(180, 220, 240, 0.20)";
+    ctx.setLineDash([2, 4]);
     ctx.beginPath();
     ctx.moveTo(cx, cy);
     ctx.lineTo(cx, cy - maxR);
     ctx.stroke();
+    ctx.setLineDash([]);
 
-    // FOV edge labels.
+    // Pan readout near origin
+    ctx.fillStyle = "rgba(0, 212, 255, 0.65)";
+    ctx.font = `${Math.round(10 * (window.devicePixelRatio || 1))}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.fillText(`PAN ${panDeg.toFixed(1)}°`, cx, cy + 14);
+
+    // FOV edge labels (rotated with the wedge).
     ctx.fillStyle = "rgba(180, 220, 240, 0.45)";
     ctx.font = `${Math.round(10 * (window.devicePixelRatio || 1))}px sans-serif`;
     ctx.textAlign = "center";
-    const lx = cx + Math.sin(-fovRad) * maxR * 0.98;
-    const ly = cy - Math.cos(-fovRad) * maxR * 0.98;
-    const rx = cx + Math.sin( fovRad) * maxR * 0.98;
-    const ry = cy - Math.cos( fovRad) * maxR * 0.98;
-    ctx.fillText(`-${fovHalf.toFixed(0)}°`, lx, ly);
-    ctx.fillText(`+${fovHalf.toFixed(0)}°`, rx, ry);
+    const aL = panRad - fovRad;
+    const aR = panRad + fovRad;
+    const lx = cx + Math.sin(aL) * maxR * 0.98;
+    const ly = cy - Math.cos(aL) * maxR * 0.98;
+    const rx = cx + Math.sin(aR) * maxR * 0.98;
+    const ry = cy - Math.cos(aR) * maxR * 0.98;
+    ctx.fillText(`${(panDeg - fovHalf).toFixed(0)}°`, lx, ly);
+    ctx.fillText(`${(panDeg + fovHalf).toFixed(0)}°`, rx, ry);
 
     // Range labels — match the 100 m ring's warm highlight.
     ctx.font = `${Math.round(11 * (window.devicePixelRatio || 1))}px sans-serif`;
@@ -451,7 +490,48 @@ export class RadarView {
     this._drawTargets(r.targets);
   }
 
-  update(radar) {
+  // Radar (x,y) → "world" pass-through.
+  //
+  // 2026-04-27: A/B tested all three options (R(-p), R(+p), no rotation)
+  // against `recordings/radar_opposite.jsonl` — 43 s of pure gimbal
+  // panning across 30°+ with no track engaged. For every persistent
+  // target tid (1, 4, 5, 9), NO ROTATION produces the smallest world-x
+  // standard deviation by a factor of 2-6× over either rotation. tid=4
+  // chronological check: gimbal slewed +20° while target's local_x
+  // changed by 3.77 m — camera-frame would have predicted ~34 m at the
+  // observed range. Conclusion: this rig's radar reports (x,y) that are
+  // already world-stable. Whatever the mechanical or firmware
+  // explanation, applying any pan rotation only adds spurious motion.
+  //
+  // History notes (so a future agent doesn't re-introduce the bug):
+  //   * 2026-04-26 first wired this fn as R(-p); pulled the wrong
+  //     direction and made targets swing >10× expected.
+  //   * 2026-04-27 morning, swapped to R(+p); operator's video
+  //     "radar_is_opposite" showed targets now flying off the canvas.
+  //   * Same afternoon, replay-driven analysis (above) showed no
+  //     rotation is correct on this rig.
+  // Re-enable rotation only if the rig changes (radar mount, IMU
+  // wiring, firmware) AND a captured-video A/B test against a fresh
+  // `radar_opposite`-style recording supports it.
+  _rotateToWorld(x, y) {
+    return { x, y };
+  }
+
+  // Apply world-frame rotation in-place to one wire-shape entry that
+  // carries radar-local (x, y, vx, vy). Returns a SHALLOW COPY so the
+  // upstream payload isn't mutated (downstream consumers may still
+  // need radar-local coords).
+  _toWorldEntry(e) {
+    const p = this._rotateToWorld(e.x || 0, e.y || 0);
+    let vx = e.vx, vy = e.vy;
+    if (vx != null && vy != null) {
+      const v = this._rotateToWorld(vx, vy);
+      vx = v.x; vy = v.y;
+    }
+    return { ...e, x: p.x, y: p.y, vx, vy };
+  }
+
+  update(radar, gimbalPanDeg = 0) {
     if (!this.ctx) return;
     // Defensive re-fit: if the view was constructed before CSS layout
     // settled, the constructor's _fit() sized the canvas to 1×1. Check
@@ -464,9 +544,27 @@ export class RadarView {
       this.canvas.width = wantW;
       this.canvas.height = wantH;
     }
-    this._lastRadar = radar || null;
 
-    if (!radar || !radar.connected) {
+    // Cache gimbal pose for the world-frame rotation. Stored in radians
+    // for fast cos/sin in the hot loop.
+    this._gimbalPanDeg = Number(gimbalPanDeg) || 0;
+    this._gimbalPanRad = this._gimbalPanDeg * Math.PI / 180;
+
+    // Pre-rotate the radar payload into world frame so all downstream
+    // drawing, view-range fitting, and trail accumulation operate in
+    // a fixed reference. Targets stay anchored on the panel; only the
+    // radar's pointing wedge swings as the gimbal moves.
+    let rWorld = radar || null;
+    if (radar && radar.connected) {
+      rWorld = {
+        ...radar,
+        points:  (radar.points  || []).map(p => this._toWorldEntry(p)),
+        targets: (radar.targets || []).map(t => this._toWorldEntry(t)),
+      };
+    }
+    this._lastRadar = rWorld;
+
+    if (!rWorld || !rWorld.connected) {
       this._setDisconnected(true);
       // Reset to default when the sensor drops — avoids showing a stale
       // breathed-out scale on reconnect.
@@ -480,14 +578,14 @@ export class RadarView {
     }
 
     this._setDisconnected(false);
-    if (radar.max_range_m && radar.max_range_m > 0) this._maxRangeM = radar.max_range_m;
-    if (typeof radar.fov_half_deg === "number" && radar.fov_half_deg > 0) {
-      this._fovHalfDeg = radar.fov_half_deg;
+    if (rWorld.max_range_m && rWorld.max_range_m > 0) this._maxRangeM = rWorld.max_range_m;
+    if (typeof rWorld.fov_half_deg === "number" && rWorld.fov_half_deg > 0) {
+      this._fovHalfDeg = rWorld.fov_half_deg;
     }
-    this._ingestTrails(radar.targets);
-    this._updateViewRange(radar);
+    this._ingestTrails(rWorld.targets);
+    this._updateViewRange(rWorld);
 
-    const hz = this._updateHz(radar);
+    const hz = this._updateHz(rWorld);
     this._paintHzLabel(hz);
     this._redraw();
   }

@@ -207,6 +207,15 @@ body {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 10px;
+  /* Cap canvas heights so the dashboard fits one viewport without
+     scrolling. The chrome above (topbar 52 + tab nav ~30 + tab
+     padding) and below (row-main ~155 + paddings/gaps) eats ~280
+     px on a typical 1080p / 1440p screen. The remainder is split
+     across the three panel canvases (each panel-head ~38, subbar
+     ~40 not on RADAR). Bump --dash-density up (>1) on a tall screen,
+     or down (<1) on a 720p screen, to scale.
+     Override via the body element:  document.body.style.--dash-density = '1.1' */
+  max-height: calc((100vh - var(--dash-chrome-px, 280px)) * var(--dash-density, 1));
 }
 
 .panel {
@@ -312,6 +321,11 @@ body {
 }
 .device-sel:hover { border-color: var(--cyan); color: var(--text); }
 
+/* Panel canvas — keep aspect ratio but never exceed the row's budget.
+   `min-height: 0` lets flex/grid actually shrink the canvas below its
+   intrinsic 4:3 ratio when the row's max-height is binding. Without
+   this, the aspect-ratio rule wins and the row overflows the viewport. */
+.panel { min-height: 0; }
 .panel-canvas {
   position: relative;
   width: 100%;
@@ -344,6 +358,23 @@ body {
 .disconnected-overlay.hidden { display: none; }
 .disc-icon { font-size: 28px; opacity: 0.5; }
 
+/* Amber-tinted variant for the EO software-AE convergence window.
+   Distinct from disconnect: scrim is translucent so the (likely dark)
+   live frame shows through, telegraphing "we're working on it". */
+.disconnected-overlay.initializing {
+  background: rgba(28, 22, 8, 0.55);
+  color: #f5b86b;
+}
+.disconnected-overlay.initializing .disc-icon {
+  opacity: 0.8;
+  /* slow pulse so the user sees the panel is alive */
+  animation: ae-pulse 1.6s ease-in-out infinite;
+}
+@keyframes ae-pulse {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 1.0; }
+}
+
 .panel-overlay-tl {
   position: absolute;
   top: 6px; left: 8px;
@@ -362,10 +393,18 @@ body {
 }
 
 
-/* ─────────── ROW 2: target list + gimbal dpad ─────────── */
+/* ─────────── ROW 2: target list + gimbal sliders ───────────
+   Column ratio rebalanced 2026-04-25: targets card was too wide, its
+   rows wrapped under the lock-state subtitle; gimbal card was too
+   narrow for the new sliders. 2fr targets / 1.4fr gimbal gives the
+   targets enough room for 2-line entries and the gimbal enough
+   horizontal room for the wide PAN/TILT sliders + numeric value
+   readouts on the right side of each row.
+   For other monitors: bump --gimbal-col-fr in the :root vars to
+   widen the gimbal panel further. */
 .row-main {
   display: grid;
-  grid-template-columns: 3fr 1fr;
+  grid-template-columns: 2fr var(--gimbal-col-fr, 1.4fr);
   gap: 10px;
 }
 .gimbal-card { padding: 10px 12px; }
@@ -611,6 +650,78 @@ body {
   gap: 10px;
 }
 
+/* New 2026-04-25 dev-tab layout: a slim globals row above three
+   per-sensor panels. Replaces the old 6-tile flat grid. The globals
+   row gets its own height (~80 px) and the sensor row fills the
+   remainder of the dev tab's no-scroll viewport. */
+.row-ctrl-globals {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.globals-tile { padding: 8px 10px; }
+.globals-tile .ctrl-head { margin-bottom: 6px; }
+
+.row-ctrl-sensors {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-height: 0;             /* allow children to shrink to fit viewport */
+}
+
+/* Per-sensor card: stacks sections vertically, with the live preview
+   pinned at the bottom. min-height:0 + the .sensor-preview canvas
+   sized via aspect-ratio + flex-shrink lets the layout breathe on
+   shorter viewports without overflowing. */
+.sensor-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.sensor-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.sensor-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.section-label {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 1.6px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 3px;
+  margin-bottom: 2px;
+}
+.sensor-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: auto;          /* push preview to bottom of card */
+}
+.sensor-preview canvas {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+  /* Scale the canvas DOWN if the card height isn't enough for the
+     full 4:3 aspect — better than overflowing. */
+  max-height: 40vh;
+  object-fit: contain;
+}
+
 .ctrl-card {
   background: var(--bg-card);
   border: 1px solid var(--border);
@@ -688,29 +799,111 @@ body {
   display: block;
 }
 
-/* Gimbal dpad */
-.dpad {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: repeat(3, 28px);
-  gap: 3px;
-  max-width: 128px;
-  margin: 0 auto;
+/* Main RADAR panel canvas — match the dev-tab mini's solid black so the
+   point cloud reads cleanly. Tight ID selectors to stay out of the way
+   of EO/thermal panel styling. The disconnected scrim's default navy
+   tint mixes with the black canvas to a bluish gradient — override it
+   to a black scrim so the look matches the dev-tab mini exactly. */
+#radar-canvas {
+  background: #000;
 }
-.dpad-btn {
+#radar-disconnected {
+  background: rgba(0, 0, 0, 0.82);
+}
+
+/* Extrinsic calibration card — EO mini preview lives below the slider
+   block (not next to it) so the wide EO image gets full card width
+   and the user can see fused-box slide clearly while dragging biases. */
+.extrinsic-card { min-width: 0; grid-column: span 2; }
+.extrinsic-eo-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+}
+.extrinsic-eo-preview canvas {
+  width: 100%;
+  aspect-ratio: 16 / 9;   /* EO is wide; match its native shape */
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+}
+
+/* Gimbal sliders (replaced the dpad on 2026-04-25).
+   Two horizontal range inputs + numeric readouts + a HOME button.
+   Sliders span the full card width so the user gets maximum
+   resolution per pixel of drag, and the wide track makes it visually
+   easier to land within ±0.5° than the old ±5° step buttons did. */
+.gimbal-sliders {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+}
+.gslider-row {
+  display: grid;
+  grid-template-columns: 36px 1fr 56px;
+  align-items: center;
+  gap: 8px;
+}
+.gslider-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  color: var(--text-2);
+}
+.gslider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  background: var(--bg-card-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+.gslider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  background: var(--cyan, #4fd6ff);
+  border: 1px solid var(--border-2);
+  border-radius: 50%;
+  cursor: grab;
+  transition: transform 0.05s;
+}
+.gslider::-webkit-slider-thumb:active { cursor: grabbing; transform: scale(1.15); }
+.gslider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  background: var(--cyan, #4fd6ff);
+  border: 1px solid var(--border-2);
+  border-radius: 50%;
+  cursor: grab;
+}
+.gslider-val {
+  font-size: 11px;
+  text-align: right;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.gslider-home {
+  align-self: stretch;
   background: var(--bg-card-2);
   border: 1px solid var(--border-2);
   color: var(--text);
-  font-size: 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  padding: 6px 0;
   cursor: pointer;
-  border-radius: 4px;
-  padding: 0;
-  transition: all 0.1s;
+  border-radius: 5px;
+  transition: background 0.1s;
 }
-.dpad-btn:hover:not(:disabled) { background: var(--border-2); }
-.dpad-btn:disabled { opacity: 0.3; cursor: not-allowed; }
-.dpad-btn.home { font-size: 10px; letter-spacing: 0.5px; }
-.dpad-spacer { background: transparent !important; border: none !important; }
+.gslider-home:hover { background: var(--border-2); }
 
 .gimbal-hint {
   font-size: 10px;
@@ -790,7 +983,19 @@ select {
   color: var(--cyan);
   border-bottom-color: var(--cyan);
 }
-.tab-content { display: flex; flex-direction: column; gap: 10px; }
+/* Tab content fills the viewport minus the topbar + tab nav, with
+   no internal scroll. Sub-rows (.row-sensors, .row-main) do their
+   own sizing inside this budget. The padding here matches the
+   topbar's horizontal padding so panels don't kiss the screen edge. */
+.tab-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 16px;
+  /* topbar 52 + tab nav ~40 + (small fudge) */
+  height: calc(100vh - 100px);
+  overflow: hidden;
+}
 .tab-content.hidden { display: none; }
 
 /* DEV banner above the dev controls */
@@ -872,6 +1077,30 @@ select {
 @keyframes rec-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%       { opacity: 0.35; transform: scale(1.25); }
+}
+
+/* REPLAY pill — only visible during replay_server.py playback. Solid
+   red so it's unmistakable that the dashboard is NOT live. The clock
+   inside it is the user's reference timestamp ("at 0:12 the gimbal
+   jumped right") — they can quote it back to the agent without
+   touching any logs. */
+.pill-replay {
+  background: var(--danger);
+  color: white;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  box-shadow: 0 0 0 2px rgba(255,80,80,0.25);
+}
+.pill-replay .dot {
+  background: white;
+  animation: rec-pulse 1.2s infinite;
+}
+#pill-replay-clock {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+  background: rgba(0,0,0,0.25);
+  padding: 1px 6px;
+  border-radius: 6px;
 }
 
 

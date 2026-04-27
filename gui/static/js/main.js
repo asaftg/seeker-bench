@@ -14,14 +14,28 @@ const thermalView = new ThermalView("thermal-canvas", "thermal-disconnected");
 const eoView      = new EOView("eo-canvas", "eo-disconnected");
 const radarView   = new RadarView("radar-canvas");
 
-// Mini preview in the DEVELOPERS tab — shows the live thermal image
-// (no boxes/labels) next to the sensitivity sliders so the user sees
-// blob-bb effects immediately while tuning. Optional; disappears if
-// the DEV canvas isn't in the DOM.
-// Mini preview SHOWS overlays — that's the whole point: let the user
-// watch bounding boxes grow/shrink as they drag the sensitivity sliders.
+// Expose eoView so the DISTANCE ESTIMATE IIFE (and any future ad-hoc
+// devtools) can reach the live view without re-importing the module.
+// We only expose the main panel view, not the mini.
+window.eoView = eoView;
+
+// Mini previews on the DEVELOPERS tab.
+//   * thermalMini — sits inside THERMAL TUNING. Shows live thermal so
+//     user can watch sensitivity slider effects AND flip black-hot vs
+//     white-hot in real time. Inherits invert state from main thermal.
+//   * eoMini      — sits inside EXTRINSIC CALIBRATION (below the
+//     sliders). Shows live EO with fused/projected overlays. Thermal
+//     AZ/EL biases shift the GREEN fused/projected box on the EO
+//     image, so the user watches THIS canvas (not the thermal mini)
+//     while dragging extrinsic sliders.
+//   * radarMini   — sits inside RADAR TUNING. Live radar plot.
+// All three are optional; each falls back to null if its canvas is
+// not in the DOM (e.g. older mockup, future layout swap).
 const thermalMini = document.getElementById("thermal-mini-canvas")
   ? new ThermalView("thermal-mini-canvas", null)
+  : null;
+const eoMini = document.getElementById("eo-mini-canvas")
+  ? new EOView("eo-mini-canvas", null)
   : null;
 const radarMini = document.getElementById("radar-mini-canvas")
   ? new RadarView("radar-mini-canvas")
@@ -35,6 +49,7 @@ const radarMini = document.getElementById("radar-mini-canvas")
   const apply = () => {
     thermalView.setInvert(cb.checked);
     if (thermalMini) thermalMini.setInvert(cb.checked);
+    // eoMini is RGB — black-hot/white-hot doesn't apply.
   };
   cb.addEventListener("change", apply);
   apply();
@@ -89,7 +104,46 @@ let _gimbalTilt       = null;
 let _trackedTargetId  = null;     // null = manual; int = user pressed TRACK
 let _trackedHeatId    = null;     // dev-mode: raw heat-blob tracker ID we asked gimbal to follow
 let _devMode          = false;    // developer overlays: heat-blob tracker debug, etc.
-let _recOn            = false;    // REC pill toggle — stubbed recording (backend logs but writes nothing yet)
+let _recOn            = false;    // REC pill toggle — driven by JSONL recorder lifecycle on the backend
+let _replayActive     = false;    // true when the WS envelope arrives with `replay:true` (replay_server.py)
+
+// Replay-mode UI: pulse a red REPLAY badge in the topbar and show
+// the playback clock so the user has a single visible time reference
+// they can quote to the agent ("at 0:12 the gimbal jumped"). The
+// badge is created lazily on first replay frame so a normal live
+// session has zero DOM cost.
+function _setReplayBadge(on, tSec) {
+  if (on && !_replayActive) {
+    _replayActive = true;
+    let badge = document.getElementById("pill-replay");
+    if (!badge) {
+      const pills = document.querySelector(".topbar .pills");
+      if (pills) {
+        badge = document.createElement("span");
+        badge.id = "pill-replay";
+        badge.className = "pill pill-replay";
+        badge.innerHTML = '<span class="dot"></span>REPLAY <span id="pill-replay-clock" class="mono">0:00.0</span>';
+        pills.appendChild(badge);
+      }
+    }
+    if (badge) badge.style.display = "";
+  }
+  if (!on && _replayActive) {
+    _replayActive = false;
+    const badge = document.getElementById("pill-replay");
+    if (badge) badge.style.display = "none";
+    return;
+  }
+  if (on) {
+    const clock = document.getElementById("pill-replay-clock");
+    if (clock) {
+      const t = Math.max(0, Number(tSec) || 0);
+      const m = Math.floor(t / 60);
+      const s = t - m * 60;
+      clock.textContent = `${m}:${s.toFixed(1).padStart(4, "0")}`;
+    }
+  }
+}
 
 // Cross-sensor overlay gating — source-centric. Each flag controls
 // whether that sensor's tracks project onto the OTHER panels:
@@ -186,6 +240,7 @@ const _overlay = {
         // non-zero rect), second RAF lets layout settle before refit.
         requestAnimationFrame(() => requestAnimationFrame(() => {
           if (thermalMini && typeof thermalMini.refit === "function") thermalMini.refit();
+          if (eoMini      && typeof eoMini.refit      === "function") eoMini.refit();
           if (radarMini   && typeof radarMini.refit   === "function") radarMini.refit();
         }));
       }
@@ -204,17 +259,43 @@ const _overlay = {
   eo?.addEventListener("change",      () => { _overlay.eo      = eo.checked; });
 })();
 
-// REC pill toggle — stubbed until HDF5 recording ships. We mirror state
-// visually so the user sees a red pulse while "recording", and send a
-// WS command so the backend can start logging (even if it writes nothing
-// to disk yet). The status bar reflects state from the WS echo.
+// REC pill toggle — drives the JSONL recorder backend.
+//   Click while OFF → turn recording ON (start a new file).
+//   Click while ON  → prompt for an optional name, turn recording OFF.
+// The name is sent with `command:"record", on:false, rename_to:"<name>"`;
+// backend renames the closed file to recordings/<name>.jsonl. Empty /
+// cancelled prompt = keep the auto timestamp filename.
+// The status bar reflects state from the WS echo (`recording: true/false`).
 (() => {
   const pill = document.getElementById("pill-rec");
   if (!pill) return;
   pill.addEventListener("click", () => {
-    _recOn = !_recOn;
-    pill.classList.toggle("pill-rec-on", _recOn);
-    wsSend({ command: "record", on: _recOn });
+    if (!_recOn) {
+      _recOn = true;
+      pill.classList.toggle("pill-rec-on", true);
+      wsSend({ command: "record", on: true });
+      return;
+    }
+    // Stopping — ask for a friendly name. Sanitize on the wire side
+    // too, but a quick client-side sanity helps the UX.
+    let raw = window.prompt(
+      "Name this recording (optional — blank keeps the timestamp filename):",
+      "");
+    let rename_to = null;
+    if (raw != null) {
+      raw = String(raw).trim();
+      if (raw.length > 0) {
+        // Strip path separators and dangerous chars; keep alnum, dash,
+        // underscore, dot, space. Backend re-validates.
+        const cleaned = raw.replace(/[^A-Za-z0-9 _\-\.]/g, "_").slice(0, 80);
+        if (cleaned.length > 0) rename_to = cleaned;
+      }
+    }
+    _recOn = false;
+    pill.classList.toggle("pill-rec-on", false);
+    const cmd = { command: "record", on: false };
+    if (rename_to) cmd.rename_to = rename_to;
+    wsSend(cmd);
   });
 })();
 
@@ -482,19 +563,37 @@ function _renderHeatRows(msg) {
 // below in the message handler.
 
 // ─────────────────────────────────────────────────────────────────────────
-// Gimbal dpad
+// Gimbal sliders (replaced the dpad on 2026-04-25 for finer control).
+// Sliders are always live — backend releases any active track lock as
+// soon as the user drags. Each slider sends an absolute angle setpoint
+// via gimbal_absolute (NOT delta) so the manager rate-limits the slew
+// instead of the user accumulating clicks.
 // ─────────────────────────────────────────────────────────────────────────
-// Dpad is always live now — backend releases any active track lock
-// as soon as the user nudges manually.
-document.querySelectorAll(".dpad-btn[data-dp]").forEach(btn => {
-  btn.addEventListener("click", () => {
-    const dp = parseFloat(btn.dataset.dp || 0);
-    const dt = parseFloat(btn.dataset.dt || 0);
-    wsSend({ command: "gimbal_manual", delta_pan: dp, delta_tilt: dt });
-  });
-});
+const _panSlider  = $("gimbal-pan-slider");
+const _tiltSlider = $("gimbal-tilt-slider");
+const _panSliderVal  = $("gimbal-pan-slider-val");
+const _tiltSliderVal = $("gimbal-tilt-slider-val");
+// Suppression flag: when the manager publishes its current pose back to
+// us via the WS payload, we update the slider position to reflect it
+// (so HOME / TRACK / re-engage move the handle visually). But that
+// programmatic `slider.value = …` would normally fire `input` and echo
+// the value back — pumping the gimbal. The flag short-circuits that.
+let _suppressSliderEcho = false;
 
-const homeBtn = $("dpad-home");
+function _sendPanTilt() {
+  if (!_panSlider || !_tiltSlider) return;
+  const pan  = parseFloat(_panSlider.value);
+  const tilt = parseFloat(_tiltSlider.value);
+  if (_panSliderVal)  _panSliderVal.textContent  = pan.toFixed(1)  + "°";
+  if (_tiltSliderVal) _tiltSliderVal.textContent = tilt.toFixed(1) + "°";
+  if (_suppressSliderEcho) return;
+  wsSend({ command: "gimbal_absolute", pan_deg: pan, tilt_deg: tilt });
+}
+
+if (_panSlider)  _panSlider.addEventListener("input", _sendPanTilt);
+if (_tiltSlider) _tiltSlider.addEventListener("input", _sendPanTilt);
+
+const homeBtn = $("gimbal-home-btn");
 if (homeBtn) {
   homeBtn.addEventListener("click", () => {
     // Backend knows the configured home pose — don't compute it client-side.
@@ -510,6 +609,21 @@ function updateGimbalUI(gimbal) {
   const tiltEl = $("gimbal-tilt");
   if (panEl)  panEl.textContent  = (_gimbalPan  != null) ? _gimbalPan.toFixed(1)  + "°" : "—";
   if (tiltEl) tiltEl.textContent = (_gimbalTilt != null) ? _gimbalTilt.toFixed(1) + "°" : "—";
+  // Sync slider handles to reported gimbal position so the UI doesn't
+  // get stuck showing the user's last drag while auto-track or HOME
+  // commands move the gimbal elsewhere. Suppress the echo loop.
+  if (_panSlider && _gimbalPan != null) {
+    _suppressSliderEcho = true;
+    _panSlider.value = _gimbalPan;
+    if (_panSliderVal) _panSliderVal.textContent = _gimbalPan.toFixed(1) + "°";
+    _suppressSliderEcho = false;
+  }
+  if (_tiltSlider && _gimbalTilt != null) {
+    _suppressSliderEcho = true;
+    _tiltSlider.value = _gimbalTilt;
+    if (_tiltSliderVal) _tiltSliderVal.textContent = _gimbalTilt.toFixed(1) + "°";
+    _suppressSliderEcho = false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -700,6 +814,44 @@ if (areaSlider) {
     paint();
   }
 
+  // SAVE button — persist current biases to config/calibration.json so
+  // they survive a restart. Backend sources values from live manager
+  // state (not WS payload), so even a slider mid-drag commits cleanly.
+  // Status line clears after 4s so it doesn't dominate the card.
+  const saveBtn = document.getElementById("ext-save");
+  const saveStat = document.getElementById("ext-save-status");
+  if (saveBtn) {
+    let _statTimer = null;
+    function setStatus(text, color) {
+      if (!saveStat) return;
+      saveStat.textContent = text;
+      saveStat.style.color = color || "var(--text-3)";
+      if (_statTimer) clearTimeout(_statTimer);
+      _statTimer = setTimeout(() => {
+        saveStat.textContent = "";
+        saveStat.style.color = "var(--text-3)";
+      }, 4000);
+    }
+    saveBtn.addEventListener("click", () => {
+      // Force-flush any pending slider drag before saving so the file
+      // reflects what the user is looking at.
+      if (_timer != null) { clearTimeout(_timer); flush(); }
+      wsSend({ command: "extrinsic_save" });
+      setStatus("saving…", "var(--text-2)");
+    });
+    // Listen for the backend ack on the same WS the slider commands use.
+    window.__onExtrinsicSaved = (ev) => {
+      if (ev.ok) {
+        const v = ev.values || {};
+        const summary = `radar (${(v.radar_az ?? 0).toFixed(1)}°, ${(v.radar_el ?? 0).toFixed(1)}°) · ` +
+                        `thermal (${(v.thermal_az ?? 0).toFixed(1)}°, ${(v.thermal_el ?? 0).toFixed(1)}°)`;
+        setStatus("saved · " + summary, "var(--fused-green, #58e07b)");
+      } else {
+        setStatus("save failed: " + (ev.error || "unknown"), "var(--warn, #f08a3a)");
+      }
+    };
+  }
+
   let _hydrated = false;
   window.__hydrateExtrinsic = (ext) => {
     if (_hydrated || !ext) return;
@@ -772,6 +924,27 @@ function connect() {
     let msg;
     try { msg = JSON.parse(ev.data); } catch(_) { return; }
 
+    // Replay-mode banner + clock. The replay server stamps `replay:true`
+    // on every envelope plus `replay_t_s` (seconds since session start).
+    // We toggle a red badge in the topbar and render the clock as
+    // mm:ss.s — gives the user a single visible reference they can
+    // point an LLM agent at ("at ~0:12 the gimbal jumped right").
+    if (msg && msg.replay === true) {
+      _setReplayBadge(true, Number(msg.replay_t_s || 0));
+    } else if (_replayActive) {
+      _setReplayBadge(false, 0);
+    }
+
+    // Out-of-band events (not periodic frames). Backend uses {event: "..."}
+    // for these; periodic frames don't carry an `event` key. Handle here
+    // so we can fan them out without polluting the per-frame fast path.
+    if (msg && typeof msg.event === "string") {
+      if (msg.event === "extrinsic_saved" && typeof window.__onExtrinsicSaved === "function") {
+        try { window.__onExtrinsicSaved(msg); } catch(e) { console.warn("__onExtrinsicSaved", e); }
+      }
+      return;
+    }
+
     // Source-centric overlay gating (DEV tab → OVERLAY SCREEN). A
     // fused track appears on panel P iff at least one of its contributing
     // sensors other than P has its overlay toggle on — turning off a
@@ -805,6 +978,12 @@ function connect() {
     // ── EO panel ──
     const eo = msg.eo || {};
     eoView.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
+    // DEV-tab EO mini — same payload, same overlays. This is what the
+    // user watches while tuning the THERMAL AZ/EL extrinsic sliders:
+    // a thermal bias shifts the green fused/projected box on the EO
+    // image, and the mini shows the slide in real time so the user
+    // can lock the box onto the actual target without leaving DEV.
+    if (eoMini) eoMini.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
     const eoHz = $("eo-hz");
     if (eoHz) eoHz.textContent = eo.connected ? (_fps.current + " Hz") : "— Hz";
@@ -830,8 +1009,15 @@ function connect() {
     const radarDisc = $("radar-disconnected");
     if (radarDisc) radarDisc.classList.toggle("hidden", !!radar.connected);
     setPill("pill-radar", radar.connected ? "on" : "off", "RADAR");
-    radarView.update(radar);
-    if (radarMini) radarMini.update(radar);
+    // Pass gimbal pan into radarView so the panel can rotate radar
+    // targets into world frame. Without this, every radar track
+    // appears to swing wildly when the gimbal pans (because radar
+    // local frame rotates with the gimbal). Operator-reported
+    // 2026-04-26 "I can't even understand what's going on".
+    const gimbalPanForRadar = (msg.gimbal && msg.gimbal.pan != null)
+      ? Number(msg.gimbal.pan) : 0;
+    radarView.update(radar, gimbalPanForRadar);
+    if (radarMini) radarMini.update(radar, gimbalPanForRadar);
 
     // Hydrate DEV-tab radar sliders from the server-reported tuning on
     // first tick so they reflect YAML defaults, not HTML-hard-coded ones.
@@ -876,6 +1062,247 @@ function connect() {
     renderTargets(msg);
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// EO EXPOSURE controls (DEV tab)
+//   Auto = bridge AE on (Leopard CameraTool default).
+//   Manual = AE off + lock to ExposureExt int. Switching restarts the
+//   SDK helper subprocess, so we show a brief "applying…" state.
+// ─────────────────────────────────────────────────────────────────────────
+(function eoExposureControls() {
+  const $ = (id) => document.getElementById(id);
+  const auto = $("eo-exp-auto");
+  const manual = $("eo-exp-manual");
+  const valEl = $("eo-exp-value");
+  const apply = $("eo-exp-apply");
+  const status = $("eo-exp-status");
+  if (!apply || !auto || !manual || !valEl || !status) return;
+
+  function setStatus(text, color) {
+    status.textContent = text;
+    status.style.color = color || "var(--text-3)";
+  }
+  function syncManualEnabled() {
+    valEl.disabled = !manual.checked;
+    valEl.style.opacity = manual.checked ? "1" : "0.5";
+  }
+  auto.addEventListener("change", syncManualEnabled);
+  manual.addEventListener("change", syncManualEnabled);
+  syncManualEnabled();
+
+  // Hydrate from server on load so the toggle reflects real state.
+  fetch("/api/config/eo_exposure")
+    .then((r) => r.ok ? r.json() : null)
+    .then((j) => {
+      if (!j) return;
+      if (j.mode === "manual" && j.exposure_ext != null) {
+        manual.checked = true;
+        valEl.value = String(j.exposure_ext);
+      } else {
+        auto.checked = true;
+      }
+      syncManualEnabled();
+      setStatus(
+        j.mode === "manual"
+          ? `Locked at ExposureExt=${j.exposure_ext}.`
+          : "Auto = scene-adaptive (bridge AE on).",
+      );
+    })
+    .catch(() => { /* hydrate is best-effort */ });
+
+  // In-flight guard: rapid clicks while the SDK helper is mid-restart
+  // used to queue concurrent POSTs, which translated to two parallel
+  // helper-stop/start cycles inside EOManager and caused the device to
+  // lock up. Disable the button until the request settles.
+  let inFlight = false;
+  apply.addEventListener("click", async () => {
+    if (inFlight) return;
+    inFlight = true;
+    apply.disabled = true;
+    apply.style.opacity = "0.6";
+    auto.disabled = true;
+    manual.disabled = true;
+    valEl.disabled = true;
+    const body = manual.checked
+      ? { mode: "manual", value: parseInt(valEl.value, 10) || 1264 }
+      : { mode: "auto" };
+    setStatus("applying… (SDK helper restart, ~2 s)", "var(--text-2)");
+    try {
+      const r = await fetch("/api/config/eo_exposure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        setStatus(`apply failed (HTTP ${r.status})`, "var(--warn, #f08a3a)");
+        return;
+      }
+      const j = await r.json();
+      const ok = j.applied !== false;
+      const msg = j.mode === "manual"
+        ? `Locked at ExposureExt=${j.exposure_ext}.`
+        : "Auto = scene-adaptive (bridge AE on).";
+      setStatus(ok ? msg : msg + " (helper not engaged — SDK backend may be off)",
+                ok ? "var(--fused-green, #58e07b)" : "var(--warn, #f08a3a)");
+    } catch (e) {
+      setStatus("apply failed: " + (e?.message || "network error"),
+                "var(--warn, #f08a3a)");
+    } finally {
+      inFlight = false;
+      apply.disabled = false;
+      apply.style.opacity = "1";
+      auto.disabled = false;
+      manual.disabled = false;
+      syncManualEnabled();
+    }
+  });
+})();
+
+// ─────────────────────────────────────────────────────────────────────────
+// EO distance estimate — operator drags a bbox across a target's width,
+// we compute distance from known size + HFOV.
+//
+//   D  =  S · W_img  /  ( p_px · 2 · tan(HFOV/2) )
+//
+// Pure client-side; no server roundtrip. Persists the box as a sticky
+// magenta overlay (with a `≈ XX m` label) until CLEAR. Stand-in for
+// radar range until the radar half of the rig comes online.
+//
+// Single hardcoded assumption: target is ~1.8 m wide (typical car /
+// adult shoulder width). Adjust REAL_WIDTH_M below if you're measuring
+// something else.
+// ─────────────────────────────────────────────────────────────────────────
+(() => {
+  const btn      = document.getElementById("eo-measure-btn");
+  const clearBtn = document.getElementById("eo-measure-clear");
+  const statusEl = document.getElementById("eo-measure-status");
+  if (!btn || !clearBtn) return;
+
+  const REAL_WIDTH_M = 1.8;  // assumed target width; tweak if needed
+
+  const setStatus = (text, color) => {
+    if (!statusEl) return;
+    statusEl.textContent = text || "";
+    statusEl.style.color = color || "var(--text-3)";
+  };
+
+  function fmtMeters(D) {
+    if (!isFinite(D) || D <= 0) return "—";
+    if (D < 100) return D.toFixed(1) + " m";
+    return D.toFixed(0) + " m";
+  }
+
+  function computeDistance(bbox) {
+    const fw = window.eoView ? window.eoView.getFrameWidth()  : 0;
+    const hfovDeg = window.eoView ? window.eoView.getHfovDeg() : 11.05;
+    if (!fw || !hfovDeg || bbox.w < 1) return null;
+    const tanHalf = Math.tan(hfovDeg * Math.PI / 360);  // tan(HFOV/2)
+    return REAL_WIDTH_M * fw / (bbox.w * 2 * tanHalf);
+  }
+
+  const setActive = (on) => {
+    btn.classList.toggle("active", !!on);
+    if (window.eoView) {
+      window.eoView.setMeasureMode(!!on, (bbox) => {
+        const D = computeDistance(bbox);
+        if (D == null) {
+          setStatus("measure failed (no frame intrinsics)", "var(--warn, #f08a3a)");
+        } else {
+          const lbl = `≈ ${fmtMeters(D)}`;
+          window.eoView.setMeasurement({ bbox, label: lbl });
+          setStatus(`${lbl} (assuming ${REAL_WIDTH_M} m wide)`,
+                    "var(--fused-green, #58e07b)");
+        }
+        btn.classList.remove("active");
+        window.eoView.setMeasureMode(false);
+      });
+    }
+  };
+
+  btn.addEventListener("click", () => {
+    if (!window.eoView) return;
+    setActive(!window.eoView.isMeasureMode());
+    if (window.eoView.isMeasureMode()) {
+      setStatus("drag a bbox across the target's WIDTH — ESC to cancel",
+                "var(--text-2)");
+    }
+  });
+
+  clearBtn.addEventListener("click", () => {
+    if (!window.eoView) return;
+    window.eoView.clearMeasurement();
+    setStatus("");
+  });
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && window.eoView && window.eoView.isMeasureMode()) {
+      window.eoView.cancelDrag();
+      setActive(false);
+      setStatus("");
+    }
+  });
+})();
+
+// ─────────────────────────────────────────────────────────────────────────
+// EO low-light boost toggle (AGC stretch + gamma midtone lift). Live
+// switch — no SDK helper restart. POSTs to /api/config/eo_lowlight, the
+// EOManager flips the display chain on the next published frame.
+// ─────────────────────────────────────────────────────────────────────────
+(function eoLowLightControls() {
+  const cb = document.getElementById("eo-lowlight-enable");
+  const status = document.getElementById("eo-lowlight-status");
+  if (!cb || !status) return;
+  function setStatus(text, color) {
+    status.textContent = text;
+    status.style.color = color || "var(--text-3)";
+  }
+  fetch("/api/config/eo_lowlight")
+    .then((r) => r.ok ? r.json() : null)
+    .then((j) => {
+      if (!j) return;
+      cb.checked = !!j.enabled;
+      setStatus(
+        j.enabled
+          ? "ON · AGC stretch + gamma " + (j.gamma || 1.6).toFixed(1) + "."
+          : "OFF · passthrough (best for daytime).",
+      );
+    })
+    .catch(() => {});
+  let inFlight = false;
+  cb.addEventListener("change", async () => {
+    if (inFlight) return;
+    inFlight = true;
+    cb.disabled = true;
+    const want = cb.checked;
+    setStatus(want ? "enabling boost…" : "disabling boost…", "var(--text-2)");
+    try {
+      const r = await fetch("/api/config/eo_lowlight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: want }),
+      });
+      if (!r.ok) {
+        setStatus("toggle failed (HTTP " + r.status + ")", "var(--warn, #f08a3a)");
+        cb.checked = !want;
+        return;
+      }
+      const j = await r.json();
+      setStatus(
+        j.enabled
+          ? "ON · AGC stretch + gamma " + (j.gamma || 1.6).toFixed(1) + "."
+          : "OFF · passthrough.",
+        "var(--fused-green, #58e07b)",
+      );
+    } catch (e) {
+      setStatus("toggle failed: " + (e?.message || "network error"),
+                "var(--warn, #f08a3a)");
+      cb.checked = !want;
+    } finally {
+      inFlight = false;
+      cb.disabled = false;
+    }
+  });
+})();
 
 // ─────────────────────────────────────────────────────────────────────────
 // Boot

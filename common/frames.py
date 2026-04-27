@@ -157,6 +157,14 @@ class EOFrame:
     bgr: Optional[np.ndarray] = None   # uint8, shape (H, W, 3)
     detections: List[EODetection] = field(default_factory=list)
 
+    # Software-AE / source-restart sentinel. Distinct from `connected`:
+    # connected=False means "camera unplugged or hard failure"; while
+    # initializing=True means "camera is fine, AE is bracketing toward a
+    # usable exposure or the source is being restarted to commit a new
+    # ExposureExt." The GUI shows a friendly "EO INITIALIZING…" badge
+    # for this state instead of the alarming red DISCONNECTED pill.
+    initializing: bool = False
+
     # IMX568 (2472x2064 @ 2.74um -> 6.77x5.65mm active) + Commonlands
     # CIL350 (35mm EFL) — narrow telephoto.
     # HFOV = 2*atan(6.77/2/35) ≈ 11.05°
@@ -305,6 +313,11 @@ class Topic:
     RADAR   = "radar"
     FUSED   = "fused"
     GIMBAL  = "gimbal"
+    # Discrete event stream — user actions, system transitions, algo
+    # diagnostics. Each publish is a free-form dict
+    # {"type": str, "payload": {...}}; the recorder writes it to JSONL
+    # and never inspects the payload. Don't bake schema into this topic.
+    EVENTS  = "events"
 
 
 # ───────────────────────────────────────────────────────────────

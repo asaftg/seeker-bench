@@ -200,6 +200,19 @@ class FusionManager:
         tf: Optional[ThermalFrame] = BUS.get_latest(Topic.THERMAL)
         ef: Optional[EOFrame] = BUS.get_latest(Topic.EO)
         rf: Optional[RadarFrame] = BUS.get_latest(Topic.RADAR)
+        # Snapshot the current gimbal pose so we can compensate
+        # tracker-track az/el during matching. Without this, fusion
+        # matches new observations to existing tracks in CAMERA frame
+        # — and a fast gimbal slew between observations shifts the
+        # same world target's camera-az enough to miss the IoU gate
+        # → new track id every time YOLO+ByteTrack briefly drops the
+        # target, which is what killed every TRACK lock in the
+        # 2026-04-27 Human_and_vehicle_mistrack recording.
+        from common.frames import GimbalState as _GS
+        gs = BUS.get_latest(Topic.GIMBAL)
+        cur_pan = float(gs.pan_deg) if isinstance(gs, _GS) else 0.0
+        cur_tilt = float(gs.tilt_deg) if isinstance(gs, _GS) else 0.0
+        self._cur_gimbal_pose = (cur_pan, cur_tilt)
 
         thermal_obs = self._observations_from_thermal(tf)
         eo_obs = self._observations_from_eo(ef)
@@ -447,6 +460,17 @@ class FusionManager:
         # the track still matches, so we don't spawn a duplicate ID.
         TRACK_IOU = 0.15
         rt = TargetClass.RADAR_TARGET.value
+        # 2026-04-27 morning fix added (a) a gimbal-pose-compensated
+        # track-az shift `trk_az_now = trk["az"] - (cur_pan - last_pan)`
+        # before IoU and (b) a 3° centroid-distance fallback gate.
+        # Both REVERTED the same afternoon: `gimbal_not_tracking_static.jsonl`
+        # showed fused track #20 merging two distinct nearby vehicles
+        # — bbox angular size bouncing between (3.27, 1.76) and
+        # (5.05, 4.34) as the IoU "match" alternated between them.
+        # The original IoU-only matcher with no gimbal compensation
+        # is correct for this scene density (multiple vehicles within
+        # one bbox-width). Re-introducing either fix needs a multi-
+        # vehicle-scene replay test, not just a YOLO-id-swap one.
         for c in candidates:
             best_i, best_iou = -1, 0.0
             for i in range(n_existing):
@@ -466,6 +490,11 @@ class FusionManager:
                 trk["el"]    = a * trk["el"]    + (1 - a) * c["el"]
                 trk["ang_w"] = a * trk["ang_w"] + (1 - a) * c["ang_w"]
                 trk["ang_h"] = a * trk["ang_h"] + (1 - a) * c["ang_h"]
+                # Stamp the gimbal pose at this update so the next
+                # tick's matcher can compensate the track's camera-az
+                # for any gimbal motion that happens before the next
+                # observation arrives.
+                trk["pose_at_update"] = (cur_pan, cur_tilt)
                 # Class promotion: a radar-born track stays RADAR_TARGET
                 # until an EO/thermal observation joins, at which point
                 # we lock in the real class. Once locked, never overwrite
@@ -506,7 +535,23 @@ class FusionManager:
                     "primary": c["primary"],
                     "conf": c["conf"],
                     "hits": 1, "misses": 0,
+                    # Pose at birth — used by next tick's matcher to
+                    # gimbal-compensate the track's camera-az.
+                    "pose_at_update": (cur_pan, cur_tilt),
                 })
+                try:
+                    from common.events import emit as _emit
+                    _emit("fused_track_born", {
+                        "id": int(self._next_id),
+                        "class": c["class"],
+                        "primary": c["primary"],
+                        "az": float(c["az"]),
+                        "el": float(c["el"]),
+                        "sensors": list(c["sensors"]),
+                        "conf": float(c["conf"]),
+                    })
+                except Exception:
+                    pass
                 self._next_id += 1
 
         kept = []
@@ -528,6 +573,17 @@ class FusionManager:
                 }
                 if trk["misses"] <= self.max_misses:
                     kept.append(trk)
+                else:
+                    try:
+                        from common.events import emit as _emit
+                        _emit("fused_track_dropped", {
+                            "id": int(trk["id"]),
+                            "hits": int(trk["hits"]),
+                            "misses": int(trk["misses"]),
+                            "reason": "max_misses",
+                        })
+                    except Exception:
+                        pass
         self._tracks = kept
 
     # ───────────────────────── dedup helpers ─────────────────────

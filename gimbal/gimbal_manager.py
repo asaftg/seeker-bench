@@ -22,7 +22,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from algorithms import track_predictor
 from common.config import load_config
+from common.events import emit as emit_event
 from common.frame_bus import BUS
 from common.frames import GimbalState, ThermalFrame, Topic
 from common.logging_setup import get_logger
@@ -42,6 +44,13 @@ class _HeatObs:
     az_deg: float
     el_deg: float
     synthetic: bool = False  # True if the source is a user-drawn target
+    # Raw thermal-pixel centre of the bbox this obs was computed from.
+    # The heat-track control loop gates its setpoint update on whether
+    # this centre actually moved between ticks — without that gate, a
+    # stale (constant) cx/cy lets the manager apply kp*az multiple
+    # times per OF update and the gimbal hunts.
+    cx_px: Optional[float] = None
+    cy_px: Optional[float] = None
 
 
 def _clip(v: float, lim: float) -> float:
@@ -80,6 +89,12 @@ def _hyst_deadband(az: float,
     This is what finally makes a backlashed hobby servo settle: once
     close, we commit to "close enough" and stop chasing the last
     fraction of a degree of noise.
+
+    NOTE 2026-04-25: superseded by ``_smooth_proportional`` for the
+    track path. Hyst-deadband is binary (full kp outside, zero inside)
+    which causes hunting at the boundary on close, slow-drift targets.
+    Kept here in case future code wants a hard-cutoff settle behaviour
+    (it's also still wired to the dev-mode heat-track fallback).
     """
     if enter_band <= 0.0:
         return az, el, False
@@ -94,6 +109,60 @@ def _hyst_deadband(az: float,
         if mag < enter_band:
             return 0.0, 0.0, True
         return az, el, False
+
+
+def _smooth_proportional(err: float,
+                         kp: float,
+                         zero_band_deg: float,
+                         full_band_deg: float) -> float:
+    """Soft-deadband proportional gain — smooth replacement for the
+    binary hysteretic deadband used by earlier track loops.
+
+    Three regimes, all on a single P-controller (no integrator, no
+    derivative, no PID juggle):
+
+      |err| <= zero_band_deg          → output 0 (truly stationary
+                                        when at target)
+      zero_band_deg < |err| < full_band_deg
+                                      → output ramps linearly from
+                                        0 to kp*err (gentle approach
+                                        when close)
+      |err| >= full_band_deg          → output = kp * err (full
+                                        proportional gain when far)
+
+    Why this beats hyst_deadband for tracking close foreground
+    targets: the binary deadband had a cliff at the boundary —
+    when the target's centroid jitters across the threshold, the
+    output snaps between 0 and full kp*err, which the operator sees
+    as "twitchy hunting around the centre". The linear ramp turns
+    that cliff into a smooth gradient: tiny excursions across
+    the inner band produce tiny commands (which then clip via
+    max_step_deg or simply get absorbed by servo resolution),
+    while real off-center errors still drive full-speed correction.
+
+    Tunables (config: gimbal.track_zero_band_deg / track_full_band_deg):
+      * zero_band_deg ≈ servo angular resolution + sensor jitter floor
+        (~0.2° on this rig — below this, commanding motion just
+        wastes effort).
+      * full_band_deg ≈ "this much error means we should respond
+        urgently" (~1.0° matches a small target visibly off-centre
+        on the EO panel).
+
+    No state across calls — pure function. The lp_filter upstream
+    handles temporal smoothing; this handles spatial gain shaping.
+    """
+    if full_band_deg <= zero_band_deg:
+        # Misconfigured — collapse to hard deadband.
+        return 0.0 if abs(err) <= zero_band_deg else kp * err
+    a = abs(err)
+    if a <= zero_band_deg:
+        return 0.0
+    if a >= full_band_deg:
+        return kp * err
+    # Linear ramp: scale grows from 0 (at zero_band) to 1 (at full_band).
+    span = full_band_deg - zero_band_deg
+    scale = (a - zero_band_deg) / span
+    return kp * err * scale
 
 
 def _pan_only_if_tilt_saturated(cur_tilt: float,
@@ -174,6 +243,14 @@ class GimbalManager:
             home_pan_deg=home_pan,
             home_tilt_deg=home_tilt,
         )
+
+        # Stash pan limits for the pan_saturated event detection later.
+        # Tilt floor/ceil already live on self in the existing tilt-sat
+        # path; pan was previously silent — adding for symmetry so the
+        # JSONL stream documents both axes.
+        self._pan_floor = float(limits.pan_min_deg)
+        self._pan_ceil  = float(limits.pan_max_deg)
+        self._pan_saturated_logged = False
 
         self._home_pan  = home_pan
         self._home_tilt = home_tilt
@@ -265,6 +342,25 @@ class GimbalManager:
         self._deadband_exit_ratio = float(gcfg.get("deadband_exit_ratio", 1.5))
         self._in_deadband = False  # track hysteresis state across ticks
 
+        # Smooth-proportional band parameters. Replace the binary
+        # deadband on the fused-track path: tiny stationary error
+        # → no output; small error → ramped output; large error →
+        # full kp gain. See _smooth_proportional() docstring for the
+        # full rationale and shape. Set track_zero_band_deg ==
+        # track_full_band_deg to collapse back to a hard deadband.
+        self._track_zero_band_deg = float(
+            gcfg.get("track_zero_band_deg", 0.20))
+        self._track_full_band_deg = float(
+            gcfg.get("track_full_band_deg", 1.00))
+        # Output minimum threshold: if the proposed delta after the
+        # smooth-proportional law is smaller than this, treat it as 0.
+        # ~0.05° matches the servo's effective angular resolution
+        # under this calibration; commanding finer-than-that just
+        # wastes a USB write and risks the motor's PWM dither
+        # turning into audible buzz on a static target.
+        self._track_min_step_deg = float(
+            gcfg.get("track_min_step_deg", 0.05))
+
         # Visual-servo gating: the control loop runs at 60 Hz but the
         # camera only feeds ~30 Hz. If we re-command every tick we end
         # up firing corrections twice per feedback sample → guaranteed
@@ -275,6 +371,195 @@ class GimbalManager:
         self._last_track_ts: Optional[float] = None
         self._last_sp_pan:   Optional[float] = None
         self._last_sp_tilt:  Optional[float] = None
+        # Fused-track feedback freshness counter. Distinct from
+        # _last_track_ts (which is keyed on the THERMAL frame at ~60 Hz).
+        # FusionManager publishes at ~15 Hz, so 3-4 thermal ticks pass
+        # between fused-track updates. If we re-applied kp*az on every
+        # thermal tick we'd over-correct 3-4x per fusion cycle and the
+        # gimbal would walk 20-40° past the target before the feedback
+        # caught up (operator-reported 2026-04-25 "+30° overshoot").
+        # Now we recompute the fused-track setpoint only when the fused
+        # track's `hits` counter advances, i.e. when a sensor actually
+        # contributed a new observation. Between updates we hold the
+        # last setpoint and let the controller's slew limit finish the
+        # in-flight motion. Tracks the (id, hits) tuple so a re-born
+        # track with the same id and lower hits also counts as fresh.
+        self._last_fused_track_hits: Optional[tuple[int, int]] = None
+
+        # ── Track velocity / dead-reckoning state ──
+        # Operator-reported (2026-04-26): "for a moving vehicle, the
+        # moment I move the gimbal, the radar stops picking the target
+        # because it's on the gimbal." Same applies to EO/thermal at
+        # narrow zoom: the moment the camera slews aggressively, the
+        # YOLO/heat detection breaks lock for a few hundred ms while
+        # the new field of view stabilises. With pure proportional
+        # control (sp = cur + kp*az) the gimbal stops at the last
+        # observed position while the real target keeps moving --
+        # by the time detection comes back the target is gone.
+        #
+        # Fix is a constant-velocity predictor (alpha-beta tracker):
+        # we maintain the target's WORLD-frame position + velocity in
+        # az/el space, updating both on every fresh fused track
+        # observation. Between observations the predictor extrapolates
+        # at the last-known velocity, and the setpoint always points a
+        # `lead_time` seconds ahead of the predicted current position.
+        # This is a state estimator, NOT a PID controller -- there is
+        # no integral and no error-derivative term, so it doesn't
+        # have the windup / noise-amplification issues operator
+        # explicitly wanted to avoid.
+        self._track_world_az: Optional[float] = None
+        self._track_world_el: Optional[float] = None
+        self._track_world_az_dot: float = 0.0
+        self._track_world_el_dot: float = 0.0
+        self._track_world_last_t: Optional[float] = None
+        # Number of fresh observations seen since track engagement.
+        # The predictor's effective lead time is scaled by this so
+        # the first noisy velocity sample (heavily contaminated by
+        # gimbal motion + sensor lag during the first slew) never
+        # gets multiplied by the full lead. 0 -> no prediction;
+        # ramps to 1.0 over `_track_predict_warmup_n` observations.
+        self._track_obs_count: int = 0
+        self._track_predict_warmup_n: int = int(
+            gcfg.get("track_predict_warmup_n", 5))
+        # Lookahead horizon: gimbal aims `lead_time` seconds ahead of
+        # the current predicted target position. 0.3 s matches the
+        # physical slew time for typical 5-15 deg corrections at our
+        # ~120 deg/s pan slew rate, so the gimbal arrives roughly when
+        # the target is there.
+        self._track_lead_time_s: float = float(
+            gcfg.get("track_lead_time_s", 0.30))
+        # Velocity smoothing alpha (alpha-beta tracker beta term).
+        # Lower = smoother (lags fast accelerations), higher = noisier
+        # but more responsive. 0.3 = strong smoothing, picked because
+        # the first 1-2 observations are heavily corrupted by gimbal
+        # motion and radar lag; we'd rather trust accumulated history
+        # than a fresh measurement. Bump to 0.5 for snappier response
+        # on truly fast-accelerating targets if needed.
+        self._track_vel_alpha: float = float(
+            gcfg.get("track_vel_alpha", 0.3))
+        # Hard cap on the predictive setpoint shift per axis (deg).
+        # Even with full lead time and a high velocity estimate, we
+        # never push the setpoint more than this far ahead of the
+        # observed target position. Prevents runaway when a phantom
+        # velocity slips past the smoothing.
+        self._track_predict_cap_deg: float = float(
+            gcfg.get("track_predict_cap_deg", 5.0))
+
+        # Gimbal-velocity gate. The world-frame position estimate
+        # `world_az = cur_pan + obs_az` is only correct when cur_pan
+        # and obs_az are sampled at the same instant. In reality
+        # `obs_az` is measured by the sensor at time t_sensor and
+        # arrives at the manager at time t_now, with ~100-300 ms of
+        # processing+fusion latency in between. During that gap the
+        # gimbal has moved by `gimbal_velocity × latency`. At 60 deg/s
+        # slew and 200 ms latency, that's 12 deg of error PER
+        # observation, which feeds straight into the velocity
+        # differentiator and produces a phantom 60 deg/s "target
+        # velocity" that didn't exist. The hard cap and warmup ramp
+        # only mitigate -- they don't break the positive-feedback
+        # loop because the phantom velocity is SUSTAINED during the
+        # slew (8+ cycles at the cap = 40 deg of drift, matches the
+        # operator-reported runaway 2026-04-26).
+        # Gate: only update the velocity estimate (and only apply
+        # lead-time extrapolation) when the gimbal is approximately
+        # stationary. Position update still runs freely (bounded
+        # error during slew, converges as gimbal arrives). 15 deg/s
+        # threshold is chosen so normal small tracking corrections
+        # (typically 1-5 deg/s) still register as "settled" while
+        # genuine slews (60-120 deg/s) freeze the predictor.
+        self._track_gimbal_settled_dps: float = float(
+            gcfg.get("track_gimbal_settled_dps", 15.0))
+        # Previous gimbal pose snapshot, used to estimate the
+        # gimbal's own angular velocity each tick.
+        self._cur_pan_prev: Optional[float] = None
+        self._cur_tilt_prev: Optional[float] = None
+        self._cur_pose_prev_t: Optional[float] = None
+        # How long to keep extrapolating after observations stop.
+        # Beyond this we accept the lock is dead and hold position.
+        # 2.0 s is enough for the gimbal to slew through ~240 deg of
+        # accumulated motion (well past the mechanical envelope) and
+        # for the radar/EO/thermal to re-acquire a new track id, but
+        # short enough that we don't drift forever.
+        self._track_extrap_horizon_s: float = float(
+            gcfg.get("track_extrap_horizon_s", 2.0))
+        # Velocity sanity clip (deg/sec). Targets faster than this in
+        # angular space are likely a fusion ID swap (jumped from one
+        # vehicle to another) -- don't propagate that velocity.
+        self._track_vel_clip_dps: float = float(
+            gcfg.get("track_vel_clip_dps", 30.0))
+        # Velocity decay half-life for the no-fresh-obs case. Default
+        # 0.2 s makes the cached predictor velocity fade fast once
+        # observations stop, preventing the runaway-by-stale-spike
+        # pattern observed 2026-04-26 on the radar+EO freak-out.
+        self._track_vel_decay_halflife_s: float = float(
+            gcfg.get("track_vel_decay_halflife_s", 0.20))
+        # Hard-zero the predictor lead past this age-since-fresh-obs.
+        # Replay (2026-04-27) showed decay alone leaves visible
+        # hunting (~3° amplitude shrinking over 1+ s); zeroing lead
+        # at 0.3 s collapses the hunt to ~0° immediately while still
+        # giving the predictor 0.3 s of lead-aided convergence on a
+        # genuinely fresh track.
+        self._track_no_obs_lead_zero_after_s: float = float(
+            gcfg.get("track_no_obs_lead_zero_after_s", 0.30))
+
+        # Pure-function predictor (algorithms.track_predictor) — both
+        # the live tick AND scripts/replay_algo.py call into this one
+        # implementation. The state object is owned by this manager;
+        # the parameter snapshot is rebuilt every tick so a YAML reload
+        # propagates without a restart.
+        self._predictor_state = track_predictor.PredictorState()
+        self._last_settled_state: Optional[bool] = None
+
+        # World-frame angle a synthetic-target lock has committed to.
+        # The synthetic_target / draw-target loop is fundamentally a
+        # ONE-SHOT system: the user clicked on something, we compute
+        # where in world space that something is (cur_pan + az at lock
+        # time), and slew the gimbal to that absolute angle. The OF
+        # tracker that's supposed to keep the bbox following the target
+        # as the camera moves is unreliable in practice (lag, drift),
+        # so we don't trust subsequent az readings to refine the
+        # estimate — they'd just send the gimbal hunting. World-frame
+        # az/el is cached here on the FIRST fresh observation and
+        # never updated afterwards (the user can re-draw the target
+        # for a new lock). Set to None when no synthetic lock is
+        # active. Verified 2026-04-25 — replaces an iterative
+        # closed-loop that produced unbounded oscillation when OF
+        # lagged.
+        self._synth_world_az_deg: Optional[float] = None
+        self._synth_world_el_deg: Optional[float] = None
+        # Wall-clock at which the synthetic-track auto-lock was
+        # committed. Used to dampen the gimbal slew during the first
+        # ~0.6 s post-draw so OF features have time to track without
+        # the per-frame scene motion exceeding LK's tracking limit.
+        # Without this, the bbox visibly drifts off the user's chosen
+        # target during the initial slew (verified offline 2026-04-27
+        # via NCC=−0.087 between draw-time and post-slew bbox content
+        # in scripts/replay_of.py against the tree recording).
+        self._synth_lock_t: Optional[float] = None
+        self._synth_slew_window_s: float = float(
+            gcfg.get("synth_slew_window_s", 0.6))
+        self._synth_slew_dps: float = float(
+            gcfg.get("synth_slew_dps", 25.0))
+
+        # Heat-track (synthetic_target / draw-target) freshness signal.
+        # Same shape of bug as fused tracks had, different cause:
+        # the OF tracker that propagates a synthetic bbox is much
+        # slower than the gimbal can slew, so cx/cy in the thermal
+        # frame stays nearly constant for a few thermal ticks while
+        # the gimbal rotates 5-10°. Manager runs at 60 Hz, applies
+        # kp*az every tick using the SAME stale (cx, cy) — gimbal
+        # walks far past the target before OF catches up, then
+        # swings back. Operator reported "PID circles the target"
+        # 2026-04-25.
+        # Cache the last-seen bbox center in raw thermal pixels and
+        # only recompute the heat-track setpoint when the centre
+        # has moved by >= track_min_bbox_move_px since the last
+        # update. Sub-pixel jitter is also gated. Default 2 px is
+        # well above OF noise but small enough that real OF motion
+        # registers within one update.
+        self._last_heat_bbox_center: Optional[tuple[float, float]] = None
+        self._track_min_bbox_move_px = float(
+            gcfg.get("track_min_bbox_move_px", 2.0))
 
         # Pan-only saturation log throttle — we emit one INFO when we
         # enter saturation and another when we exit, but nothing in
@@ -496,7 +781,111 @@ class GimbalManager:
         if tracked_heat_id is not None and tracked_id is None:
             if heat_obs is not None:
                 cur_pan, cur_tilt = self._controller.current
-                if fresh_frame or self._last_sp_pan is None:
+                # Centroid-move gate. The OF tracker that propagates
+                # synthetic targets advances cx/cy only every few
+                # thermal frames. If we recompute the setpoint on
+                # every fresh thermal tick, we apply kp*az 3-5 times
+                # using the SAME stale (cx, cy) -- gimbal walks past
+                # the target before OF catches up, then swings back
+                # = "gimbal circles the target" pattern (operator-
+                # reported 2026-04-25). Only update setpoint when the
+                # bbox centre has actually moved by >= the configured
+                # min pixels. Sub-pixel jitter is also gated.
+                cur_center: Optional[tuple[float, float]] = None
+                if heat_obs.cx_px is not None and heat_obs.cy_px is not None:
+                    cur_center = (float(heat_obs.cx_px), float(heat_obs.cy_px))
+                if cur_center is None:
+                    centroid_moved = True       # no info -> default fresh
+                elif self._last_heat_bbox_center is None:
+                    centroid_moved = True       # first observation
+                else:
+                    dx = cur_center[0] - self._last_heat_bbox_center[0]
+                    dy = cur_center[1] - self._last_heat_bbox_center[1]
+                    centroid_moved = (dx*dx + dy*dy
+                                      >= self._track_min_bbox_move_px ** 2)
+                fresh_heat = (centroid_moved and fresh_frame) \
+                             or self._last_sp_pan is None
+                if heat_obs.synthetic and self._cameras_on_gimbal:
+                    # ── SYNTHETIC TARGET PATH (ONE-SHOT) ──
+                    # Lock world-frame target angle on first observation
+                    # and slew there. Don't trust subsequent OF updates
+                    # to refine — they oscillate when OF lags.
+                    if self._synth_world_az_deg is None:
+                        # First observation: capture world-frame angle.
+                        # World az = current gimbal pan + observed
+                        # camera-frame az. Same for el.
+                        self._synth_world_az_deg = (
+                            float(cur_pan) + float(heat_obs.az_deg))
+                        self._synth_world_el_deg = (
+                            float(cur_tilt) + float(heat_obs.el_deg))
+                        self._synth_lock_t = time.time()
+                        log.info("Synthetic lock: world target "
+                                 "az=%.2f el=%.2f (cur=%.1f,%.1f + obs=%.1f,%.1f)"
+                                 " slew-dampened for %.1fs at %.0f dps",
+                                 self._synth_world_az_deg,
+                                 self._synth_world_el_deg,
+                                 cur_pan, cur_tilt,
+                                 heat_obs.az_deg, heat_obs.el_deg,
+                                 self._synth_slew_window_s,
+                                 self._synth_slew_dps)
+                    target_sp_pan  = self._synth_world_az_deg
+                    target_sp_tilt = self._synth_world_el_deg
+                    # Slew dampening window. During the first
+                    # _synth_slew_window_s after lock commit, cap the
+                    # per-tick setpoint advance so per-frame scene
+                    # motion stays within the LK tracking limit. Once
+                    # the window expires, normal slew rate (from the
+                    # GimbalController) applies.
+                    if (self._synth_lock_t is not None
+                            and (time.time() - self._synth_lock_t)
+                                < self._synth_slew_window_s):
+                        # Per-tick step cap = dps × tick period.
+                        max_step_deg = (self._synth_slew_dps
+                                        / max(1e-3, self._rate_hz))
+                        d_pan  = target_sp_pan  - cur_pan
+                        d_tilt = target_sp_tilt - cur_tilt
+                        if abs(d_pan)  > max_step_deg:
+                            d_pan  = max_step_deg if d_pan  > 0 else -max_step_deg
+                        if abs(d_tilt) > max_step_deg:
+                            d_tilt = max_step_deg if d_tilt > 0 else -max_step_deg
+                        sp_pan  = cur_pan  + d_pan
+                        sp_tilt = cur_tilt + d_tilt
+                    else:
+                        sp_pan  = target_sp_pan
+                        sp_tilt = target_sp_tilt
+                    # Saturation log line uses the live error.
+                    el_err = self._synth_world_el_deg - cur_tilt
+                    _, tilt_sat = _pan_only_if_tilt_saturated(
+                        cur_tilt, el_err,
+                        self._tilt_floor, self._tilt_ceil,
+                        self._tilt_sat_eps_deg)
+                    if tilt_sat and not self._tilt_saturated_logged:
+                        log.info("Tilt saturated at mechanical stop "
+                                 "(cur=%.1f, el_err=%.2f) — pan-only",
+                                 cur_tilt, el_err)
+                        try:
+                            emit_event("tilt_saturated_enter",
+                                       {"cur_tilt": float(cur_tilt),
+                                        "el_err": float(el_err)})
+                        except Exception:
+                            pass
+                        self._tilt_saturated_logged = True
+                    elif not tilt_sat:
+                        if self._tilt_saturated_logged:
+                            try:
+                                emit_event("tilt_saturated_exit", {})
+                            except Exception:
+                                pass
+                        self._tilt_saturated_logged = False
+                    self._last_track_ts = tf_ts
+                    self._last_heat_bbox_center = (
+                        (float(heat_obs.cx_px), float(heat_obs.cy_px))
+                        if heat_obs.cx_px is not None else None
+                    )
+                    self._last_sp_pan   = sp_pan
+                    self._last_sp_tilt  = sp_tilt
+                elif fresh_heat:
+                    # ── REAL HEAT-BLOB PATH (CLOSED-LOOP) ──
                     if self._cameras_on_gimbal:
                         # First-order low-pass on the raw error before
                         # deadband + gain. Smooths centroid jitter on
@@ -504,27 +893,25 @@ class GimbalManager:
                         # adding meaningful lag for real motion.
                         az_in, el_in = self._lp_filter_error(
                             float(heat_obs.az_deg), float(heat_obs.el_deg))
-                        # Synthetic targets have extra loop delay: OF
-                        # needs (prev, curr) + Kalman smoothing adds its
-                        # own dynamics. Using the same kp/deadband as a
-                        # direct heat-blob centroid pumps the servo. Soft
-                        # gains here trade settling precision for
-                        # stability — acceptable because a user-drawn
-                        # box doesn't need pixel-perfect centering.
-                        if heat_obs.synthetic:
-                            kp_eff  = self._kp_track * 0.6
-                            band    = self._deadband_deg * 1.6
-                            step_eff= self._max_step_deg * 0.6
-                        else:
-                            kp_eff  = self._kp_track
-                            band    = self._deadband_deg
-                            step_eff= self._max_step_deg
-                        az, el, self._in_deadband = _hyst_deadband(
-                            az_in, el_in,
-                            band, self._deadband_exit_ratio,
-                            self._in_deadband)
-                        d_pan  = _clip(kp_eff * az, step_eff)
-                        d_tilt = _clip(kp_eff * el, step_eff)
+                        # Real heat blob — re-detection-based tracker,
+                        # centroid genuinely updates as the camera
+                        # moves, so closed-loop smooth-proportional gain
+                        # converges naturally.
+                        kp_eff = self._kp_track
+                        d_pan  = _smooth_proportional(
+                            az_in, kp_eff,
+                            self._track_zero_band_deg,
+                            self._track_full_band_deg)
+                        d_tilt = _smooth_proportional(
+                            el_in, kp_eff,
+                            self._track_zero_band_deg,
+                            self._track_full_band_deg)
+                        if abs(d_pan)  < self._track_min_step_deg: d_pan  = 0.0
+                        if abs(d_tilt) < self._track_min_step_deg: d_tilt = 0.0
+                        d_pan  = _clip(d_pan,  self._max_step_deg)
+                        d_tilt = _clip(d_tilt, self._max_step_deg)
+                        # `el` here is just for the saturation log.
+                        el = el_in
                         d_tilt, tilt_sat = _pan_only_if_tilt_saturated(
                             cur_tilt, d_tilt,
                             self._tilt_floor, self._tilt_ceil,
@@ -533,8 +920,19 @@ class GimbalManager:
                             log.info("Tilt saturated at mechanical stop "
                                      "(cur=%.1f, el_err=%.2f) — pan-only",
                                      cur_tilt, el)
+                            try:
+                                emit_event("tilt_saturated_enter",
+                                           {"cur_tilt": float(cur_tilt),
+                                            "el_err": float(el)})
+                            except Exception:
+                                pass
                             self._tilt_saturated_logged = True
                         elif not tilt_sat:
+                            if self._tilt_saturated_logged:
+                                try:
+                                    emit_event("tilt_saturated_exit", {})
+                                except Exception:
+                                    pass
                             self._tilt_saturated_logged = False
                         sp_pan  = cur_pan  + d_pan
                         sp_tilt = cur_tilt + d_tilt
@@ -542,10 +940,13 @@ class GimbalManager:
                         sp_pan  = self._home_pan  + float(heat_obs.az_deg)
                         sp_tilt = self._home_tilt + float(heat_obs.el_deg)
                     self._last_track_ts = tf_ts
+                    self._last_heat_bbox_center = cur_center
                     self._last_sp_pan   = sp_pan
                     self._last_sp_tilt  = sp_tilt
                 else:
-                    # Stale frame — hold last setpoint; servo keeps slewing.
+                    # Centroid hasn't moved yet -- hold last setpoint
+                    # so the gimbal finishes its in-flight motion
+                    # rather than re-applying kp*az on stale data.
                     sp_pan  = self._last_sp_pan
                     sp_tilt = self._last_sp_tilt
                 mode = "auto"
@@ -559,6 +960,14 @@ class GimbalManager:
                 if self._track_miss >= self._track_grace_ticks:
                     err = f"heat id H#{tracked_heat_id} lost after {self._track_miss} ticks"
                     log.info("Dropping heat track lock on H#%d (lost)", tracked_heat_id)
+                    try:
+                        emit_event("track_grace_expired", {
+                            "kind": "heat",
+                            "tracked_id": int(tracked_heat_id),
+                            "miss_ticks": int(self._track_miss),
+                        })
+                    except Exception:
+                        pass
                     with self._lock:
                         if self._tracked_heat_id == tracked_heat_id:
                             self._tracked_heat_id = None
@@ -577,40 +986,170 @@ class GimbalManager:
                         break
             if trk is not None:
                 cur_pan, cur_tilt = self._controller.current
-                if fresh_frame or self._last_sp_pan is None:
-                    if self._cameras_on_gimbal:
-                        az_in, el_in = self._lp_filter_error(
-                            float(trk.az_deg), float(trk.el_deg))
-                        az, el, self._in_deadband = _hyst_deadband(
-                            az_in, el_in,
-                            self._deadband_deg, self._deadband_exit_ratio,
-                            self._in_deadband)
-                        d_pan  = _clip(self._kp_track * az, self._max_step_deg)
-                        d_tilt = _clip(self._kp_track * el, self._max_step_deg)
-                        d_tilt, tilt_sat = _pan_only_if_tilt_saturated(
-                            cur_tilt, d_tilt,
-                            self._tilt_floor, self._tilt_ceil,
-                            self._tilt_sat_eps_deg)
-                        if tilt_sat and not self._tilt_saturated_logged:
-                            log.info("Tilt saturated at mechanical stop "
-                                     "(cur=%.1f, el_err=%.2f) — pan-only",
-                                     cur_tilt, el)
-                            self._tilt_saturated_logged = True
-                        elif not tilt_sat:
-                            self._tilt_saturated_logged = False
-                        sp_pan  = cur_pan  + d_pan
-                        sp_tilt = cur_tilt + d_tilt
-                    else:
-                        # Bench setup: cameras stationary. az/el is already
-                        # absolute bench-frame; command directly.
-                        sp_pan  = self._home_pan  + float(trk.az_deg)
-                        sp_tilt = self._home_tilt + float(trk.el_deg)
-                    self._last_track_ts = tf_ts
-                    self._last_sp_pan   = sp_pan
-                    self._last_sp_tilt  = sp_tilt
+                # Fused-track freshness gate. Only feed the predictor
+                # a "fresh" observation when the FUSED track has
+                # actually been refreshed (id+hits tuple changed) --
+                # NOT on every thermal tick.
+                fused_key: Optional[tuple[int, int]] = None
+                try:
+                    fused_key = (int(trk.id), int(trk.hits))
+                except Exception:
+                    fused_key = None
+                fresh_fused = (
+                    fused_key is not None
+                    and fused_key != self._last_fused_track_hits
+                )
+                # Pure-function predictor — see algorithms/track_predictor.
+                # Both this live tick AND scripts/replay_algo.py call
+                # the same `step` against the same captured inputs;
+                # parity is the verification gate before iterating
+                # variants offline.
+                # Tilt-saturation gate. The fused-track predictor path
+                # historically bypassed _pan_only_if_tilt_saturated (the
+                # heat-track path uses it). Result: tracking a target
+                # at el<0 (e.g. a person below boresight when home_tilt
+                # is 0°) walked the gimbal pan correctly but commanded
+                # negative tilt every tick — which the controller
+                # silently clamped at the floor. Predictor kept
+                # accumulating world_el_dot from observations the
+                # gimbal physically couldn't follow, contaminating the
+                # next non-saturated extrapolation.
+                # Now: detect saturation BEFORE calling step(), tell
+                # the predictor to zero el-velocity contributions, then
+                # clip sp_tilt to the floor/ceil after step() returns.
+                # Pan tracking continues independently — exactly the
+                # "below 0° → pan only" behavior we agreed.
+                # Determine el-error for saturation. When fresh, use
+                # the latest fused observation. When stale, use the
+                # predictor's last-known world_el (= last_observed_el)
+                # so the saturation state doesn't flicker every other
+                # tick — the previous code passed 0.0 on stale ticks
+                # which made tilt_sat oscillate True↔False at 60 Hz
+                # and emitted hundreds of pointless enter/exit events
+                # (visible in the 2026-04-27 mistrack recording: 12
+                # enter/exit pairs in 0.4 s on track #42).
+                if fresh_fused:
+                    el_obs_for_sat = float(trk.el_deg)
+                elif self._predictor_state.world_el is not None:
+                    el_obs_for_sat = (float(self._predictor_state.world_el)
+                                      - float(cur_tilt))
                 else:
-                    sp_pan  = self._last_sp_pan
-                    sp_tilt = self._last_sp_tilt
+                    el_obs_for_sat = 0.0
+                _, tilt_sat_now = _pan_only_if_tilt_saturated(
+                    cur_tilt, el_obs_for_sat,
+                    self._tilt_floor, self._tilt_ceil,
+                    self._tilt_sat_eps_deg)
+                import time as _t
+                now = _t.time()
+                params = track_predictor.PredictorParams(
+                    lead_time_s=self._track_lead_time_s,
+                    vel_alpha=self._track_vel_alpha,
+                    predict_warmup_n=self._track_predict_warmup_n,
+                    predict_cap_deg=self._track_predict_cap_deg,
+                    gimbal_settled_dps=self._track_gimbal_settled_dps,
+                    extrap_horizon_s=self._track_extrap_horizon_s,
+                    vel_clip_dps=self._track_vel_clip_dps,
+                    vel_decay_halflife_s=self._track_vel_decay_halflife_s,
+                    no_obs_lead_zero_after_s=self._track_no_obs_lead_zero_after_s,
+                    tilt_saturated=tilt_sat_now,
+                )
+                sp_pan_pred, sp_tilt_pred, diag = track_predictor.step(
+                    self._predictor_state,
+                    now=now,
+                    cur_pan=cur_pan, cur_tilt=cur_tilt,
+                    obs_az_deg=(float(trk.az_deg) if fresh_fused else None),
+                    obs_el_deg=(float(trk.el_deg) if fresh_fused else None),
+                    fresh_fused=fresh_fused,
+                    params=params,
+                )
+                # Clip sp_tilt at the saturated edge. Without this the
+                # controller still clamps, but the predictor's "last
+                # setpoint" memory carries an out-of-range value.
+                if tilt_sat_now and sp_tilt_pred is not None:
+                    sp_tilt_pred = max(self._tilt_floor,
+                                       min(self._tilt_ceil, sp_tilt_pred))
+                # Tilt-saturation transition events for the timeline.
+                if tilt_sat_now and not self._tilt_saturated_logged:
+                    log.info("Tilt saturated (fused track) cur=%.1f el_obs=%.2f"
+                             " — pan-only", cur_tilt, el_obs_for_sat)
+                    try:
+                        emit_event("tilt_saturated_enter", {
+                            "kind": "fused",
+                            "cur_tilt": float(cur_tilt),
+                            "el_err": float(el_obs_for_sat),
+                            "tracked_id": int(tracked_id),
+                        })
+                    except Exception:
+                        pass
+                    self._tilt_saturated_logged = True
+                elif not tilt_sat_now:
+                    if self._tilt_saturated_logged:
+                        try:
+                            emit_event("tilt_saturated_exit",
+                                       {"kind": "fused"})
+                        except Exception:
+                            pass
+                    self._tilt_saturated_logged = False
+                # Mirror the live state into the legacy fields a few
+                # other places still read from. This is mechanical;
+                # the predictor state is the source of truth.
+                self._track_world_az      = self._predictor_state.world_az
+                self._track_world_el      = self._predictor_state.world_el
+                self._track_world_az_dot  = self._predictor_state.world_az_dot
+                self._track_world_el_dot  = self._predictor_state.world_el_dot
+                self._track_world_last_t  = self._predictor_state.world_last_t
+                self._track_obs_count     = self._predictor_state.obs_count
+                self._cur_pan_prev        = self._predictor_state.cur_pan_prev
+                self._cur_tilt_prev       = self._predictor_state.cur_tilt_prev
+                self._cur_pose_prev_t     = self._predictor_state.cur_pose_prev_t
+
+                # Emit one diagnostic event per tick. The recorder will
+                # capture this in the JSONL events stream — single
+                # highest-leverage signal for offline tracking-debug.
+                # Tagged with track id + name so a future agent can
+                # filter quickly via `replay_inspect.py --grep predictor`.
+                try:
+                    diag_payload = dict(diag)
+                    diag_payload["tracked_id"] = int(tracked_id)
+                    emit_event("track_predictor_step", diag_payload)
+                except Exception:
+                    pass
+                # Settled-state transition is a useful event too --
+                # changes in `settled` mark the start/end of slew
+                # windows in the timeline.
+                if self._last_settled_state != bool(diag.get("settled")):
+                    try:
+                        emit_event("track_settled_change", {
+                            "settled": bool(diag.get("settled")),
+                            "gimbal_dps": float(diag.get("gimbal_dps", 0.0)),
+                        })
+                    except Exception:
+                        pass
+                    self._last_settled_state = bool(diag.get("settled"))
+
+                if fresh_fused:
+                    self._last_fused_track_hits = fused_key
+                    self._last_track_ts = tf_ts
+                    log.debug(
+                        "Track #%d  gimbal=(%.1f,%.1f) dps=%.1f settled=%s "
+                        "obs_world=(%s,%s) vel=(%.1f,%.1f)",
+                        tracked_id, cur_pan, cur_tilt,
+                        diag.get("gimbal_dps", 0.0), diag.get("settled"),
+                        diag.get("obs_world_az"), diag.get("obs_world_el"),
+                        self._track_world_az_dot, self._track_world_el_dot,
+                    )
+
+                # Predictor returns sp = observed_world + capped predictive
+                # shift, OR (when extrap horizon exceeded) the last setpoint.
+                # When there's no track state at all (first tick before
+                # first fresh observation) sp_*_pred is None; hold pose.
+                if sp_pan_pred is not None and sp_tilt_pred is not None:
+                    sp_pan, sp_tilt = sp_pan_pred, sp_tilt_pred
+                else:
+                    sp_pan  = cur_pan
+                    sp_tilt = cur_tilt
+                self._last_sp_pan   = sp_pan
+                self._last_sp_tilt  = sp_tilt
                 mode = "auto"
                 self._track_miss = 0
                 # Keep the manual park position synced so that when
@@ -630,6 +1169,14 @@ class GimbalManager:
                 if self._track_miss >= self._track_grace_ticks:
                     err = f"tracked id #{tracked_id} lost after {self._track_miss} ticks"
                     log.info("Dropping track lock on #%d (lost)", tracked_id)
+                    try:
+                        emit_event("track_grace_expired", {
+                            "kind": "fused",
+                            "tracked_id": int(tracked_id),
+                            "miss_ticks": int(self._track_miss),
+                        })
+                    except Exception:
+                        pass
                     with self._lock:
                         if self._tracked_id == tracked_id:
                             self._tracked_id = None
@@ -644,9 +1191,58 @@ class GimbalManager:
             self._last_track_ts = None
             self._last_sp_pan   = None
             self._last_sp_tilt  = None
+            self._last_fused_track_hits = None
+            self._last_heat_bbox_center = None
+            self._synth_world_az_deg = None
+            self._synth_world_el_deg = None
+            self._synth_lock_t = None
+            # Reset alpha-beta tracker so the next engage starts
+            # fresh, no stale velocity from a prior target.
+            self._track_world_az = None
+            self._track_world_el = None
+            self._track_world_az_dot = 0.0
+            self._track_world_el_dot = 0.0
+            self._track_world_last_t = None
+            self._track_obs_count = 0
+            # Drop the gimbal-pose history too so the next engage
+            # starts with gimbal_dps=0 (treated as settled), allowing
+            # the FIRST observation to anchor world position cleanly.
+            self._cur_pan_prev = None
+            self._cur_tilt_prev = None
+            self._cur_pose_prev_t = None
+            self._predictor_state.reset()
+            self._last_settled_state = None
             self._in_deadband   = False
             self._reset_track_filter()
             self._tilt_saturated_logged = False
+
+        # Pan-saturation detection (symmetric with the tilt-saturated
+        # logic above). Detect when the desired sp_pan would push the
+        # gimbal past its mechanical pan envelope, so the operator /
+        # replay tool can see WHY the gimbal stopped responding to a
+        # tracking target outside its travel.
+        if sp_pan is not None:
+            pan_sat = ((sp_pan <= self._pan_floor + 0.1
+                        and sp_pan < self._controller.current[0])
+                       or (sp_pan >= self._pan_ceil - 0.1
+                           and sp_pan > self._controller.current[0]))
+            if pan_sat and not self._pan_saturated_logged:
+                try:
+                    emit_event("pan_saturated_enter", {
+                        "cur_pan": float(self._controller.current[0]),
+                        "sp_pan": float(sp_pan),
+                        "edge": ("min" if sp_pan <= self._pan_floor + 0.1
+                                 else "max"),
+                    })
+                except Exception:
+                    pass
+                self._pan_saturated_logged = True
+            elif not pan_sat and self._pan_saturated_logged:
+                try:
+                    emit_event("pan_saturated_exit", {})
+                except Exception:
+                    pass
+                self._pan_saturated_logged = False
 
         # Slew + clamp
         cmd_pan, cmd_tilt = self._controller.step(sp_pan, sp_tilt)
@@ -715,6 +1311,8 @@ class GimbalManager:
             az_deg=float(az),
             el_deg=float(el),
             synthetic=bool(getattr(hit, "synthetic", False)),
+            cx_px=float(cx),
+            cy_px=float(cy),
         )
 
     def _command_now(self, pan_deg: float, tilt_deg: float) -> None:

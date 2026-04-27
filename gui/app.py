@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from common.config import load_config
+from common.events import emit as emit_event
 from common.frame_bus import BUS
 from common.frames import Topic
 from common.logging_setup import get_logger
@@ -39,7 +40,8 @@ def _static_dir() -> Path:
 
 
 def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
-               radar_manager=None, fusion_manager=None) -> FastAPI:
+               radar_manager=None, fusion_manager=None,
+               recorder=None, config_snapshot=None) -> FastAPI:
     """Create the FastAPI app.
 
     `thermal_manager` and `eo_manager` are optional — when provided, the
@@ -47,6 +49,14 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
     parameters live and swap capture devices without restarting.
     `radar_manager` likewise exposes a live-tune hook for the DEV-tab
     sensitivity sliders.
+
+    `recorder` is an optional ``JSONLRecorder`` instance. The WS
+    "record" command toggles it on/off and emits matching events on
+    the events stream so the recording itself documents the bracket.
+
+    `config_snapshot` is the dict from ``common.config.load_config()``;
+    written to the JSONL header when recording starts so replay tools
+    have access to FOVs, calibration, etc.
     """
     app = FastAPI(title="Seeker-01 Bench Test", version="0.1.0")
     app.state.thermal_manager = thermal_manager
@@ -54,6 +64,8 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
     app.state.gimbal_manager = gimbal_manager
     app.state.radar_manager = radar_manager
     app.state.fusion_manager = fusion_manager
+    app.state.recorder = recorder
+    app.state.config_snapshot = config_snapshot or {}
 
     static_dir = _static_dir()
     if static_dir.exists():
@@ -106,6 +118,11 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
             ok = tm.set_zoom_preset(str(body["zoom_preset"]))
             if not ok:
                 return Response(status_code=400, content=f"unknown preset {body['zoom_preset']}")
+            try:
+                emit_event("zoom_preset_changed",
+                           {"sensor": "thermal", "preset": str(body["zoom_preset"])})
+            except Exception:
+                pass
         if "device_index" in body:
             raw = body["device_index"]
             try:
@@ -114,6 +131,10 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 idx = str(raw)
             tm.set_device(idx)
             log.info("Thermal device_index -> %s", idx)
+            try:
+                emit_event("device_changed", {"sensor": "thermal", "idx": idx})
+            except Exception:
+                pass
         return {"zoom_preset": tm._zoom_preset, "device_index": tm.device_index}
 
     @app.get("/api/devices/cameras")
@@ -160,7 +181,105 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 idx = str(raw)
             em.set_device(idx)
             log.info("EO device_index -> %s", idx)
+            try:
+                emit_event("device_changed", {"sensor": "eo", "idx": idx})
+            except Exception:
+                pass
         return {"device_index": em.device_index}
+
+    @app.post("/api/config/eo_exposure")
+    async def set_eo_exposure(request: Request):
+        """Flip the SDK stream backend between AE-on and a manual lock.
+
+        Body shape (JSON):
+            {"mode": "auto"}                  → bridge AE on
+            {"mode": "manual", "value": 1264} → AE off + lock to 1264
+
+        Echoes back the resulting state so the dev-tab UI can confirm.
+        """
+        em = app.state.eo_manager
+        if em is None:
+            return Response(status_code=503, content="EO manager not running")
+        body = await request.json()
+        mode = str(body.get("mode", "auto")).lower()
+        if mode == "manual":
+            try:
+                value = int(body.get("value"))
+            except (TypeError, ValueError):
+                return Response(status_code=400,
+                                content="manual mode requires int 'value'")
+            # Sanity clamp. Floor used to be 50, but on bright outdoor
+            # scenes through the 35mm NIR-pass lens the IMX568 saturates
+            # hard at ExposureExt>=25 — see scripts/sdk_daylight_diagnostic.py
+            # output 2026-04-25, where ExposureExt in [5,15] gave the
+            # only properly-exposed cloudy-daylight frames. Drop the
+            # floor to 1 so daylight + NIR-pass usage actually works.
+            value = max(1, min(50000, value))
+            res = em.set_exposure_ext(value)
+            try:
+                emit_event("eo_exposure_set", {"mode": "manual", "value": value})
+            except Exception:
+                pass
+            return res
+        res = em.set_exposure_ext(None)
+        try:
+            emit_event("eo_exposure_set", {"mode": "auto"})
+        except Exception:
+            pass
+        return res
+
+    @app.get("/api/config/eo_exposure")
+    async def get_eo_exposure():
+        em = app.state.eo_manager
+        if em is None:
+            return Response(status_code=503, content="EO manager not running")
+        v = getattr(em, "_manual_exposure_ext", None)
+        return {
+            "exposure_ext": v,
+            "mode": "auto" if v is None else "manual",
+        }
+
+    @app.get("/api/eo/ae_state")
+    async def get_eo_ae_state():
+        """Software-AE introspection for the engineering tab.
+
+        Returns the current bracket, last stats, and chosen ExposureExt.
+        Useful for confirming the AE has converged on a tricky scene
+        without tailing logs.
+        """
+        em = app.state.eo_manager
+        if em is None:
+            return Response(status_code=503, content="EO manager not running")
+        try:
+            return em.get_ae_state()
+        except AttributeError:
+            return Response(status_code=503,
+                            content="AE state not available on this build")
+
+    @app.post("/api/config/eo_lowlight")
+    async def set_eo_lowlight(request: Request):
+        """Toggle the EO low-light display boost (AGC stretch + gamma).
+
+        Body: {"enabled": true|false}. Live — no helper restart needed.
+        """
+        em = app.state.eo_manager
+        if em is None:
+            return Response(status_code=503, content="EO manager not running")
+        body = await request.json()
+        enabled = bool(body.get("enabled", False))
+        res = em.set_lowlight_mode(enabled)
+        try:
+            emit_event("eo_lowlight_toggled", {"enabled": enabled})
+        except Exception:
+            pass
+        return res
+
+    @app.get("/api/config/eo_lowlight")
+    async def get_eo_lowlight():
+        em = app.state.eo_manager
+        if em is None:
+            return Response(status_code=503, content="EO manager not running")
+        return em.get_lowlight_mode()
 
     @app.post("/api/config/heat_detector")
     async def set_heat_detector_config(request: Request):
@@ -180,6 +299,14 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
             "heat_detector config updated: k=%.1f min_area=%d max_det=%d",
             cfg.threshold_k, cfg.min_blob_area_px, cfg.max_detections,
         )
+        try:
+            emit_event("heat_detector_set", {
+                "threshold_k": cfg.threshold_k,
+                "min_blob_area_px": cfg.min_blob_area_px,
+                "max_detections": cfg.max_detections,
+            })
+        except Exception:
+            pass
         return {
             "threshold_k": cfg.threshold_k,
             "min_blob_area_px": cfg.min_blob_area_px,
@@ -192,6 +319,10 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
         cfg = load_config()
         ws_fps = float(cfg.get("gui", {}).get("ws_fps", 20))
         jpeg_quality = int(cfg.get("gui", {}).get("thermal_jpeg_quality", 80))
+        # Separate knob for EO — it's a 2K mono sensor with a real lens
+        # and the thermal default (80) shows visible JPEG ringing on
+        # foliage/brick. Default 92 ≈ visually lossless on mono.
+        eo_jpeg_quality = int(cfg.get("gui", {}).get("eo_jpeg_quality", 92))
         period = 1.0 / max(1e-3, ws_fps)
 
         # Per-connection mutable state.
@@ -206,9 +337,10 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
             # back at us (proves the command took). Only then will a
             # subsequent gimbal-side clear unwind our client mirror.
             "_lock_confirmed": False,
-            # Recording toggle — stubbed until HDF5 session recording ships.
-            # The flag is echoed back on every WS frame so the REC pill
-            # reflects the truth even after a reconnect.
+            # Recording toggle — backed by the JSONL recorder when one
+            # is wired in (see main.py). The echoed value below mirrors
+            # `recorder.is_recording`, so the REC pill stays in sync
+            # across reconnects and across the auto-record flag.
             "recording": False,
         }
         gm = app.state.gimbal_manager
@@ -250,22 +382,29 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 state["_lock_confirmed"] = False
                         else:
                             state["_lock_confirmed"] = True
-                    # Radar extrinsic read lock-free — floats, so a torn
-                    # read just lands between two slider ticks; harmless.
+                    # Radar/thermal extrinsic read lock-free — floats,
+                    # so a torn read just lands between two slider
+                    # ticks; harmless.
                     rm_for_bias = app.state.radar_manager
+                    fm_for_bias = app.state.fusion_manager
                     r_az = float(rm_for_bias.az_bias_deg) if rm_for_bias is not None else 0.0
                     r_el = float(rm_for_bias.el_bias_deg) if rm_for_bias is not None else 0.0
+                    t_az = float(fm_for_bias.thermal_az_bias_deg) if fm_for_bias is not None else 0.0
+                    t_el = float(fm_for_bias.thermal_el_bias_deg) if fm_for_bias is not None else 0.0
                     payload = build_ws_message(
                         tf=tf,
                         ef=ef,
                         fused=fused,
                         gstate=gstate,
                         jpeg_quality=jpeg_quality,
+                        eo_jpeg_quality=eo_jpeg_quality,
                         nir_mode=state["nir_mode"],
                         tracked_target_id=state["tracked_target_id"],
                         tracked_heat_id=state["tracked_heat_id"],
                         radar_az_bias_deg=r_az,
                         radar_el_bias_deg=r_el,
+                        thermal_az_bias_deg=t_az,
+                        thermal_el_bias_deg=t_el,
                     )
                     # `default=str` is a safety net for numpy scalars that
                     # slip through the dataclass contracts — better to ship
@@ -274,6 +413,9 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     # reconcile after reconnects. (No-op for downstream
                     # consumers of build_ws_message — they don't inspect
                     # this field.)
+                    rec = app.state.recorder
+                    if rec is not None:
+                        state["recording"] = bool(rec.is_recording)
                     payload["recording"] = bool(state.get("recording", False))
                     # Attach current radar tuning so the DEV-tab sliders
                     # can load correct initial positions (first frame only
@@ -334,6 +476,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         state["tracked_target_id"] = None
                         if gm is not None: gm.set_track_target(None)
                         log.info("Fused track lock cleared → manual gimbal")
+                        emit_event("track_released", {})
                     else:
                         try:
                             tid = int(raw)
@@ -342,6 +485,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                             state["tracked_heat_id"] = None
                             if gm is not None: gm.set_track_target(tid)
                             log.info("Track lock → fused-id %d", tid)
+                            emit_event("track_engaged", {"target_id": tid})
                         except (TypeError, ValueError):
                             log.warning("Bad track_id payload: %r", raw)
 
@@ -354,6 +498,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         state["tracked_heat_id"] = None
                         if gm is not None: gm.set_track_heat(None)
                         log.info("Heat track lock cleared → manual gimbal")
+                        emit_event("track_heat_released", {})
                     else:
                         try:
                             hid = int(raw)
@@ -361,6 +506,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                             state["tracked_target_id"] = None
                             if gm is not None: gm.set_track_heat(hid)
                             log.info("Track lock → heat-id H#%d", hid)
+                            emit_event("track_heat_engaged", {"heat_id": hid})
                         except (TypeError, ValueError):
                             log.warning("Bad heat_id payload: %r", raw)
 
@@ -370,23 +516,53 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     if state["tracked_target_id"] is not None:
                         log.info("Manual gimbal input — releasing fused track lock")
                         state["tracked_target_id"] = None
+                        emit_event("track_released", {"reason": "manual_input"})
                     if state["tracked_heat_id"] is not None:
                         log.info("Manual gimbal input — releasing heat track lock")
                         state["tracked_heat_id"] = None
+                        emit_event("track_heat_released", {"reason": "manual_input"})
                     dp = float(cmd.get("delta_pan", 0))
                     dt = float(cmd.get("delta_tilt", 0))
                     if gm is not None:
                         gm.set_manual_delta(dp, dt)
                     log.debug("Gimbal manual delta pan=%.1f tilt=%.1f", dp, dt)
+                    emit_event("gimbal_manual_input", {"dpan": dp, "dtilt": dt})
+
+                elif command == "gimbal_absolute":
+                    # Slider drag — sends an absolute setpoint angle
+                    # rather than a delta. Same semantics as manual
+                    # delta wrt track release: any drag releases the
+                    # current track lock so the operator gets manual
+                    # control immediately. The manager rate-limits the
+                    # slew internally, so it's safe to fire this on
+                    # every `input` event from the slider.
+                    if state["tracked_target_id"] is not None:
+                        log.info("Manual gimbal input (slider) — releasing fused track lock")
+                        state["tracked_target_id"] = None
+                        emit_event("track_released", {"reason": "slider_input"})
+                    if state["tracked_heat_id"] is not None:
+                        log.info("Manual gimbal input (slider) — releasing heat track lock")
+                        state["tracked_heat_id"] = None
+                        emit_event("track_heat_released", {"reason": "slider_input"})
+                    pan_deg  = float(cmd.get("pan_deg", 0))
+                    tilt_deg = float(cmd.get("tilt_deg", 0))
+                    if gm is not None:
+                        gm.set_manual_absolute(pan_deg, tilt_deg)
+                    log.debug("Gimbal absolute pan=%.1f tilt=%.1f", pan_deg, tilt_deg)
+                    emit_event("gimbal_absolute_input",
+                               {"pan": pan_deg, "tilt": tilt_deg})
 
                 elif command == "gimbal_home":
                     if state["tracked_target_id"] is not None:
                         state["tracked_target_id"] = None
+                        emit_event("track_released", {"reason": "home"})
                     if state["tracked_heat_id"] is not None:
                         state["tracked_heat_id"] = None
+                        emit_event("track_heat_released", {"reason": "home"})
                     if gm is not None:
                         gm.set_home()
                     log.info("Gimbal home")
+                    emit_event("gimbal_home_pressed", {})
 
                 elif cmd.get("type") == "synthetic_target" or command == "synthetic_target":
                     # User drew a bbox on the thermal panel — seed a
@@ -417,6 +593,9 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                             state["tracked_target_id"] = None
                             gm.set_track_heat(int(tid))
                             log.info("Gimbal auto-locked on synthetic target id=%d", tid)
+                        emit_event("synthetic_target_drawn",
+                                   {"bbox": [int(x), int(y), int(w), int(h)],
+                                    "tid": int(tid) if tid is not None else None})
 
                 elif cmd.get("type") == "clear_synthetic_target" or command == "clear_synthetic_target":
                     tm_ref = app.state.thermal_manager
@@ -428,6 +607,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         state["tracked_heat_id"] = None
                         if gm is not None:
                             gm.set_track_heat(None)
+                    emit_event("synthetic_target_cleared", {})
 
                 elif command == "nir":
                     # Retained for backwards-compat with older GUI builds
@@ -458,6 +638,14 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 cluster_eps_dop_mps=cmd.get("cluster_eps_dop_mps"),
                                 cluster_min_samples=cmd.get("cluster_min_samples"),
                             )
+                            # Emit one event per tune. Sliders fire on
+                            # every input event so this can be busy;
+                            # the recorder + replay tools collapse
+                            # adjacent events on display anyway.
+                            emit_event("radar_tune", {
+                                k: v for k, v in cmd.items()
+                                if k != "command" and v is not None
+                            })
                         except Exception as e:
                             log.warning("radar_tune failed: %s", e)
 
@@ -496,15 +684,147 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 )
                             except Exception as e:
                                 log.warning("extrinsic_tune (fm) failed: %s", e)
+                    try:
+                        emit_event("extrinsic_tune", {
+                            k: cmd.get(k) for k in (
+                                "radar_az_bias_deg", "radar_el_bias_deg",
+                                "thermal_az_bias_deg", "thermal_el_bias_deg")
+                            if cmd.get(k) is not None
+                        })
+                    except Exception:
+                        pass
+
+                elif command == "extrinsic_tune_done":
+                    # Optional debounced "user finished dragging" marker
+                    # the GUI may or may not emit; harmless if absent.
+                    emit_event("extrinsic_tune_done", {
+                        "radar_az_bias_deg": cmd.get("radar_az_bias_deg"),
+                        "radar_el_bias_deg": cmd.get("radar_el_bias_deg"),
+                        "thermal_az_bias_deg": cmd.get("thermal_az_bias_deg"),
+                        "thermal_el_bias_deg": cmd.get("thermal_el_bias_deg"),
+                    })
+
+                elif command == "extrinsic_save":
+                    # Persist current az/el biases for radar + thermal
+                    # to config/calibration.json so they survive restart.
+                    # Source of truth = the LIVE manager state (not the
+                    # WS payload), because the user may have nudged
+                    # past the last extrinsic_tune that the WS captured.
+                    rm = app.state.radar_manager
+                    fm = app.state.fusion_manager
+                    payload: dict = {}
+                    if rm is not None:
+                        try:
+                            r = rm.get_extrinsic()
+                            payload["radar_az"] = float(r.get("az_bias_deg", 0.0))
+                            payload["radar_el"] = float(r.get("el_bias_deg", 0.0))
+                        except Exception as e:
+                            log.warning("get_extrinsic(radar) failed: %s", e)
+                    if fm is not None:
+                        try:
+                            t = fm.get_extrinsic()
+                            payload["thermal_az"] = float(t.get("thermal_az_bias_deg", 0.0))
+                            payload["thermal_el"] = float(t.get("thermal_el_bias_deg", 0.0))
+                        except Exception as e:
+                            log.warning("get_extrinsic(thermal) failed: %s", e)
+                    try:
+                        from common import calibration_store
+                        path = calibration_store.save(**payload)
+                        log.info("Extrinsic calibration saved to %s: %s",
+                                 path, payload)
+                        emit_event("extrinsic_saved", {"biases": payload,
+                                                       "path": str(path)})
+                        await ws.send_json({
+                            "event": "extrinsic_saved",
+                            "ok": True,
+                            "path": str(path),
+                            "values": payload,
+                        })
+                    except Exception as e:
+                        log.exception("extrinsic_save failed: %s", e)
+                        try:
+                            await ws.send_json({
+                                "event": "extrinsic_saved",
+                                "ok": False,
+                                "error": str(e),
+                            })
+                        except Exception:
+                            pass
 
                 elif command == "record":
-                    # Stubbed: no HDF5 writer yet. We toggle the flag so
-                    # the WS echo lights the REC pill, and log the intent
-                    # so future recording plumbing can hook in here.
+                    # Drive the JSONL recorder. ``on=true`` opens a fresh
+                    # file; ``on=false`` flushes and closes. Idempotent.
                     on = bool(cmd.get("on", False))
-                    state["recording"] = on
-                    log.info("Record toggle → %s (stub — no disk I/O yet)",
-                             "ON" if on else "OFF")
+                    rec = app.state.recorder
+                    if rec is None:
+                        log.warning("record cmd ignored — no recorder wired")
+                        state["recording"] = False
+                    else:
+                        try:
+                            if on and not rec.is_recording:
+                                # The "recording_started" event is emitted
+                                # AFTER start() so it lands inside the new
+                                # file. We pass the live config snapshot so
+                                # replay tools see the full config used at
+                                # capture time.
+                                cfg_snap = app.state.config_snapshot or load_config()
+                                path = rec.start(config_snapshot=cfg_snap)
+                                state["recording"] = True
+                                log.info("Recording → ON: %s", path)
+                                emit_event("recording_started",
+                                           {"path": str(path)})
+                            elif (not on) and rec.is_recording:
+                                # Emit the stopped event BEFORE closing the
+                                # file so it gets written.
+                                emit_event("recording_stopped", {})
+                                path = rec.stop()
+                                state["recording"] = False
+                                log.info("Recording → OFF: %s", path)
+                                # Optional rename: client may send
+                                # `rename_to: "my_run_3"` along with
+                                # the off command. Sanitize, append
+                                # .jsonl if missing, and rename in
+                                # the same recordings/ dir. The
+                                # original timestamp filename is
+                                # used as fallback on collision.
+                                rename_to = cmd.get("rename_to")
+                                if rename_to and path:
+                                    try:
+                                        import os, re
+                                        safe = re.sub(
+                                            r"[^A-Za-z0-9 _\-\.]", "_",
+                                            str(rename_to))[:80].strip()
+                                        if safe:
+                                            if not safe.lower().endswith(".jsonl"):
+                                                safe = safe + ".jsonl"
+                                            new_path = os.path.join(
+                                                os.path.dirname(path), safe)
+                                            # Avoid overwriting an
+                                            # existing file — append a
+                                            # numeric suffix until free.
+                                            base, ext = os.path.splitext(new_path)
+                                            n = 1
+                                            while os.path.exists(new_path):
+                                                new_path = f"{base}_{n}{ext}"
+                                                n += 1
+                                            os.rename(path, new_path)
+                                            log.info("Recording renamed -> %s",
+                                                     new_path)
+                                            try:
+                                                await ws.send_json({
+                                                    "event": "recording_renamed",
+                                                    "ok": True,
+                                                    "path": new_path,
+                                                })
+                                            except Exception:
+                                                pass
+                                    except Exception as e:
+                                        log.warning("rename failed: %s", e)
+                            else:
+                                state["recording"] = bool(rec.is_recording)
+                        except Exception:
+                            log.exception("record toggle failed")
+                            state["recording"] = bool(rec.is_recording)
 
                 else:
                     log.warning("Unknown WS command: %s", command)

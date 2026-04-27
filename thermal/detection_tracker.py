@@ -195,6 +195,13 @@ class _Track:
     # the track when the detector drops a frame. Refreshed on every
     # real-detection match.
     of_pts: Optional[np.ndarray] = field(default=None, repr=False)
+    # Whether the most recent tick was a coast (no real-detection
+    # match AND no OF bridge match). For synthetic tracks the GUI
+    # uses this instead of (misses > 0), since misses-on-synthetic
+    # is a one-way counter that never resets and would otherwise
+    # paint the target as "coasting" forever after a single OF miss
+    # during a fast slew.
+    coasted_last_tick: bool = False
     # Track is born from a user "Draw Target" bbox rather than a heat
     # detection. Propagates purely via optical flow — no warmth check,
     # no streak / misses accounting (never needs a real detection), no
@@ -296,16 +303,27 @@ class DetectionTracker:
             return []
         out: List[HeatTrackSnapshot] = []
         for trk in self._tracks:
+            # Synthetic tracks have no detector to "match" against, so
+            # `misses` only ever increments and never resets — making the
+            # legacy `coasting=(misses > 0)` flag sticky from the second
+            # tick onward. For the GUI it's cosmetic, but it lies about
+            # whether OF is actually keeping up. Use a short rolling
+            # window: synthetic tracks are coasting only if the LAST
+            # tick was an actual coast (no OF match). For real tracks
+            # the legacy semantics are preserved — they get reset by
+            # _merge_detection on a real heat-blob match.
+            if trk.synthetic:
+                coasting = bool(trk.coasted_last_tick)
+            else:
+                coasting = (trk.misses > 0)
             out.append(HeatTrackSnapshot(
                 id=trk.id,
                 bbox=trk.det.bbox,
                 hits=trk.hits,
                 misses=trk.misses,
                 age=trk.age,
-                # Synthetic tracks are confirmed from birth so the GUI
-                # renders the USER TARGET overlay immediately.
                 confirmed=trk.synthetic or (trk.hits >= self.cfg.min_hits),
-                coasting=(trk.misses > 0),
+                coasting=coasting,
                 synthetic=trk.synthetic,
             ))
         return out
@@ -547,10 +565,12 @@ class DetectionTracker:
         kept: List[_Track] = []
         for ti, trk in enumerate(self._tracks):
             if ti in matched_t:
+                trk.coasted_last_tick = False
                 kept.append(trk)
                 continue
             trk.misses += 1
             trk.age += 1
+            trk.coasted_last_tick = True
             # Synthetic (user-drawn) tracks are NEVER dropped by max_misses.
             # They persist on Kalman coast until the user hits Clear Target
             # or seeds a new one. The user owns the target lifecycle; the
