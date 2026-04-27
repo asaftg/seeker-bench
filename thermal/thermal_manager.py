@@ -32,7 +32,26 @@ from thermal.digital_zoom import PRESETS as ZOOM_PRESETS, center_crop
 from thermal.drone_classifier import Classifier
 from thermal.fake_thermal_source import FakeThermalSource
 from thermal.heat_detector import HeatDetector, HeatDetectorConfig
-from thermal.thermal_processor import apply_agc, apply_colormap
+from thermal.thermal_processor import (
+    ThermalEnhanceParams,
+    apply_agc,
+    apply_colormap,
+    enhance_post_agc,
+    from_config as enhance_from_config,
+    raw16_to_display_with_params,
+)
+
+
+# Map config string → cv2 interpolation enum for the digital-zoom upscale.
+# Cubic is the new default (see config/app_config.yaml note); linear is the
+# legacy behaviour and is kept as a fallback for rigs that need the old
+# look bit-for-bit.
+_INTERP_LOOKUP = {
+    "linear":   cv2.INTER_LINEAR,
+    "cubic":    cv2.INTER_CUBIC,
+    "lanczos4": cv2.INTER_LANCZOS4,
+    "area":     cv2.INTER_AREA,  # only useful when downscaling
+}
 
 log = get_logger(__name__)
 
@@ -51,11 +70,16 @@ class ThermalManager:
         device_index: int | str = "auto",
         enable_classifier: bool = True,
         reconnect_interval_s: float = 2.0,
+        exclude_indices: Optional[list[int]] = None,
     ) -> None:
         self.use_fake = use_fake
         self.device_index = device_index
         self.enable_classifier = enable_classifier
         self.reconnect_interval_s = reconnect_interval_s
+        # Indices owned by another manager (e.g. the IMX568 on the EO side).
+        # Skipping them in BosonCapture's auto-probe prevents the thermal
+        # scan from disrupting an active EO stream on the same index.
+        self.exclude_indices = list(exclude_indices or [])
 
         cfg = load_config()
         hdcfg = cfg.get("heat_detector", {})
@@ -175,6 +199,23 @@ class ThermalManager:
         self._full_hfov = float(self._thcfg.get("hfov_deg", 75.0))
         self._full_vfov = float(self._thcfg.get("vfov_deg", 60.0))
         self._zoom_preset = str(self._thcfg.get("digital_zoom", {}).get("preset", "full"))
+        # Image-quality enhancement chain — built once from YAML and reused
+        # per frame. Replaces the per-frame cfg.get() calls into the AGC
+        # primitive that the legacy code did. Toggling YAML and restarting
+        # the app picks up the new params; runtime hot-reload is a future
+        # follow-up (a simple `set_enhance_params(p)` setter would do it).
+        self._enhance_params: ThermalEnhanceParams = enhance_from_config(self._thcfg)
+        # Digital-zoom upscale interpolation. cubic is the new default;
+        # falls back to linear if the YAML names an unknown method.
+        _zoom_interp_name = str(
+            (self._thcfg.get("digital_zoom", {}) or {}).get("interpolation", "linear")
+        ).lower()
+        self._zoom_interp: int = _INTERP_LOOKUP.get(_zoom_interp_name, cv2.INTER_LINEAR)
+        if _zoom_interp_name not in _INTERP_LOOKUP:
+            log.warning(
+                "thermal.digital_zoom.interpolation=%r unrecognised; using LINEAR",
+                _zoom_interp_name,
+            )
 
         self._capture_thread: Optional[threading.Thread] = None
         self._process_thread: Optional[threading.Thread] = None
@@ -337,7 +378,10 @@ class ThermalManager:
         # doesn't drag in cv2.VideoCapture at fake-mode import time
         from thermal.boson_capture import BosonCapture
         try:
-            cap = BosonCapture(device_index=self.device_index)
+            cap = BosonCapture(
+                device_index=self.device_index,
+                exclude_indices=self.exclude_indices,
+            )
             cap.start()
             return cap
         except RuntimeError as e:
@@ -419,15 +463,29 @@ class ThermalManager:
         #    the slider feels different at every FOV.
         if frame.ndim == 2:
             raw16_full = frame.astype(np.uint16, copy=False)
-            agc_lo = float(self._thcfg.get("agc", {}).get("low_percentile", 2))
-            agc_hi = float(self._thcfg.get("agc", {}).get("high_percentile", 98))
-            colormap_name = str(self._thcfg.get("agc", {}).get("colormap", "INFERNO"))
-            agc = apply_agc(raw16_full, low_percentile=agc_lo, high_percentile=agc_hi)
-            display_full = apply_colormap(agc, colormap_name)
+            # Full enhancement pipeline (dead-pixel → AGC → CLAHE? → gamma →
+            # bilateral → unsharp → colormap). All YAML-driven via the
+            # `_enhance_params` snapshot built at __init__. Each enhancement
+            # stage is a no-op when its `_enabled` flag is False, so this
+            # is byte-equivalent to the legacy 2-step pipeline when every
+            # new flag is off.
+            _agc8, display_full = raw16_to_display_with_params(
+                raw16_full, self._enhance_params
+            )
         else:
             display_full = frame
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             raw16_full = gray.astype(np.uint16, copy=False)
+            # Camera fell back to AGC8/YUY2 — we only have a uint8 BGR
+            # already. Apply the post-AGC enhancement chain to the gray
+            # channel and re-colormap so the operator sees the same
+            # processing intent on both code paths.
+            try:
+                gray_enh = enhance_post_agc(gray, self._enhance_params)
+                display_full = apply_colormap(gray_enh, self._enhance_params.colormap)
+            except Exception:
+                # Defensive: on any error fall back to the camera's BGR.
+                display_full = frame
 
         # ── 2. Detect on the full frame ────────────────────────────
         detections = []
@@ -465,11 +523,15 @@ class ThermalManager:
                     cropped.append(d)
             detections = cropped
 
-            # Crop + upscale display to original dims
+            # Crop + upscale display to original dims. Interpolation
+            # is YAML-configurable (thermal.digital_zoom.interpolation);
+            # cubic is the new default and produces visibly sharper
+            # mid/narrow zooms vs. the legacy bilinear at the same cost
+            # tier on a 60 Hz path.
             display = cv2.resize(
                 display_full[cy0:cy0 + ch, cx0:cx0 + cw],
                 (orig_w, orig_h),
-                interpolation=cv2.INTER_LINEAR,
+                interpolation=self._zoom_interp,
             )
             # Scale bbox coords from crop space → display space
             sx = orig_w / float(cw)

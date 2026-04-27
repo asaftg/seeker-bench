@@ -169,6 +169,16 @@ export class ThermalView {
     const dpr = window.devicePixelRatio || 1;
     this.canvas.width  = Math.max(1, Math.floor(r.width  * dpr));
     this.canvas.height = Math.max(1, Math.floor(r.height * dpr));
+    // Chrome's default imageSmoothingQuality is 'low', which uses a fast
+    // bilinear scale and visibly softens the 640×512 thermal frame when
+    // the canvas is wider than the source. 'high' switches to a higher-
+    // order resampler for negligible cost on a single 640×512 draw per
+    // frame. Has to be re-set after a canvas resize because the 2D
+    // context state is reset.
+    if (this.ctx) {
+      this.ctx.imageSmoothingEnabled = true;
+      this.ctx.imageSmoothingQuality = "high";
+    }
     if (this._lastFrameW > 0) this._draw();
   }
 
