@@ -40,7 +40,7 @@ thermal:
   agc:
     low_percentile: 2
     high_percentile: 98
-    colormap: INFERNO           # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA
+    colormap: WHITE_HOT         # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA — operator preference 2026-04-27
 
   # Digital zoom presets (emulated narrow FOV)
   digital_zoom:
