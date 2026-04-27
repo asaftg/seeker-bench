@@ -169,3 +169,35 @@ The `ab3_off_mid` is the canonical "what the rig does today" baseline.
    pixel-error closed loop. That should work. Phase 3 of the original plan.
 3. Stage B refactor (anchor LK on bbox content, pixel-error control law)
    if dynamic tracking on synthetic targets is needed later.
+
+## Phase 2: world-frame fusion (commit 73a6c90)
+
+Built `scripts/replay_fusion.py` — offline fusion harness with two
+variants (camera-frame for parity, world-frame for the structural fix
+documented in `SESSION_SUMMARY.md`). Implements the full `_tick`
+pipeline: observation builders, cross-sensor association, dedup,
+matching, merge.
+
+Status: tool runs both variants against the regression set. Parity
+between camera-frame replay and recorded events is approximate but not
+exact (under-predicting birth/death counts ~50%); root cause not fully
+diagnosed but suspected to be in tick-rate alignment with BUS semantics
+when sensors are silent. Replay clearly shows the world-frame variant
+producing more distinct fused tracks across both
+`Human_and_vehicle_mistrack.jsonl` and `gimbal_not_tracking_static.jsonl`
+than camera-frame, which is the qualitative direction we want.
+
+The honest evaluation step (Phase 2c) is per-track lifespan analysis,
+not raw event counts: for each fused track, how long does it survive
+between birth and death, and does world-frame produce LONGER-LIVED
+tracks per real-world target than camera-frame? That analysis is the
+right next step before live verification.
+
+## Final state pushed
+
+Branch `session/phase-2-recap`:
+- `5ff0465` Stage A optical-residual diagnostic
+- `c13d767` Stage B initial implementation (gated, default off)
+- `d203f00` **Maestro auto-reconnect** (the actual home run)
+- `331ca5b` Stage B deferred + multi-FOV baseline + STAGE_AB_NOTES.md
+- `73a6c90` Phase 2a: replay_fusion.py
