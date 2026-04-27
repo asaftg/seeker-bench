@@ -26,21 +26,10 @@ thermal:
   vfov_deg: 60.0
 
   # AGC
-  #
-  # 2026-04-27: full revert to the pre-2026-04-27 baseline at operator
-  # request. Multiple tuning passes (CLAHE, gamma, bilateral, unsharp,
-  # WHITE_HOT, lanczos4) all looked WORSE on the live bench scene than
-  # the original 2/98 + INFERNO + bilinear. The new processing
-  # primitives remain in thermal/thermal_processor.py and are
-  # YAML-reachable via an `enhance:` block + `agc.clahe:` + `agc.colormap`
-  # + `digital_zoom.interpolation` if a future operator wants them, but
-  # NONE are on by default — defaults reproduce the legacy pipeline
-  # bit-for-bit. The Y16 negotiation-order fix in boson_capture.py is
-  # kept (it's a real bug, unrelated to image processing).
   agc:
     low_percentile: 2
     high_percentile: 98
-    colormap: INFERNO           # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA
+    colormap: INFERNO           # INFERNO | IRONBOW | WHITE_HOT
 
   # Digital zoom presets (emulated narrow FOV)
   digital_zoom:
@@ -120,226 +109,15 @@ classifier:
   classifier_hv_imgsz: auto
 
 eo:
-  # Electro-optical pipeline — Leopard LI-USB30-IMX568-GMSL2 (mono, global
-  # shutter, 2472×2064 @ 2.74µm → 6.77×5.65mm sensor) + Commonlands
+  # Electro-optical pipeline — emulates Leopard LI-USB30-IMX568-GMSL2-105H
+  # (IMX568, 2472×2064 @ 2.74µm → 6.77×5.65mm sensor) + Commonlands
   # CIL350-F2.4-M12ANIR (35mm EFL, F/2.4, NIR). Yields ~11.05° HFOV,
   # ~9.23° VFOV — narrow telephoto, ~7x finer per-pixel IFOV than thermal.
   enabled: true
-  # Capture backend:
-  #   imx568 — real hardware via DirectShow at 2472×2064 (mono, AGC'd in sw)
-  #   webcam — generic UVC webcam fallback for dev on laptops without the kit
-  sensor: imx568                # imx568 | webcam
   device_index: auto            # auto | 0 | 1 | 2 ...
-  skip_builtin_webcam: false    # webcam-mode only: skip index 0 if it's a built-in
-  target_fps: 20                # IMX568 over USB3 sustains ~19 fps at full res
-  # SDK stream cadence (only used in sensor=imx568 mode). The SDK helper
-  # actively throttles delivered frames to this rate. 10 was the historical
-  # default (chosen for power); 20 doubles motion smoothness on moving
-  # vehicles with no measured downside. Cap at 25 — beyond that we start
-  # competing with the FX3 USB3 bus saturation under RAW12.
-  stream_fps: 20.0
-  # Resolution is ignored when sensor=imx568 (native 2472×2064 is forced).
-  resolution: [1920, 1080]      # webcam mode: will negotiate closest supported
-
-  # Downscale the 2472×2064 native capture to this width BEFORE AGC, YOLO,
-  # and JPEG encoding. Height is auto-scaled to preserve aspect.
-  #
-  # Trade-off: bigger = sharper EO panel + more YOLO recall on small
-  # targets, but QUADRATIC cost in AGC / encode / WS bandwidth.
-  # Don't bump this above 1236 without checking fps — going to 1854 was
-  # tried 2026-04-24 and dropped the EO publish rate from 14 → 6 Hz on
-  # this laptop, which felt much worse than the marginal sharpness win.
-  # The browser canvas is ~640 px wide on the MAIN tab anyway, so almost
-  # all the extra source pixels get thrown away by the client. The real
-  # leverage for sharpness is JPEG quality (gui.eo_jpeg_quality), not
-  # source resolution. Set to 0 to disable downscaling entirely.
-  display_max_width: 1236
-
-  # Exposure profiles — auto-selected from scene brightness, hysteretic.
-  # SAVgood 850nm VCSEL illuminator is manually controlled by the operator
-  # (always-on, switched at the device). Night profile assumes illuminator
-  # fill, so gain+exposure are pushed harder than an unilluminated scene
-  # could tolerate without motion smear.
-  profiles:
-    # Bright outdoor / lit room — short exposure, low gain.
-    # 0.5ms is aggressive: on a 30fps / 33ms frame budget this is still
-    # sky-safe and keeps high-contrast scenes (roof edge against bright
-    # sky) from clipping. If the bridge rejects sub-ms exposures we'll
-    # see in the log and bump this back up.
-    day:
-      exposure_ms: 0.5
-      gain: 1.0
-      # Enter DAY when scene mean (0..255) crosses above this from DUSK
-      enter_above: 150.0
-      enter_below: 255.0
-    # Indoor normal / overcast twilight
-    dusk:
-      exposure_ms: 20.0
-      gain: 4.0
-      enter_above: 50.0
-      enter_below: 160.0
-    # Dark scene, VCSEL fills NIR
-    night:
-      exposure_ms: 80.0
-      gain: 16.0
-      enter_above: 0.0
-      enter_below: 60.0
-  profile_min_dwell_s: 3.0      # min seconds before another profile switch
-
-  # Actually drive the sensor's exposure + gain from the profile selector.
-  #
-  # FALSE (default): the FX3 bridge runs its own auto-exposure. The
-  #   camera adapts to whatever the scene is — bright outdoor, indoor
-  #   bench, dim corner — without us locking it to one of three guesses.
-  #   This is the setting that produced a watchable image historically.
-  #
-  # TRUE: we flip the camera to MANUAL mode and command the current
-  #   profile's exposure_ms / gain. Sounds nice in theory but in
-  #   practice it: (a) the FX3 firmware silently ignores exposure
-  #   writes on this bridge, AND (b) the manual-mode flip itself sticks
-  #   even though the value doesn't, so the camera locks at some default
-  #   manual-exposure value with no AE — the displayed image goes dark
-  #   indoors and "looks like shit" outdoors. Flip on ONLY after a
-  #   bridge firmware update where exposure writes verifiably take.
-  #
-  # Either way the AGC + enhancement chain handles display dynamic range,
-  # so the visible image is never raw bridge output.
-  profile_control_exposure: false
-
-  # Bridge auto-exposure lock. Set this to a UVC log2(seconds) value to
-  # write CAP_PROP_AUTO_EXPOSURE=manual + CAP_PROP_EXPOSURE on the FX3
-  # bridge via cv2-DSHOW before PyAV opens the device. Killing bridge AE
-  # was the single biggest "static scene stops breathing frame to frame"
-  # win on this rig (2026-04-24). The bridge wanders between exposure
-  # values on every frame even when nothing in the scene moves.
-  #
-  # Conversion: -6 ≈ 1/64 s ≈ 16 ms, -7 ≈ 8 ms, -5 ≈ 32 ms, -4 ≈ 64 ms.
-  # Tune to match the brightness/mood of Leopard CameraTool's reference.
-  # Set to null to disable (bridge AE runs free).
-  manual_exposure_log2: null    # legacy UVC path — bridge ignores it on FX3
-  # Optional gain lock (CAP_PROP_GAIN). Bridge-specific scale; null=skip.
-  manual_gain: null
-  # PRIMARY exposure lock on the IMX568/FX3 rig. Sends LPCamera.ExposureExt
-  # via the 32-bit Leopard SDK helper before PyAV opens the device. The
-  # FX3 firmware ignores all standard UVC writes (proven in
-  # scripts/eo_probe_uvc_props.py) but DOES honor ExposureExt — it's the
-  # vendor extension Leopard's CameraTool uses. With manual_exposure_ext
-  # set, the static-scene "breathing" the user observed disappears
-  # (mean span 1.7 over 30s vs full-saturation drift before).
-  # Set to null to skip the SDK prelude entirely.
-  #
-  # NEW DEFAULT (2026-04-24): null → bridge runs its own auto-exposure
-  # via the SDK stream. With `eo.sensor: imx568` and `manual_exposure_ext:
-  # null`, IMX568Capture spawns the SDK helper with `--ae on` and lets
-  # the FX3/IMX568 firmware adapt exposure to the scene the same way
-  # CameraTool does on its default settings. This is what you want for
-  # "I'm pointing the bench at an arbitrary scene tomorrow and don't
-  # want to wake up to a blown-out white frame."
-  #
-  # Set this to a specific int (e.g. 1264 or 2000) to LOCK exposure for
-  # repeatable engineering tests / reference-comparison runs:
-  #   1264  reproduces leopard_reference.bmp at sub-decimal precision
-  #         (R/G/B mean = 16/17/15 raw — dim but stable)
-  #   2000  the calibrated value that produced the verified frame-to-
-  #         frame match against leopard_reference.bmp
-  # The GUI dev tab also exposes a toggle to flip this at runtime.
-  manual_exposure_ext: null
-
-  # Software auto-exposure (Auto mode driver).
-  #
-  # The FX3 bridge's own AE is broken on this rig in bright daylight
-  # (verified 2026-04-25 with scripts/sdk_daylight_diagnostic.py): it
-  # leaves the IMX568 fully analog-clipped through the 35mm NIR-pass
-  # lens and never recovers. Even Leopard's CameraTool produces a pure
-  # white frame in those conditions. So when the user is in "Auto" mode
-  # (manual_exposure_ext: null), this software AE thread polls raw u16
-  # stats from the SDK stream and drives ExposureExt itself, using a
-  # bracket-based binary search controller.
-  #
-  # Validated: converged 1264 -> 9 in 8 iterations on a saturated cloudy
-  # daylight scene (scripts/sdk_ae_loop.py).
-  #
-  # Manual mode (manual_exposure_ext: <int>) takes priority — software
-  # AE no-ops while the user is overriding.
-  auto_exposure:
-    enabled: true
-    target_p99_lo: 300.0    # raw u16; well above noise floor
-    target_p99_hi: 3500.0   # raw u16; comfortably below 4095 ceiling
-    initial_exposure_ext: 1264   # historical reference seed
-    step_period_s: 1.5      # how often the AE thread evaluates
-    reengage_frac_clip: 0.05  # only re-engage on catastrophic clip
-    max_blank_iters: 6      # consecutive blank stats before warning
-
-  # Percentile AGC on luma channel (mono sensor, BGR output has identical
-  # channels from DirectShow's YUY2 decode). Stretches low_percentile..
-  # high_percentile across 0..255 before publishing so YOLO + display see
-  # a consistent image regardless of current exposure.
-  #
-  # Tight bands like [2, 98] hard-clip ~4% of pixels to pure black/white,
-  # which on a sunlit outdoor scene gives a posterized "HDR-torture" look
-  # — what should be a smooth B&W image gets crushed shadows and blown
-  # highlights. [0.5, 99.5] only clips genuine outliers (hot pixels,
-  # sun-disk, sensor noise spikes) so the panel looks like a normal
-  # mono photo instead of a contrast-pumped render.
-  # AGC + enhancement: OFF by default.
-  #
-  # We tried "do clever processing on the 8-bit-from-12-bit FX3 output"
-  # — percentile AGC + gamma + CLAHE + unsharp — and on a low-light
-  # 7 pm indoor frame it turned grain into "oil-painting" ridge
-  # artifacts. The bridge already runs its own auto-exposure
-  # (profile_control_exposure: false); the simplest, most honest
-  # answer is to TRUST that AE and pass the frame through. This is
-  # also what every consumer webcam app does — no AGC, no gamma,
-  # no CLAHE, just whatever the sensor gave us.
-  #
-  # The processing chain remains code-available and YAML-toggleable
-  # for daylight scenes that benefit from it. To enable:
-  #   * set agc.enabled: true              ← turn the chain on at all
-  #   * set enhance.gamma: 0.85            ← mild midtone lift
-  #   * set enhance.clahe.enabled: true    ← local contrast (DAYLIGHT ONLY!)
-  #   * set enhance.unsharp.enabled: true  ← extra sharpness on clean frames
-  #
-  # In low light, EVERY stage past percentile clip will amplify noise.
-  # Don't touch them on a noisy scene; fix exposure first.
-  agc:
-    # OFF — passthrough, like Leopard CameraTool does. Per-frame
-    # percentile AGC was enabled briefly and produced the exact symptoms
-    # the user reported: "granular, noisy, breathing." All three were
-    # the AGC's fault:
-    #   * granular/noisy: stretching a raw-mean-~16 frame to 0..255 is
-    #     a 6× multiplication of sensor noise.
-    #   * breathing: the [0.5, 99.5] thresholds drift fractionally with
-    #     noise frame-to-frame; after the 6× stretch that drift becomes
-    #     visible brightness wobble.
-    # CameraTool just displays the raw 8-bit frame as-is. Doing the
-    # same here gets Leopard-quality output. If we ever want the frame
-    # brighter than Leopard without breathing, use a *fixed* gain
-    # (constant multiplier, NOT percentile-based) — see eo_processor.
-    enabled: false
-    low_percentile:  0.5
-    high_percentile: 99.5
-
-  enhance:
-    # Median 3×3 — fast salt-and-pepper denoise. Cheap (~1 ms), edge-
-    # preserving. Off by default since we're in passthrough; enable
-    # together with agc.enabled to clean the input before stretching.
-    denoise:
-      enabled: false
-      ksize: 3
-    # Midtone lift. 1.0 = no change. 0.85 = mild lift (good for daylight).
-    # Set to 1.0 (or omit) to disable.
-    gamma: 1.0
-    # Local contrast. Off by default — amplifies noise on low-light input.
-    # Re-enable only on clean daylight frames; clip_limit 1.0–1.5 is safe.
-    clahe:
-      enabled: false
-      clip_limit: 1.5
-      tile_grid: 8
-    # Edge sharpening. Off by default — same reason as CLAHE.
-    unsharp:
-      enabled: false
-      amount: 0.4
-      radius: 1.0
+  skip_builtin_webcam: false    # set true on laptops to skip index 0
+  target_fps: 30
+  resolution: [1920, 1080]      # webcam will negotiate closest supported
 
   # Optics. IMX568 + Commonlands CIL350 35mm is 11.05° H × 9.23° V.
   # If you're running a test webcam instead of the real sensor, set
@@ -353,8 +131,7 @@ eo:
   # webcam sees — otherwise cross-sensor angular matching is broken.
   # Pick the profile matching your webcam (or add one). `none` uses the
   # real-hardware optics above.
-  test_webcam: none                # none | insta360_link | logitech_c920 | generic_60
-                                   # (real IMX568 hardware — leave as 'none')
+  test_webcam: insta360_link       # none | insta360_link | logitech_c920 | generic_60
   test_webcam_profiles:
     none:            { hfov_deg: null, vfov_deg: null }
     insta360_link:   { hfov_deg: 67.0, vfov_deg: 41.0 }   # CINSABNB, 79.5° DFOV @ 16:9
@@ -369,16 +146,11 @@ eo:
     conf_threshold: 0.45
     classes: [person, vehicle]
     include_drone: false        # TODO: enable after EO drone fine-tune
-    # imgsz: 832 matches the resolution seeker_eo_v3.pt was trained at
-    # (see thermal/training/train_eo_v3_close_targets.py docstring).
-    # Was 1280 — that ran ~2.4x slower than 832 AND mismatched the
-    # training distribution by 1.54x, causing a measured publish-rate
-    # bottleneck at ~12 Hz (operator-reported lag 2026-04-25). At 832
-    # we expect ~18-20 Hz publish, with no recall regression because
-    # 832 IS the model's native input size.
-    # Drop to 640 on weak GPUs; bump back to 1280 only if a future
-    # model is retrained at that resolution.
-    imgsz: 832
+    # EO runs on full-color 1920x1080, so imgsz=640 already captures
+    # plenty of detail for person/vehicle detection without the 2x
+    # inference cost of 960. Override to 960 if you need more recall
+    # at long range.
+    imgsz: 640
     # Run YOLO every 2nd frame on GPU (tracks coast in between, no
     # flicker) so publish rate roughly doubles. "auto" = 2 GPU / 4 CPU.
     classify_interval_frames: auto
@@ -522,18 +294,7 @@ fusion:
                                 # (cameras are coplanar <5cm apart so parallax ~= 0°;
                                 #  looser gate prevents small bbox jitter spawning dup IDs)
   min_hits: 1                   # ticks before a track is visible in the GUI
-  # Extended 2026-04-27 from 15→30 (~2.0s @ 15Hz). Replay analysis of
-  # the 5 human-tracking attempts showed every fused track was EO-only
-  # (no thermal h/v support on this rig at present), and YOLO loses
-  # the person briefly during fast gimbal slews. With max_misses=15
-  # the track id died after ~1s of YOLO drop and the user's TRACK
-  # lock grace-expired soon after. With 30 the angular position
-  # survives long enough for YOLO to re-acquire on the same target,
-  # keeping the same fused-track id and the user's lock alive.
-  # Coupled with the predictor's new no_obs_lead_zero_after_s=0.3,
-  # the gimbal holds last-observed position cleanly during the
-  # extended grace window — no runaway, just a pause.
-  max_misses: 30
+  max_misses: 15                # ticks of no-observation before a track is dropped
                                 # (~1s at 15Hz). ByteTrack (per-sensor) already
                                 # coasts through brief dropouts via Kalman, so
                                 # fusion's grace can stay short.
@@ -557,16 +318,11 @@ gimbal:
   port: COM4                    # Command Port (COM5 on this box is TTL)
   rate_hz: 60                   # command/publish loop rate
 
-  # Home / rest pose. tilt convention: 0 = horizon, higher = more up.
-  # Operator-measured tilt envelope on this rig (2026-04-25, second
-  # cal) is 0..90° — see tilt_calibration block below. Pan envelope
-  # is ±45°.
+  # Home / rest pose. tilt convention: lower = horizon-ish,
+  # higher = more up. Mechanical range is 22..90° on this rig,
+  # so 56° is the natural middle.
   home_pan_deg: 0.0
-  # Home sits at horizon (tilt 0°) — operator preference 2026-04-25.
-  # With absolute-angle sliders, dragging from horizon to wherever
-  # the scene needs is one gesture, so there's no "needs head-room"
-  # argument for parking elsewhere.
-  home_tilt_deg: 0.0
+  home_tilt_deg: 22.0   # minimum pitch — ground targets live here
 
   # Are the cameras rigidly mounted on the gimbal, or stationary next
   # to it on the bench?
@@ -582,134 +338,51 @@ gimbal:
   #   centers the target, so the command integrates: `pan += az`.
   cameras_on_gimbal: true
 
-  # Auto-track control law tuning. The defaults inside gimbal_manager
-  # were picked for distant targets where centroid jitter is large
-  # and a wide deadband prevents twitchy hunting. Close foreground
-  # targets (e.g. a vehicle filling 30% of the EO frame) typically
-  # land inside that deadband while still visibly off-center, which
-  # looks like "track does nothing" to the operator. Lower defaults
-  # below trade a bit more residual servo activity for visibly
-  # responsive tracking on close targets.
-  kp_track:    0.30           # was 0.15 — faster slew toward target
-  deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
-  max_step_deg: 2.0           # per-tick setpoint cap (unchanged)
-
-  # Alpha-beta predictor knobs (algorithms/track_predictor.py).
-  # Defaults are baked into PredictorParams; override here per rig.
-  track_lead_time_s: 0.30
-  track_vel_alpha: 0.30
-  track_predict_warmup_n: 5
-  track_predict_cap_deg: 5.0
-  track_gimbal_settled_dps: 15.0
-  track_extrap_horizon_s: 2.0
-  # Tightened 2026-04-26 (was 60). A single fresh observation arriving
-  # on a brief settle between fast slews used to produce a 49 dps
-  # raw_dot that smoothed into +17 dps and pushed the setpoint past
-  # the cap → gimbal hunted blindly until grace. 30 dps is well above
-  # legitimate target rate at our ranges, well below the latency
-  # spike envelope.
-  track_vel_clip_dps: 30.0
-  # New 2026-04-26. When fresh observations stop, decay world_*_dot
-  # toward 0 with this half-life so the predictor doesn't coast on a
-  # stale velocity spike. Set 0 to disable (legacy behaviour).
-  track_vel_decay_halflife_s: 0.20
-  # New 2026-04-27. After this age-since-fresh-obs, the predictor's
-  # lead-time extrapolation is hard-zeroed. Replay confirmed that
-  # decay alone leaves residual hunting (~3° amplitude shrinking
-  # over 1+ s); zeroing lead at 0.3 s collapses the hunt immediately
-  # while still allowing 0.3 s of lead-aided convergence on a
-  # genuinely fresh track.
-  track_no_obs_lead_zero_after_s: 0.30
-
-  # Software safety envelope & slew rate.
-  #
-  # Operator-measured mechanical envelope (2026-04-25, second cal):
-  #   PAN   ch 0: 1950 µs = -45° (max LEFT),  1250 µs = +45° (max RIGHT)
-  #               (reduced from ±90° to ±45° to keep the camera mount
-  #                inside its safe travel — cables don't bind in this
-  #                range and the field of regard is still ample.)
-  #   TILT  ch 1: 1030 µs = 0° (horizon, exact),
-  #               2000 µs = 90° (vertical up, exact)
-  #               (tilt floor lowered from 3° to 0° — operator now
-  #                wants the gimbal to be able to look straight at
-  #                ground-level / horizon-level targets.)
+  # Software safety envelope & slew rate. Mechanical tilt range is
+  # user-specified as 22..90°; we hard-clamp so no command (manual
+  # or auto-track) can exceed it.
   limits:
-    pan_min_deg: -45.0
-    pan_max_deg:  45.0
-    tilt_min_deg:  0.0
+    pan_min_deg: -90.0
+    pan_max_deg:  90.0
+    tilt_min_deg: 22.0
     tilt_max_deg: 90.0
     pan_slew_deg_per_s:  120.0
     tilt_slew_deg_per_s:  60.0
 
-  # Linear angle→µs calibration per servo.
-  # Values reflect the actual mechanical/electrical envelope of THIS
-  # rig as measured by the operator in Maestro Control Center.
+  # Linear angle→µs calibration per servo. These are starting-point
+  # values for a generic 25 kg hobby servo (500..2500 µs full swing).
+  # Run `python -m scripts.gimbal_calibrate` to refine them against
+  # the actual mount, then paste the output back here.
   pan_calibration:
     channel: 0
-    min_deg: -45.0
-    max_deg:  45.0
-    # With invert=true the controller maps:
-    #   -45° (LEFT)   → us_at_max_deg = 1950 µs
-    #   +45° (RIGHT)  → us_at_min_deg = 1250 µs
-    # i.e. LOWER pulse = MORE RIGHT pan. Direction-tested with
-    # operator: ◄ moves left, ► moves right. Same polarity as the
-    # earlier ±90° calibration — only the µs endpoints shifted.
-    us_at_min_deg: 1250.0
-    us_at_max_deg: 1950.0
-    invert: true        # servo mounted so +pan (right) needs lower pulse
+    min_deg: -90.0
+    max_deg:  90.0
+    us_at_min_deg:  500.0
+    us_at_max_deg: 2500.0
+    invert: true        # servo mounted so +pan goes right
   tilt_calibration:
     channel: 1
-    min_deg:  0.0
+    min_deg: 22.0
     max_deg: 90.0
-    # 2026-04-25 operator-measured envelope (second cal):
-    #   1030 µs = 0°  (horizon, exact)
-    #   2000 µs = 90° (vertical up, exact)
-    # With invert=false the controller maps DIRECTLY:
-    #   0°  → us_at_min_deg = 1030 µs
-    #   90° → us_at_max_deg = 2000 µs
-    # i.e. HIGHER pulse = HIGHER tilt. Pressing ▲ (UP) drives the
-    # gimbal physically up. If after a mechanical mount change this
-    # is reversed, flip invert to true and leave the µs values alone.
-    us_at_min_deg: 1030.0
-    us_at_max_deg: 2000.0
-    invert: false
+    # Calibrated 2026-04-22 via Maestro Control Center:
+    #   992 µs  → 90° real (max up, vertical)
+    #   1725 µs → 22° real (max down, mechanical stop)
+    # With invert=true: min_deg (22°) maps to us_at_max_deg, max_deg (90°)
+    # maps to us_at_min_deg — that's the direction the servo is mounted.
+    us_at_min_deg:  992.0
+    us_at_max_deg: 1725.0
+    invert: true        # servo mounted so +tilt goes up
 
 gui:
   host: 127.0.0.1
   port: 8080
   open_browser: true
   ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)
-  thermal_jpeg_quality: 80      # 8-bit colormapped thermal looks fine at 80.
-                                # (Briefly bumped to 92 on 2026-04-27; full
-                                # revert to original on operator request when
-                                # the visible image looked worse than the
-                                # baseline despite the bigger files.)
-  eo_jpeg_quality:     82       # Was 95 — dropped 2026-04-25 to free encode
-                                # budget. The shared WS broadcast loop was
-                                # CPU-bound at ~12 Hz with q=95; q=82 cuts
-                                # JPEG size ~40% and encode time ~25% with
-                                # near-invisible loss on mono. Result: WS
-                                # broadcasts at ~18-20 Hz, freeing thermal
-                                # to display at higher cadence too.
-                                # Raise back to 92-95 if you specifically
-                                # need foliage/brick/chain-link fidelity
-                                # at the cost of motion smoothness.
+  thermal_jpeg_quality: 80
 
 recording:
-  enabled: true                 # Master kill switch. False = REC button is a no-op.
-  auto_start: false             # If true, begin recording at app launch.
-                                # Overridden at the CLI by `python main.py --auto-record`.
-  output_dir: ./recordings      # JSONL files land here as seeker_YYYY-MM-DD_HH-MM-SS.jsonl
-  jpeg_quality: 92              # Recording fidelity is decoupled from the wire (see
-                                # gui.eo_jpeg_quality). 92 = near-lossless, ~3-5 ms encode
-                                # per 640×512 frame. Drop to 85 if recordings stutter.
-  channels:                     # Per-channel enables. Set false to skip on disk.
-    thermal/frame: true
-    eo/frame: true
-    radar/frame: true
-    gimbal/state: true
-    fusion/tracks: true
-    events: true                # always-on in practice (no separate thread)
+  output_dir: ./recordings
+  format: placeholder           # Phase A: stub; HDF5 added later
 
 logging:
   level: INFO
