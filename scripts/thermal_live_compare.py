@@ -143,11 +143,14 @@ def main(argv=None) -> int:
     sum_after = 0.0
 
     for fu16 in frames_u16:
-        # BEFORE — true pre-2026-04-27 baseline:
-        #   percentile AGC 2/98 -> INFERNO, no enhance,
+        # BEFORE — what the operator was actually looking at pre-changes:
+        #   percentile AGC 2/98 -> WHITE_HOT (grayscale), no enhance,
         #   then digital zoom with hardcoded INTER_LINEAR upscale.
+        # (The YAML default colormap was INFERNO but the operator viewed
+        # WHITE_HOT in practice, so for a fair before/after that
+        # isolates *processing* changes both panels stay grayscale.)
         agc_legacy, bgr_before_full = raw16_to_display(
-            fu16, colormap="INFERNO", low_percentile=2.0, high_percentile=98.0
+            fu16, colormap="WHITE_HOT", low_percentile=2.0, high_percentile=98.0
         )
         bgr_before = _apply_zoom(bgr_before_full, args.hfov, cv2.INTER_LINEAR)
 
@@ -189,7 +192,7 @@ def main(argv=None) -> int:
         f"hfov={hfov_str}   {n} frames"
     )
     labels = [
-        f"BEFORE  legacy 2/98 + INFERNO + bilinear zoom  (no enhance)",
+        f"BEFORE  legacy 2/98 + WHITE_HOT + bilinear zoom  (no enhance)",
         f"AFTER   current YAML  ({p_after.colormap} + enhance + cubic zoom)",
     ]
 
