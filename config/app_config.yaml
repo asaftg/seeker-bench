@@ -37,7 +37,14 @@ thermal:
   agc:
     low_percentile: 1.0
     high_percentile: 99.0
-    colormap: INFERNO           # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA
+    colormap: WHITE_HOT         # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA
+                                # 2026-04-27: switched to WHITE_HOT (true
+                                # grayscale) per operator preference. Human
+                                # visual acuity is highest in luma, so target
+                                # silhouettes and small/distant detail look
+                                # crisper on grayscale than on a false-color
+                                # palette. INFERNO remains a one-line swap
+                                # for hot-spot triage scenarios.
     # Optional CLAHE on the AGC'd 8-bit before colormap. Boosts local
     # contrast on a hazy / low-thermal-gradient scene (long-range vehicle
     # at dusk, where everything looks the same temperature). DEFAULT OFF
@@ -83,15 +90,17 @@ thermal:
       d: 3
       sigma_color: 10.0
       sigma_space: 10.0
-    # Unsharp mask. amount=0.50 counteracts the bilateral above and
-    # then a touch more — produces a visibly crisper edge on vehicle
-    # silhouettes / human outlines. radius=1.0 keeps the halo invisible.
-    # If the AFTER image looks "etched" (light/dark stripes parallel
-    # to a bright edge) drop amount to 0.30; if it looks soft, bump
-    # to 0.7 — but pair with a higher-res zoom to verify.
+    # Unsharp mask. amount=0.65 gives a perceptibly sharper image —
+    # vehicle silhouettes and human outlines pop without visible halos
+    # at radius=1.0. Bumped from 0.50 (2026-04-27) per operator request
+    # for "better resolution." If the live image starts to look
+    # "etched" (light/dark fringes parallel to a bright edge) drop to
+    # 0.50; if you want even more crunch, try 0.80 at radius=1.2 — but
+    # past that point the operator is fighting the sensor's actual
+    # spatial resolution and getting back is pure illusion.
     unsharp_mask:
       enabled: true
-      amount: 0.50
+      amount: 0.65
       radius: 1.0
 
   # Digital zoom presets (emulated narrow FOV)
