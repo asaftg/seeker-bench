@@ -2,12 +2,18 @@
 // person/vehicle detections. Same fusion-aware rendering as ThermalView:
 // raw detections subsumed by a fused track are suppressed so the green
 // fused box is the single box on that target.
+//
+// Phase B+ extension: an operator-driven "MEASURE" mode lets the user
+// drag a bbox around a target of known real-world size and we compute
+// distance via known-size triangulation — a stand-in for radar range
+// until the radar half of the rig comes online.
 
 import {
   drawDetectionBox,
   drawFusedBox,
   drawProjectedBox,
   drawRadarBox,
+  drawRubberBand,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -26,11 +32,30 @@ export class EOView {
     this._lastFused = [];
     this._lastRadarTargets = [];
     this._mainTargetId = null;
+    this._lastHfovDeg = 11.05;  // updated from each WS payload
+
+    // Measure-mode state — mirrors ThermalView's draw-target plumbing
+    // but stays purely client-side: the bbox + class are turned into a
+    // distance estimate in JS and rendered as a sticky overlay until
+    // the user CLEARs it. No WS roundtrip needed.
+    this._measureMode = false;
+    this._drag = null;          // {x0,y0,x1,y1} canvas-space pixels
+    this._onCommit = null;      // (imageBbox) => void on successful drag
+    this._measurement = null;   // {bbox:{x,y,w,h}, label:"≈ 73 m · CAR"}
+
     if (this.img) {
       this.img.onload = () => this._draw();
     }
     window.addEventListener("resize", () => this._fitCanvas());
     this._fitCanvas();
+
+    if (this.canvas) {
+      this.canvas.addEventListener("mousedown", (e) => this._handleMouseDown(e));
+      // Listen on window for move/up so a drag that leaves the canvas
+      // still completes cleanly (matches standard rubber-band UX).
+      window.addEventListener("mousemove", (e) => this._handleMouseMove(e));
+      window.addEventListener("mouseup",   (e) => this._handleMouseUp(e));
+    }
   }
 
   _fitCanvas() {
@@ -42,20 +67,155 @@ export class EOView {
     if (this._lastFrameW > 0) this._draw();
   }
 
+  // Public re-fit: callers force this when the canvas's hidden tab
+  // becomes visible (DEV tab in our case). The constructor's initial
+  // _fitCanvas() ran while the tab was display:none → rect was 0×0 →
+  // canvas backed at 1×1 → all subsequent draws looked like a
+  // postage-stamp solid colour. Calling refit() after layout settles
+  // gets us the real pixel size.
+  refit() { this._fitCanvas(); }
+
+  // ── Measure-mode API ────────────────────────────────────────────────
+  // Toggled by the MEASURE button in the EO panel subbar. While active,
+  // mousedown+drag+mouseup paints a rubber-band rect; on release we
+  // hand the IMAGE-space bbox to onCommit (which knows the chosen
+  // class + dimension and computes/persists the distance label).
+  setMeasureMode(on, onCommit = null) {
+    this._measureMode = !!on;
+    this._onCommit = onCommit;
+    if (!this.canvas) return;
+    this.canvas.classList.toggle("draw-mode", this._measureMode);
+    if (!this._measureMode) {
+      this._drag = null;
+      this._draw();
+    }
+  }
+  isMeasureMode() { return this._measureMode; }
+  cancelDrag() {
+    if (this._drag) {
+      this._drag = null;
+      this._draw();
+    }
+  }
+  // Persisted measurement to render every frame until CLEAR. Set to
+  // null to remove. bbox is in IMAGE-space; label is whatever the
+  // caller wants (typically "≈ 73 m · CAR · 1.8 m wide").
+  setMeasurement(measurement) {
+    this._measurement = measurement || null;
+    this._draw();
+  }
+  clearMeasurement() {
+    this._measurement = null;
+    this._draw();
+  }
+
+  // ── Mouse → image-space helpers (same letterbox math as _draw) ──────
+  _evtToCanvasPx(evt) {
+    if (!this.canvas) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    const cssX = evt.clientX - rect.left;
+    const cssY = evt.clientY - rect.top;
+    const sx = this.canvas.width  / rect.width;
+    const sy = this.canvas.height / rect.height;
+    return { x: cssX * sx, y: cssY * sy };
+  }
+  _canvasRectToImageBbox(x0c, y0c, x1c, y1c) {
+    const fw = this._lastFrameW, fh = this._lastFrameH;
+    if (!fw || !fh) return null;
+    const cw = this.canvas.width, ch = this.canvas.height;
+    const scale = Math.min(cw / fw, ch / fh);
+    const dw = fw * scale, dh = fh * scale;
+    const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+    const lo = (a, b) => Math.min(a, b);
+    const hi = (a, b) => Math.max(a, b);
+    const xMin = hi(dx,        lo(x0c, x1c));
+    const yMin = hi(dy,        lo(y0c, y1c));
+    const xMax = lo(dx + dw,   hi(x0c, x1c));
+    const yMax = lo(dy + dh,   hi(y0c, y1c));
+    if (xMax <= xMin || yMax <= yMin) return null;
+    const ix = Math.round((xMin - dx) / scale);
+    const iy = Math.round((yMin - dy) / scale);
+    const iw = Math.round((xMax - xMin) / scale);
+    const ih = Math.round((yMax - yMin) / scale);
+    if (iw < 6 || ih < 6) return null;  // ignore micro-rects (misclick)
+    return { x: ix, y: iy, w: iw, h: ih };
+  }
+
+  _handleMouseDown(evt) {
+    if (!this._measureMode) return;
+    const p = this._evtToCanvasPx(evt);
+    if (!p) return;
+    this._drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+    evt.preventDefault();
+  }
+  _handleMouseMove(evt) {
+    if (!this._measureMode || !this._drag) return;
+    const p = this._evtToCanvasPx(evt);
+    if (!p) return;
+    this._drag.x1 = p.x;
+    this._drag.y1 = p.y;
+    this._draw();
+  }
+  _handleMouseUp(evt) {
+    if (!this._measureMode || !this._drag) return;
+    const p = this._evtToCanvasPx(evt);
+    if (p) { this._drag.x1 = p.x; this._drag.y1 = p.y; }
+    const d = this._drag;
+    this._drag = null;
+    const bbox = this._canvasRectToImageBbox(d.x0, d.y0, d.x1, d.y1);
+    this._draw();
+    if (bbox && typeof this._onCommit === "function") {
+      this._onCommit(bbox);
+    }
+  }
+
   update(eo, mainTargetId = null, fused = [], radarTargets = []) {
     this._mainTargetId = mainTargetId;
     this._lastFused = fused || [];
     this._lastRadarTargets = radarTargets || [];
-    if (!eo || !eo.connected) {
-      if (this.overlay) this.overlay.classList.remove("hidden");
-      this._clear();
-      return;
+    // Three states for the overlay scrim:
+    //   1. Hard disconnect (camera unplugged / open failed) → red
+    //      "EO · DISCONNECTED" — alarming on purpose.
+    //   2. Initializing (software AE bracketing toward usable exposure,
+    //      OR a planned source-helper restart while exposure is changed)
+    //      → amber "EO · INITIALIZING…" — communicates "we're working on
+    //      it" so the operator doesn't think the camera is broken during
+    //      the ~30-55s daylight AE convergence.
+    //   3. Connected with frames → hide scrim, draw image.
+    // Frames during AE convergence DO arrive but may be black/saturated;
+    // we still show the initializing scrim until the AE sets
+    // initializing=false.
+    const label = document.getElementById("eo-disconnected-label");
+    if (!eo || !eo.connected || eo.initializing) {
+      if (this.overlay) {
+        this.overlay.classList.remove("hidden");
+        // amber for initializing, default styling for hard disconnect
+        if (eo && eo.initializing) {
+          this.overlay.classList.add("initializing");
+          if (label) label.textContent = "EO · INITIALIZING…";
+        } else {
+          this.overlay.classList.remove("initializing");
+          if (label) label.textContent = "EO · DISCONNECTED";
+        }
+      }
+      // For the initializing case, keep the (potentially dark) frame on
+      // canvas so the user can see the AE working visually rather than
+      // a uniform black panel.
+      if (!eo || !eo.connected) {
+        this._clear();
+        return;
+      }
+      // Fall through to draw the partial frame under the amber scrim.
+    } else if (this.overlay) {
+      this.overlay.classList.add("hidden");
+      this.overlay.classList.remove("initializing");
+      if (label) label.textContent = "EO · DISCONNECTED";
     }
-    if (this.overlay) this.overlay.classList.add("hidden");
 
     this._lastFrameW = eo.width || 0;
     this._lastFrameH = eo.height || 0;
     this._lastDetections = eo.detections || [];
+    if (eo.hfov_deg != null) this._lastHfovDeg = Number(eo.hfov_deg);
 
     if (eo.jpeg_b64) {
       this.img.src = "data:image/jpeg;base64," + eo.jpeg_b64;
@@ -63,6 +223,12 @@ export class EOView {
       this._draw();
     }
   }
+
+  // Read accessors so main.js can compute distances using the same
+  // intrinsics the panel is currently rendering with.
+  getHfovDeg()  { return this._lastHfovDeg; }
+  getFrameWidth()  { return this._lastFrameW; }
+  getFrameHeight() { return this._lastFrameH; }
 
   _clear() {
     if (!this.ctx) return;
@@ -118,5 +284,51 @@ export class EOView {
     //  entries with sensors=["radar"] and get drawn by the fused loop
     //  above in their class colour. Drawing both was duplicating every
     //  box on the EO panel.)
+
+    // Sticky measurement box — magenta dashed, with a filled label
+    // panel showing the distance estimate. Rendered AFTER detections
+    // so the operator's hand-drawn rect always sits visibly on top.
+    if (this._measurement && this._measurement.bbox) {
+      const b = this._measurement.bbox;
+      const x = dx + b.x * scale;
+      const y = dy + b.y * scale;
+      const w = b.w * scale;
+      const h = b.h * scale;
+      this.ctx.save();
+      this.ctx.strokeStyle = "#ff5cd5";  // magenta — matches DEV color
+      this.ctx.lineWidth = 2;
+      this.ctx.setLineDash([7, 4]);
+      this.ctx.strokeRect(x, y, w, h);
+      this.ctx.setLineDash([]);
+      // Crosshair at centroid for the operator's aim reference.
+      const cx = x + w / 2, cy = y + h / 2;
+      this.ctx.beginPath();
+      this.ctx.moveTo(cx - 7, cy); this.ctx.lineTo(cx + 7, cy);
+      this.ctx.moveTo(cx, cy - 7); this.ctx.lineTo(cx, cy + 7);
+      this.ctx.stroke();
+      // Label panel — opaque dark fill, magenta text. Anchor below the
+      // box if there's no headroom above (top-line clipping is the
+      // only way this can be illegible against varied scenes).
+      const label = this._measurement.label || "—";
+      this.ctx.font = "12px ui-monospace, monospace";
+      const padX = 6, padY = 3;
+      const tw = this.ctx.measureText(label).width;
+      const labelH = 16;
+      let lx = x;
+      let ly = y - labelH - 2;
+      if (ly < dy) ly = y + h + 2;
+      this.ctx.fillStyle = "rgba(0,0,0,0.78)";
+      this.ctx.fillRect(lx, ly, tw + padX * 2, labelH);
+      this.ctx.fillStyle = "#ff5cd5";
+      this.ctx.fillText(label, lx + padX, ly + labelH - padY - 1);
+      this.ctx.restore();
+    }
+
+    // Rubber-band rectangle while the user is dragging in measure mode.
+    // Drawn last so it sits on top of every overlay.
+    if (this._drag) {
+      drawRubberBand(this.ctx, this._drag.x0, this._drag.y0,
+                     this._drag.x1, this._drag.y1);
+    }
   }
 }

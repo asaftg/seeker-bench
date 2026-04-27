@@ -290,6 +290,7 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
     if ef is None or not ef.connected:
         return {
             "connected": False,
+            "initializing": bool(getattr(ef, "initializing", False)) if ef is not None else False,
             "frame_id": ef.frame_id if ef is not None else 0,
             "timestamp": ef.timestamp if ef is not None else 0.0,
             "jpeg_b64": None,
@@ -327,6 +328,7 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
 
     return {
         "connected": True,
+        "initializing": bool(getattr(ef, "initializing", False)),
         "frame_id": ef.frame_id,
         "timestamp": ef.timestamp,
         "jpeg_b64": jpeg_b64,
@@ -343,6 +345,8 @@ def fused_to_wire(
     tracks: Optional[list],
     tf: Optional[ThermalFrame],
     ef: Optional[EOFrame],
+    thermal_az_bias_deg: float = 0.0,
+    thermal_el_bias_deg: float = 0.0,
 ) -> list[Dict[str, Any]]:
     """Serialize FusedTrack list with per-sensor pixel projections.
 
@@ -354,6 +358,19 @@ def fused_to_wire(
 
     The GUI uses these to draw a single green bbox on each panel that
     represents the fused target at the same world angle.
+
+    Why the thermal bias is SUBTRACTED here while it's ADDED in
+    FusionManager._observations_from_thermal:
+      - Fusion adds bias to thermal raw az to align thermal observations
+        into EO's reference frame. Fused tracks therefore live in the
+        EO-aligned (shared) frame.
+      - To project a fused track ONTO THERMAL PIXELS we need to undo
+        that mapping: shared_az -> thermal_raw_az = shared_az - bias.
+      - EO is the ground truth; its raw frame == shared frame, so no
+        bias correction on the EO projection.
+    Without this subtraction, the projected thermal bbox is offset
+    from the actual thermal detection by exactly `thermal_az_bias`
+    (operator-reported 2026-04-25: EO->thermal projection misaligned).
     """
     if not tracks:
         return []
@@ -372,18 +389,20 @@ def fused_to_wire(
     for trk in tracks:
         if not isinstance(trk, FusedTrack):
             continue
-        # Thermal projection
+        # Thermal projection — subtract bias to land in thermal's raw frame
+        thr_az = trk.az_deg - float(thermal_az_bias_deg)
+        thr_el = trk.el_deg - float(thermal_el_bias_deg)
         bt = None
         if t_w and t_h and angular_bbox_visible(
-            trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg, t_hfov, t_vfov
+            thr_az, thr_el, trk.ang_w_deg, trk.ang_h_deg, t_hfov, t_vfov
         ):
             x, y, w, h = angular_to_bbox(
-                trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg,
+                thr_az, thr_el, trk.ang_w_deg, trk.ang_h_deg,
                 t_w, t_h, t_hfov, t_vfov,
             )
             if w > 0 and h > 0:
                 bt = {"x": x, "y": y, "w": w, "h": h}
-        # EO projection
+        # EO projection — EO is ground truth, no bias correction
         be = None
         if e_w and e_h and angular_bbox_visible(
             trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg, e_hfov, e_vfov
@@ -429,12 +448,15 @@ def build_ws_message(
     fused=None,
     gstate: Optional[GimbalState] = None,
     jpeg_quality: int = 80,
+    eo_jpeg_quality: Optional[int] = None,
     nir_mode: str = "auto",
     tracked_target_id: Optional[int] = None,
     tracked_heat_id: Optional[int] = None,
     top_n: int = 5,
     radar_az_bias_deg: float = 0.0,
     radar_el_bias_deg: float = 0.0,
+    thermal_az_bias_deg: float = 0.0,
+    thermal_el_bias_deg: float = 0.0,
 ) -> Dict[str, Any]:
     """Build the full WebSocket envelope.
 
@@ -443,7 +465,11 @@ def build_ws_message(
     ``main_target_id`` (green highlight + gimbal auto-track target);
     otherwise ``main_target_id`` is None and the gimbal stays manual.
     """
-    fused_wire = fused_to_wire(fused, tf, ef)
+    fused_wire = fused_to_wire(
+        fused, tf, ef,
+        thermal_az_bias_deg=thermal_az_bias_deg,
+        thermal_el_bias_deg=thermal_el_bias_deg,
+    )
 
     # Ranked target list — pick top-N by score, then re-sort by stable
     # key (fused track id) so rows don't shuffle as scores fluctuate
@@ -488,10 +514,15 @@ def build_ws_message(
             "error": None,
         }
 
+    # EO gets its own JPEG quality knob — a 2K mono sensor with a real
+    # lens shows visible JPEG ringing/blocking on foliage and brick at
+    # the thermal-grade default of 80. Mono compresses well, so a much
+    # higher quality is cheap (~+15-25% bandwidth, sharper image).
+    eo_q = int(eo_jpeg_quality) if eo_jpeg_quality is not None else int(jpeg_quality)
     return {
         "ts": time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
-        "eo": eo_to_wire(ef, jpeg_quality=jpeg_quality),
+        "eo": eo_to_wire(ef, jpeg_quality=eo_q),
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
             radar_az_bias_deg=radar_az_bias_deg,

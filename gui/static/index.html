@@ -37,15 +37,10 @@
   <!-- ═════════════════════ MAIN TAB ═════════════════════ -->
   <section class="tab-content" data-tab="main">
 
-    <!-- ─────────── LEGEND ─────────── -->
-    <div class="legend">
-      <span class="sw"><span class="swatch" style="background:#00e88f;"></span>Main target (2+ sensors)</span>
-      <span class="sw"><span class="swatch" style="background:#378ADD;"></span>Drone</span>
-      <span class="sw"><span class="swatch" style="background:#AFA9EC;"></span>Human</span>
-      <span class="sw"><span class="swatch" style="background:#E24B4A;"></span>Vehicle</span>
-      <span class="sw"><span class="swatch" style="background:#ff6b35;"></span>Heat / EO unclassified</span>
-      <span class="sw"><span class="swatch swatch-radar"></span>Radar track (projected)</span>
-    </div>
+    <!-- Legend banner removed 2026-04-25 per operator request — the
+         color codes are self-evident from the bbox + label, and the
+         banner was eating ~32 px of vertical space we needed to fit
+         the dashboard in one no-scroll viewport. -->
 
     <!-- ─────────── ROW 1: sensors ─────────── -->
     <div class="row-sensors">
@@ -90,13 +85,28 @@
         </div>
         <div class="panel-subbar">
           <span class="fov-label" id="eo-fov">11° HFOV</span>
+          <!-- DISTANCE ESTIMATE: drag a bbox across a target, release,
+               we compute distance from known size + HFOV. Single
+               assumption: target is ~1.8 m wide (typical car/person
+               shoulder width). Edit `width_m` in main.js if you need a
+               different default. -->
+          <button class="draw-target-btn" id="eo-measure-btn"
+                  style="margin-left:auto;"
+                  title="Drag a bbox across the target's WIDTH — release for distance">
+            DISTANCE ESTIMATE
+          </button>
+          <button class="clear-target-btn" id="eo-measure-clear"
+                  title="Clear the current estimate">
+            CLEAR
+          </button>
         </div>
         <div class="panel-canvas">
           <canvas id="eo-canvas"></canvas>
           <div id="eo-disconnected" class="disconnected-overlay">
             <span class="disc-icon">📷</span>
-            <span>EO · DISCONNECTED</span>
+            <span id="eo-disconnected-label">EO · DISCONNECTED</span>
           </div>
+          <div class="panel-overlay-tl" id="eo-measure-status"></div>
         </div>
       </div>
 
@@ -134,22 +144,34 @@
         </div>
       </div>
 
-      <!-- GIMBAL DPAD (manual control — lives next to targets list) -->
+      <!-- GIMBAL SLIDERS (manual control — absolute angle setpoints).
+           Replaced the dpad on 2026-04-25: operator wanted finer-grain
+           control than the ±5° step buttons gave. Sliders send the
+           target angle directly via the 'gimbal_absolute' WS command;
+           the manager then slews to that setpoint under the existing
+           rate-limit. Slider RANGES come from the YAML calibration
+           limits and are populated by JS on connect. -->
       <div class="ctrl-card gimbal-card">
         <div class="ctrl-head">
           <span class="ctrl-title">GIMBAL</span>
-          <span class="ctrl-val mono">pan <b id="gimbal-pan">—</b> · tilt <b id="gimbal-tilt">—</b></span>
+          <span class="ctrl-val mono">pan <b id="gimbal-pan">—</b>° · tilt <b id="gimbal-tilt">—</b>°</span>
         </div>
-        <div class="dpad">
-          <button class="dpad-spacer"></button>
-          <button class="dpad-btn" id="dpad-up"   data-dp="0"  data-dt="5"  title="Tilt up">▲</button>
-          <button class="dpad-spacer"></button>
-          <button class="dpad-btn" id="dpad-left" data-dp="-5" data-dt="0"  title="Pan left">◀</button>
-          <button class="dpad-btn home" id="dpad-home" title="Go to home position">HOME</button>
-          <button class="dpad-btn" id="dpad-right" data-dp="5" data-dt="0"  title="Pan right">▶</button>
-          <button class="dpad-spacer"></button>
-          <button class="dpad-btn" id="dpad-down" data-dp="0"  data-dt="-5" title="Tilt down">▼</button>
-          <button class="dpad-spacer"></button>
+        <div class="gimbal-sliders">
+          <div class="gslider-row">
+            <span class="gslider-label">PAN</span>
+            <input class="gslider" type="range" id="gimbal-pan-slider"
+                   min="-45" max="45" step="0.5" value="0"
+                   title="Drag to absolute pan angle (deg). Range comes from app_config.yaml">
+            <span class="gslider-val mono" id="gimbal-pan-slider-val">0°</span>
+          </div>
+          <div class="gslider-row">
+            <span class="gslider-label">TILT</span>
+            <input class="gslider" type="range" id="gimbal-tilt-slider"
+                   min="0" max="90" step="0.5" value="30"
+                   title="Drag to absolute tilt angle (deg). 0 = horizon, 90 = vertical up">
+            <span class="gslider-val mono" id="gimbal-tilt-slider-val">30°</span>
+          </div>
+          <button class="gslider-home" id="gimbal-home-btn" title="Snap to home pose">HOME</button>
         </div>
         <div class="gimbal-hint" id="gimbal-hint">manual · press TRACK on a target to lock</div>
       </div>
@@ -167,17 +189,14 @@
       Nothing here affects headless operation.
     </div>
 
-    <div class="row-ctrl">
-
+    <!-- Globals row: cross-sensor knobs + the shared SAVE for extrinsic
+         biases. Slim, ~50 px, sits above the per-sensor cards. -->
+    <div class="row-ctrl-globals">
       <!-- HEAT-BLOB DEBUG TOGGLE (was the top-bar DEV button) -->
-      <div class="ctrl-card">
+      <div class="ctrl-card globals-tile">
         <div class="ctrl-head">
-          <span class="ctrl-title">HEAT-BLOB TRACKER DEBUG</span>
-        </div>
-        <button id="dev-toggle" class="dev-toggle-big">OFF</button>
-        <div class="stat-line" style="margin-top:8px;">
-          Shows raw heat-blob tracker rows (magenta) under the fused targets
-          list and paints per-blob debug ellipses on the thermal feed.
+          <span class="ctrl-title">HEAT-BLOB DEBUG</span>
+          <button id="dev-toggle" class="dev-toggle-big" style="margin-left:auto;">OFF</button>
         </div>
       </div>
 
@@ -185,41 +204,110 @@
            Each toggle controls whether that sensor's tracks project onto
            the OTHER panels. Native detections on a sensor's own panel
            are never affected. Default: all on. -->
-      <div class="ctrl-card">
+      <div class="ctrl-card globals-tile">
         <div class="ctrl-head">
-          <span class="ctrl-title">OVERLAY SCREEN</span>
+          <span class="ctrl-title">OVERLAYS</span>
         </div>
-        <div class="fusion-sub">
-          <label class="fusion-toggle">
-            <input type="checkbox" id="overlay-radar" checked>
-            <span>Radar</span>
-          </label>
-          <label class="fusion-toggle">
-            <input type="checkbox" id="overlay-thermal" checked>
-            <span>Thermal</span>
-          </label>
-          <label class="fusion-toggle">
-            <input type="checkbox" id="overlay-eo" checked>
-            <span>EO</span>
-          </label>
-        </div>
-        <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
-          Turn off a sensor to hide its cross-sensor bboxes (radar projections,
-          fused / projected boxes contributed by that sensor) on the other panels.
+        <div class="fusion-sub" style="gap:8px;">
+          <label class="fusion-toggle"><input type="checkbox" id="overlay-radar"   checked><span>Radar</span></label>
+          <label class="fusion-toggle"><input type="checkbox" id="overlay-thermal" checked><span>Thermal</span></label>
+          <label class="fusion-toggle"><input type="checkbox" id="overlay-eo"      checked><span>EO</span></label>
         </div>
       </div>
 
-      <!-- THERMAL TUNING -->
-      <div class="ctrl-card thermal-tuning-card">
+      <!-- Shared SAVE for extrinsic biases. Persists ALL bias sliders
+           (radar AZ/EL + thermal AZ/EL) to config/calibration.json. -->
+      <div class="ctrl-card globals-tile">
         <div class="ctrl-head">
-          <span class="ctrl-title">THERMAL TUNING</span>
+          <span class="ctrl-title">EXTRINSIC · SAVE</span>
+          <button id="ext-save" class="dev-toggle-big" style="margin-left:auto;padding:4px 14px;font-size:11px;letter-spacing:1px;">SAVE</button>
+        </div>
+        <div class="stat-line" id="ext-save-status" style="color:var(--text-3);font-size:10px;min-height:13px;">
+          Persists thermal/radar biases to config/calibration.json.
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-sensor row: 3 panels in EO / THERMAL / RADAR order.
+         Each panel groups its own controls + bias sliders + a same-sized
+         live preview so the operator can calibrate each sensor in place
+         without scrolling between sections. EO ground-truth preview lives
+         in the EO panel for direct visual reference while dragging biases
+         on the OTHER panels (thermal/radar overlays project onto the EO
+         frame so changes to those biases are visible there in real time). -->
+    <div class="row-ctrl-sensors">
+
+      <!-- ─────── EO PANEL ─────── -->
+      <div class="ctrl-card sensor-card" id="dev-eo">
+        <div class="ctrl-head">
+          <span class="ctrl-title">EO · IMX568 · 35mm NIR</span>
+        </div>
+        <div class="sensor-body">
+          <!-- EXPOSURE: auto/manual switch for the SDK RAW12 stream.
+               AUTO = software AE drives ExposureExt automatically.
+               MANUAL = lock to a specific ExposureExt (engineering /
+               repeatability). Switching restarts the SDK helper (~1.5s).
+            -->
+          <div class="sensor-section">
+            <div class="section-label">EXPOSURE</div>
+            <div class="fusion-sub">
+              <label class="fusion-toggle">
+                <input type="radio" name="eo-exp-mode" id="eo-exp-auto" value="auto" checked>
+                <span>Auto (software AE)</span>
+              </label>
+              <label class="fusion-toggle">
+                <input type="radio" name="eo-exp-mode" id="eo-exp-manual" value="manual">
+                <span>Manual</span>
+              </label>
+            </div>
+            <div class="slider-row" style="margin-top:6px;">
+              <label class="slider-label">EXP EXT</label>
+              <input id="eo-exp-value" type="number" min="1" max="50000" step="1" value="1264"
+                     style="width:78px;background:#111;color:#ddd;border:1px solid #333;padding:3px 6px;font-family:inherit;font-size:11px;">
+              <button id="eo-exp-apply" class="dev-toggle-big" style="margin-left:auto;padding:4px 12px;font-size:10px;letter-spacing:1px;">APPLY</button>
+            </div>
+            <div class="stat-line" id="eo-exp-status" style="margin-top:4px;color:var(--text-3);font-size:10px;min-height:13px;">
+              Daylight+NIR ≈ 5–15. Low light ≈ 8000–25000.
+            </div>
+          </div>
+
+          <!-- LOW-LIGHT BOOST: AGC stretch + gamma. Live, no restart. -->
+          <div class="sensor-section">
+            <div class="section-label">LOW-LIGHT</div>
+            <div class="fusion-sub">
+              <label class="fusion-toggle">
+                <input type="checkbox" id="eo-lowlight-enable">
+                <span>Boost (AGC + gamma 1.6)</span>
+              </label>
+            </div>
+            <div class="stat-line" id="eo-lowlight-status" style="margin-top:4px;color:var(--text-3);font-size:10px;min-height:13px;">
+              OFF = passthrough. ON = stretch dim scenes (noisier look).
+            </div>
+          </div>
+
+          <!-- EO is ground truth for extrinsic calibration — its preview
+               sits here at the same size as the thermal/radar minis so
+               the operator sees fused/projected bboxes shifting on the
+               same canvas while dragging the bias sliders elsewhere. -->
+          <div class="sensor-preview">
+            <div class="mini-preview-label">LIVE · EO (calibration reference)</div>
+            <canvas id="eo-mini-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─────── THERMAL PANEL ─────── -->
+      <div class="ctrl-card sensor-card" id="dev-thermal">
+        <div class="ctrl-head">
+          <span class="ctrl-title">THERMAL · Boson 640</span>
           <label class="fusion-toggle" style="margin-left:auto;">
             <input type="checkbox" id="thermal-invert">
             <span>Black hot</span>
           </label>
         </div>
-        <div class="thermal-tuning-body">
-          <div class="thermal-tuning-sliders">
+        <div class="sensor-body">
+          <div class="sensor-section">
+            <div class="section-label">DETECTION TUNING</div>
             <div class="slider-row">
               <label class="slider-label">SENSITIVITY</label>
               <input id="thr-slider" type="range" min="2" max="20" step="0.5" value="2" data-invert="1">
@@ -230,60 +318,40 @@
               <input id="minarea-slider" type="range" min="3" max="500" step="1" value="3" data-invert="1">
               <span class="slider-val" id="minarea-val">—</span>
             </div>
-            <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
-              Default = minimum sensitivity. Slide right to become more sensitive / accept smaller blobs.
+            <div class="stat-line" style="margin-top:4px;color:var(--text-3);font-size:10px;">
+              Right = more sensitive / smaller blobs accepted.
             </div>
           </div>
-          <div class="thermal-mini-preview">
+
+          <div class="sensor-section">
+            <div class="section-label">EXTRINSIC vs EO</div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts thermal fused box right on EO">AZ</label>
+              <input id="ext-thermal-az" type="range" min="-10" max="10" step="0.1" value="0">
+              <span class="slider-val" id="ext-thermal-az-val">— °</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts thermal fused box up on EO">EL</label>
+              <input id="ext-thermal-el" type="range" min="-10" max="10" step="0.1" value="0">
+              <span class="slider-val" id="ext-thermal-el-val">— °</span>
+            </div>
+          </div>
+
+          <div class="sensor-preview">
             <div class="mini-preview-label">LIVE · thermal</div>
             <canvas id="thermal-mini-canvas"></canvas>
           </div>
         </div>
       </div>
 
-      <!-- EXTRINSIC CALIBRATION · software bias vs. EO (ground truth) -->
-      <div class="ctrl-card">
+      <!-- ─────── RADAR PANEL ─────── -->
+      <div class="ctrl-card sensor-card" id="dev-radar">
         <div class="ctrl-head">
-          <span class="ctrl-title">EXTRINSIC CALIBRATION · vs. EO</span>
+          <span class="ctrl-title">RADAR · AWR2944P</span>
         </div>
-        <div class="radar-tuning-body">
-          <div class="radar-tuning-sliders" style="width:100%;">
-            <div class="slider-row">
-              <label class="slider-label" title="Shift radar az — + nudges projected radar bbox right on EO/thermal">RADAR AZ</label>
-              <input id="ext-radar-az" type="range" min="-10" max="10" step="0.1" value="0">
-              <span class="slider-val" id="ext-radar-az-val">— °</span>
-            </div>
-            <div class="slider-row">
-              <label class="slider-label" title="Shift radar el — + nudges projected radar bbox up">RADAR EL</label>
-              <input id="ext-radar-el" type="range" min="-10" max="10" step="0.1" value="0">
-              <span class="slider-val" id="ext-radar-el-val">— °</span>
-            </div>
-            <div class="slider-row">
-              <label class="slider-label" title="Shift thermal az — + nudges thermal fused/projected bbox right on EO">THERMAL AZ</label>
-              <input id="ext-thermal-az" type="range" min="-10" max="10" step="0.1" value="0">
-              <span class="slider-val" id="ext-thermal-az-val">— °</span>
-            </div>
-            <div class="slider-row">
-              <label class="slider-label" title="Shift thermal el — + nudges thermal fused/projected bbox up">THERMAL EL</label>
-              <input id="ext-thermal-el" type="range" min="-10" max="10" step="0.1" value="0">
-              <span class="slider-val" id="ext-thermal-el-val">— °</span>
-            </div>
-            <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
-              EO is the ground-truth reference — slide until the radar (cyan)
-              and thermal (green / dashed) bboxes overlap the EO detection
-              on a known target. Values persist in YAML.
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- RADAR TUNING (live) -->
-      <div class="ctrl-card radar-tuning-card">
-        <div class="ctrl-head">
-          <span class="ctrl-title">RADAR TUNING · live</span>
-        </div>
-        <div class="radar-tuning-body">
-          <div class="radar-tuning-sliders">
+        <div class="sensor-body">
+          <div class="sensor-section">
+            <div class="section-label">DETECTION TUNING · live</div>
             <div class="slider-row">
               <label class="slider-label" title="Drop points below this SNR — higher = cleaner, lower = more returns">SNR MIN</label>
               <input id="radar-snr" type="range" min="0" max="25" step="0.5" value="6">
@@ -295,37 +363,49 @@
               <span class="slider-val" id="radar-az-val">— °</span>
             </div>
             <div class="slider-row">
-              <label class="slider-label" title="Minimum |doppler| — 0 shows everything including static; bump to e.g. 0.5 m/s to suppress walls / parked cars / trees">SPEED MIN</label>
+              <label class="slider-label" title="Minimum |doppler|. 0 = include static. Bump to suppress walls/trees.">SPEED MIN</label>
               <input id="radar-speed" type="range" min="0" max="5" step="0.1" value="0.4">
               <span class="slider-val" id="radar-speed-val">— m/s</span>
             </div>
             <div class="slider-row">
-              <label class="slider-label" title="Near-range blanking — drop detections closer than this. Useful to hide reflections off your own mount / tripod / near clutter.">RANGE MIN</label>
+              <label class="slider-label" title="Near-range blanking — drop detections closer than this.">RANGE MIN</label>
               <input id="radar-range-min" type="range" min="0" max="30" step="0.5" value="0">
               <span class="slider-val" id="radar-range-min-val">— m</span>
             </div>
             <div class="slider-row">
-              <label class="slider-label" title="DBSCAN position epsilon — larger stitches scattered returns into one box">CLUSTER ε</label>
+              <label class="slider-label" title="DBSCAN position epsilon — larger stitches scattered returns.">CLUSTER ε</label>
               <input id="radar-eps" type="range" min="0.3" max="10.0" step="0.1" value="6.0">
               <span class="slider-val" id="radar-eps-val">— m</span>
             </div>
             <div class="slider-row">
-              <label class="slider-label" title="DBSCAN minimum cluster size — 2 allows sparse vehicle returns, 3+ rejects singletons">MIN PTS</label>
+              <label class="slider-label" title="DBSCAN minimum cluster size.">MIN PTS</label>
               <input id="radar-minpts" type="range" min="2" max="8" step="1" value="3">
               <span class="slider-val" id="radar-minpts-val">—</span>
             </div>
-            <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
-              Range pinned to firmware max (250 m). Speed 0 m/s = include static; bump up to cull clutter.
+          </div>
+
+          <div class="sensor-section">
+            <div class="section-label">EXTRINSIC vs EO</div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts radar projected box right on EO/thermal">AZ</label>
+              <input id="ext-radar-az" type="range" min="-10" max="10" step="0.1" value="0">
+              <span class="slider-val" id="ext-radar-az-val">— °</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts radar projected box up on EO/thermal">EL</label>
+              <input id="ext-radar-el" type="range" min="-10" max="10" step="0.1" value="0">
+              <span class="slider-val" id="ext-radar-el-val">— °</span>
             </div>
           </div>
-          <div class="radar-mini-preview">
+
+          <div class="sensor-preview">
             <div class="mini-preview-label">LIVE · radar</div>
             <canvas id="radar-mini-canvas"></canvas>
           </div>
         </div>
       </div>
 
-    </div><!-- /.row-ctrl -->
+    </div><!-- /.row-ctrl-sensors -->
 
   </section><!-- /.tab-content[dev] -->
 
