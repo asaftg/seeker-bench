@@ -25,99 +25,22 @@ thermal:
   hfov_deg: 75.0
   vfov_deg: 60.0
 
-  # AGC — percentile-clip linear stretch from raw u16 to display u8.
-  # Tighter bands (2/98) clip ~4% of the histogram and visibly posterize
-  # midtones on a low-contrast outdoor thermal scene. 1/99 only nips
-  # genuine outliers (sun/sky-edge glints, single-pixel hot defects)
-  # while preserving the gradient operators read details from. Inputs
-  # are 16-bit raw with on-chip NUC, so unlike the EO 8-bit-from-12-bit
-  # path the stretch does NOT 6× any noise — it's a true bit-depth
-  # reduction, not a contrast pump. EO's "oil-painting" failure mode
-  # (see eo.agc notes above) does not apply here.
+  # AGC
+  #
+  # 2026-04-27: full revert to the pre-2026-04-27 baseline at operator
+  # request. Multiple tuning passes (CLAHE, gamma, bilateral, unsharp,
+  # WHITE_HOT, lanczos4) all looked WORSE on the live bench scene than
+  # the original 2/98 + INFERNO + bilinear. The new processing
+  # primitives remain in thermal/thermal_processor.py and are
+  # YAML-reachable via an `enhance:` block + `agc.clahe:` + `agc.colormap`
+  # + `digital_zoom.interpolation` if a future operator wants them, but
+  # NONE are on by default — defaults reproduce the legacy pipeline
+  # bit-for-bit. The Y16 negotiation-order fix in boson_capture.py is
+  # kept (it's a real bug, unrelated to image processing).
   agc:
-    low_percentile: 1.0
-    high_percentile: 99.0
-    colormap: WHITE_HOT         # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA
-                                # 2026-04-27: switched to WHITE_HOT (true
-                                # grayscale) per operator preference. Human
-                                # visual acuity is highest in luma, so target
-                                # silhouettes and small/distant detail look
-                                # crisper on grayscale than on a false-color
-                                # palette. INFERNO remains a one-line swap
-                                # for hot-spot triage scenarios.
-    # CLAHE on the AGC'd 8-bit before colormap.
-    #
-    # DEFAULT OFF (2026-04-27, third pass). Briefly enabled in the
-    # second tuning pass; live operator review on the bench scene at
-    # 18 deg zoom showed it pumped grain into "oil-painting ridges" on
-    # foliage and gave bright targets a blooming halo — the exact
-    # failure mode the EO comments above warn about. CLAHE on a clean
-    # already-contrasty thermal scene amplifies noise more than it
-    # adds useful contrast. Re-enable only on a genuinely flat scene
-    # (long-range dusk vehicle in thermal equilibrium) and start at
-    # clip_limit=1.0, NOT 2.0.
-    clahe:
-      enabled: false
-      clip_limit: 1.0
-      tile_grid: 8
-
-  # Post-AGC display enhancement chain — runs in order:
-  # raw16 → dead-pixel median → AGC (above) → CLAHE? → gamma → bilateral
-  # denoise → unsharp mask → colormap. Every stage is YAML-toggleable.
-  # The detector still operates on RAW16 (pre-AGC), so toggling these
-  # never changes detection statistics — they're display-only.
-  enhance:
-    # Median 3×3 on raw u16 to suppress single-pixel stuck/hot/dead
-    # defects (Boson 640 has ~a handful of bad pixels per sensor; FFC
-    # masks most but a few survive and look like bright dots in INFERNO).
-    # Cheap (~0.3 ms at 640×512), edge-preserving, no perceptible
-    # softening of real targets at this kernel size. Default ON.
-    dead_pixel_median:
-      enabled: true
-      ksize: 3
-    # Midtone gamma. 1.0 = no change. 0.85 = mild lift, brings the
-    # warm-but-not-hot pixels (running engines, daylight road surface)
-    # up out of the lower half of the histogram where they otherwise
-    # sit after the percentile stretch.
-    #
-    # 1.0 default (2026-04-27, third pass). Even mild lift (0.9)
-    # combined with unsharp turns a clean Boson frame into a
-    # "processed" looking image that the operator does not prefer.
-    # Adjust to 0.85-0.95 only if you specifically want to bring up
-    # the mid-warm zone of the histogram and you've verified the
-    # result on a comparison capture.
-    gamma: 1.0
-    # Bilateral denoise on the 8-bit display image.
-    #
-    # DEFAULT OFF (2026-04-27, second tuning pass): live A/B at 18 deg
-    # zoom against the operator's actual baseline showed that bilateral
-    # at d=3 / sigma=10 visibly over-smooths real detail when the
-    # operator zooms in. The Boson 640's grain at the operator's
-    # current setup is mild enough that the trade is wrong — keeping
-    # the grain preserves the resolution the user is asking for, and
-    # losing it gives a "plasticky" look on vehicle bodies. Re-enable
-    # only if a sustained noisy scene actually demands it; tune sigma
-    # to the noise level (start at sigma=5 — sigma=10 is too far).
-    bilateral_denoise:
-      enabled: false
-      d: 3
-      sigma_color: 10.0
-      sigma_space: 10.0
-    # Unsharp mask.
-    #
-    # DEFAULT OFF (2026-04-27, third pass). Briefly bumped to 1.0 in
-    # the second tuning pass; live operator review showed visible
-    # halos on bright thermal targets (vehicles against cool ground)
-    # and a generally "etched" look on foliage edges. The Boson 640
-    # is already sharper than the operator's 18 deg zoom can resolve
-    # without artifacts — adding unsharp on top creates the artifacts
-    # without adding genuine resolution. Re-enable at amount=0.30
-    # only on a side-by-side comparison that confirms it's actually
-    # helping; never go above 0.50 on this rig.
-    unsharp_mask:
-      enabled: false
-      amount: 0.30
-      radius: 1.0
+    low_percentile: 2
+    high_percentile: 98
+    colormap: INFERNO           # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA
 
   # Digital zoom presets (emulated narrow FOV)
   digital_zoom:
@@ -128,13 +51,6 @@ thermal:
       wide:   { hfov_deg: 37.5 }
       mid:    { hfov_deg: 18.75 }
       narrow: { hfov_deg: 12.5 }
-    # Upscale interpolation when a crop is enlarged back to display
-    # dimensions. lanczos4 > cubic > linear on perceived sharpness at
-    # zoom; cost is ~1.5ms vs ~0.4ms at 640×512, well within budget on
-    # this rig at 60 fps. Bumped to lanczos4 (2026-04-27 second pass)
-    # because at 18 deg zoom the operator wants every bit of upscale
-    # quality possible. Drop to cubic if you ever profile a CPU bind.
-    interpolation: lanczos4
 
 heat_detector:
   # residual = frame - spatial_mean(frame)
@@ -763,14 +679,11 @@ gui:
   port: 8080
   open_browser: true
   ws_fps: 60                    # GUI push rate; actual fps is min(ws_fps, camera_fps, encode_budget)
-  thermal_jpeg_quality: 92      # Bumped from 80 (2026-04-27). Colormapped
-                                # 8-bit thermal compresses to a small file
-                                # even at 92, but the saved bytes from q=80
-                                # weren't worth the visible blocking on the
-                                # 32×32 patches inside vehicle bboxes. The
-                                # bandwidth difference at 30 Hz is ~+200 KB/s,
-                                # imperceptible on localhost. Drop back to
-                                # 85 if recording hits a write bottleneck.
+  thermal_jpeg_quality: 80      # 8-bit colormapped thermal looks fine at 80.
+                                # (Briefly bumped to 92 on 2026-04-27; full
+                                # revert to original on operator request when
+                                # the visible image looked worse than the
+                                # baseline despite the bigger files.)
   eo_jpeg_quality:     82       # Was 95 — dropped 2026-04-25 to free encode
                                 # budget. The shared WS broadcast loop was
                                 # CPU-bound at ~12 Hz with q=95; q=82 cuts
