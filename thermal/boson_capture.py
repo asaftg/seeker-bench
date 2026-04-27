@@ -33,11 +33,16 @@ class BosonCapture:
         width: int = 640,
         height: int = 512,
         prefer_raw16: bool = True,
+        exclude_indices: Optional[list[int]] = None,
     ) -> None:
         self.requested_index = device_index
         self.width = width
         self.height = height
         self.prefer_raw16 = prefer_raw16
+        # Indices to skip during auto-probe — used so the thermal probe
+        # doesn't steal the IMX568's handle. Without this, opening+setting
+        # FOURCC on the IMX568's active index knocks its stream offline.
+        self.exclude_indices = list(exclude_indices or [])
 
         self.device_index: Optional[int] = None
         self.raw16_available: bool = False
@@ -53,6 +58,11 @@ class BosonCapture:
         candidates = self._candidate_indices()
         last_err: Optional[str] = None
         for idx in candidates:
+            if idx in self.exclude_indices:
+                # Another manager already owns this index (typically the
+                # IMX568 on the EO side). Probing it would disrupt the
+                # active stream — skip silently.
+                continue
             cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
             if not cap.isOpened():
                 cap.release()
@@ -68,13 +78,21 @@ class BosonCapture:
             except Exception:
                 pass
 
-            # Request Y16 first for raw 16-bit thermal
+            # Request Y16 first for raw 16-bit thermal.
+            #
+            # Property-set ORDER MATTERS on this laptop's DSHOW (verified
+            # 2026-04-27 — direct probe shows FOURCC-before-WIDTH/HEIGHT
+            # silently drops Y16 and downconverts to 8-bit BGR; setting
+            # WIDTH/HEIGHT then CONVERT_RGB=0 then FOURCC negotiates Y16
+            # correctly and returns a uint16 single-channel array). The
+            # broken order was a no-op on whichever laptop the original
+            # code was tested on, but it cost us raw16 here.
             raw16_ok = False
             if self.prefer_raw16:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("Y", "1", "6", " "))
-                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("Y", "1", "6", " "))
                 ok, test = cap.read()
                 # OpenCV silently ignores Y16 on some laptops and still
                 # returns a BGR frame — the only reliable signal that we
