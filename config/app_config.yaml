@@ -621,6 +621,28 @@ gimbal:
   # genuinely fresh track.
   track_no_obs_lead_zero_after_s: 0.30
 
+  # ── Optical residual correction (Stage A diagnostic + Stage B closed-loop)
+  #
+  # Stage A is always on: when a synthetic-target lock is active, the
+  # gimbal manager runs LK optical flow on EO + thermal frames against
+  # an anchor captured at lock time. The measured pixel displacement,
+  # converted via the recorded FOV, gives the actual angular movement
+  # the camera made (since hobby servos have no position feedback). The
+  # difference vs the controller's commanded delta is the visual
+  # residual — emitted as the `optical_residual` event so we can A/B
+  # closed-loop work via replay tools.
+  #
+  # Stage B (gated by `optical_correction_enabled` below) feeds that
+  # residual into an integrator that biases the synth-target world-
+  # frame setpoint, closing the loop visually. Enable to A/B against
+  # the open-loop baseline. Disable while debugging Stage A.
+  optical_correction_enabled: false   # default OFF — flip true to engage
+  optical_correction_alpha: 0.3       # integrator gain per residual sample
+  optical_correction_max_deg: 8.0     # anti-windup cap on cumulative bias
+  optical_correction_min_features: 8  # below this, skip update (LK noisy)
+  optical_correction_warmup_s: 0.5    # ignore residual for first N s post
+                                      # lock — gimbal is still slewing
+
   # Software safety envelope & slew rate.
   #
   # Operator-measured mechanical envelope (2026-04-25, second cal):

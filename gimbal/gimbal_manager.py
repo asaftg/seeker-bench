@@ -542,19 +542,44 @@ class GimbalManager:
         self._synth_slew_dps: float = float(
             gcfg.get("synth_slew_dps", 25.0))
 
-        # Optical-residual trackers (Stage A: diagnostic only). One per
-        # sensor. EO is the primary source — higher resolution + more
-        # texture than thermal. Thermal is the fallback when EO loses
-        # features (e.g. low-light, target outside narrow EO FOV after
-        # a big slip). Anchors are captured at synth-lock commit; reset
-        # on track release. Per-tick measurement is emitted as the
-        # `optical_residual` event so we can A/B closed-loop work
-        # against the open-loop baseline using the existing replay
-        # infrastructure.
+        # Optical-residual trackers. One per sensor. EO is the primary
+        # source — higher resolution + more texture than thermal.
+        # Thermal is the fallback when EO loses features (e.g. low-light,
+        # target outside narrow EO FOV after a big slip). Anchors are
+        # captured at synth-lock commit; reset on track release.
+        #
+        # Stage A (always on): per-tick measurement is emitted as the
+        # `optical_residual` event. No effect on the gimbal.
+        # Stage B (gated by `optical_correction_enabled`): the residual
+        # drives an integrator that biases the synth-lock setpoint to
+        # close the loop visually. Sign convention:
+        #     residual = cmd - actual    (positive = camera fell short
+        #                                  in the commanded direction)
+        # so the correction is added to the target setpoint.
         self._opt_eo = OpticalResidualTracker(name="eo")
         self._opt_thermal = OpticalResidualTracker(name="thermal")
         self._opt_last_eo_frame_id: Optional[int] = None
         self._opt_last_thermal_frame_id: Optional[int] = None
+
+        # Stage B config + state. Default is OFF so existing behaviour
+        # is unchanged. Flip `optical_correction_enabled: true` in
+        # config/app_config.yaml to A/B against the open-loop baseline.
+        self._opt_corr_enabled: bool = bool(
+            gcfg.get("optical_correction_enabled", False))
+        self._opt_corr_alpha: float = float(
+            gcfg.get("optical_correction_alpha", 0.3))
+        self._opt_corr_max_deg: float = float(
+            gcfg.get("optical_correction_max_deg", 8.0))
+        self._opt_corr_min_features: int = int(
+            gcfg.get("optical_correction_min_features", 8))
+        self._opt_corr_warmup_s: float = float(
+            gcfg.get("optical_correction_warmup_s", 0.5))
+        # Cumulative correction applied to the synth-target world angle.
+        # Reset on lock release.
+        self._opt_corr_az: float = 0.0
+        self._opt_corr_el: float = 0.0
+        # Track which source contributed last update for the event log.
+        self._opt_corr_last_source: str = ""
 
         # Heat-track (synthetic_target / draw-target) freshness signal.
         # Same shape of bug as fused tracks had, different cause:
@@ -847,8 +872,16 @@ class GimbalManager:
                         # sensors. Best-effort — failures are silent
                         # (no cv2, frame missing, no features).
                         self._opt_capture_anchors(cur_pan, cur_tilt)
-                    target_sp_pan  = self._synth_world_az_deg
-                    target_sp_tilt = self._synth_world_el_deg
+                    # Stage B: bias the world-frame target by the
+                    # cumulative optical correction. Closes the loop
+                    # against mechanical residuals (servo backlash,
+                    # gravity creep, dead-zone) that the controller is
+                    # blind to. Zero-impact when correction is disabled
+                    # (`_opt_corr_az/_el` stay at 0.0).
+                    target_sp_pan  = (self._synth_world_az_deg
+                                      + self._opt_corr_az)
+                    target_sp_tilt = (self._synth_world_el_deg
+                                      + self._opt_corr_el)
                     # Slew dampening window. During the first
                     # _synth_slew_window_s after lock commit, cap the
                     # per-tick setpoint advance so per-frame scene
@@ -1225,6 +1258,11 @@ class GimbalManager:
             self._opt_thermal.reset()
             self._opt_last_eo_frame_id = None
             self._opt_last_thermal_frame_id = None
+            # Reset Stage B correction integrator so the next lock
+            # starts at zero bias.
+            self._opt_corr_az = 0.0
+            self._opt_corr_el = 0.0
+            self._opt_corr_last_source = ""
             # Reset alpha-beta tracker so the next engage starts
             # fresh, no stale velocity from a prior target.
             self._track_world_az = None
@@ -1375,11 +1413,86 @@ class GimbalManager:
                          tf.agc8.shape[1], tf.agc8.shape[0],
                          tf.hfov_deg, tf.vfov_deg)
 
+    def _opt_pick_best(self, eo_metrics, thermal_metrics):
+        """Choose which sensor's measurement to feed into the integrator.
+
+        EO is primary when it has enough features and isn't stale
+        (higher angular resolution at narrow FOV gives finer correction).
+        Thermal at wider FOV is the fallback when EO loses features
+        during a big slew — common when the world target shifts far
+        enough in the EO frame that LK can't track all features.
+
+        Returns (label, metrics) or (None, None) when neither is usable.
+        """
+        def _ok(m) -> bool:
+            if m is None or not m.valid:
+                return False
+            if m.n_features < self._opt_corr_min_features:
+                return False
+            if m.note == "stale":
+                return False
+            return True
+
+        if _ok(eo_metrics):
+            return "eo", eo_metrics
+        if _ok(thermal_metrics):
+            return "thermal", thermal_metrics
+        return None, None
+
+    def _opt_update_correction(self, source: str, m) -> None:
+        """Stage B integrator: cumulative correction += alpha * target_residual.
+
+        We use the **target residual** (how much further the camera
+        needs to move to land on the synth-locked world target), not
+        the metrics' "cmd vs actual" residual.
+
+            target_resid_az = (synth_world_az - anchor_pan) - daz_lk_actual
+
+        The "cmd vs actual" residual reports the SERVO error (commanded
+        but not delivered). It stays equal to the mechanical disturbance
+        even when the camera has reached the world target with a built-
+        up correction — so feeding it into the integrator would never
+        let the integrator stop growing.
+
+        target_resid goes to 0 exactly when camera lands at the world
+        target. Integrator stops growing. Anti-windup cap (±max_deg)
+        catches the case where the servo cannot physically reach the
+        target despite the cumulative bias.
+        """
+        if (self._synth_world_az_deg is None
+                or self._synth_world_el_deg is None):
+            return
+        if source == "eo":
+            anchor_pan = self._opt_eo.anchor_pan
+            anchor_tilt = self._opt_eo.anchor_tilt
+        else:
+            anchor_pan = self._opt_thermal.anchor_pan
+            anchor_tilt = self._opt_thermal.anchor_tilt
+        if anchor_pan is None or anchor_tilt is None:
+            return
+
+        required_az = self._synth_world_az_deg - anchor_pan
+        required_el = self._synth_world_el_deg - anchor_tilt
+        target_resid_az = required_az - float(m.daz_actual_deg)
+        target_resid_el = required_el - float(m.del_actual_deg)
+
+        a = self._opt_corr_alpha
+        new_az = self._opt_corr_az + a * target_resid_az
+        new_el = self._opt_corr_el + a * target_resid_el
+        cap = self._opt_corr_max_deg
+        if   new_az >  cap: new_az =  cap
+        elif new_az < -cap: new_az = -cap
+        if   new_el >  cap: new_el =  cap
+        elif new_el < -cap: new_el = -cap
+        self._opt_corr_az = new_az
+        self._opt_corr_el = new_el
+        self._opt_corr_last_source = source
+
     def _opt_measure_and_emit(self, cur_pan: float, cur_tilt: float,
                               tracked_id: Optional[int]) -> None:
-        """Measure visual residual on EO + thermal against anchors and
-        emit `optical_residual` event. No effect on the gimbal — this
-        is Stage A diagnostic only.
+        """Measure visual residual on EO + thermal against anchors,
+        update the Stage B integrator (when enabled), and emit the
+        `optical_residual` event.
 
         Skips a tick when no fresh frame has arrived for the sensor
         (matched by frame_id) — avoids reprocessing the same frame at
@@ -1411,9 +1524,26 @@ class GimbalManager:
                     vfov_deg=float(tf.vfov_deg))
         if eo_metrics is None and thermal_metrics is None:
             return
+
+        # Stage B: drive the correction integrator from the best
+        # available source. Skip during the warmup window to avoid
+        # interpreting in-progress slew as undershoot.
+        in_warmup = (self._synth_lock_t is not None
+                     and (time.time() - self._synth_lock_t)
+                         < self._opt_corr_warmup_s)
+        if self._opt_corr_enabled and not in_warmup:
+            src, picked = self._opt_pick_best(eo_metrics, thermal_metrics)
+            if picked is not None:
+                self._opt_update_correction(src, picked)
+
         payload: dict = {"tracked_heat_id": tracked_id,
                          "cur_pan": float(cur_pan),
-                         "cur_tilt": float(cur_tilt)}
+                         "cur_tilt": float(cur_tilt),
+                         "corr_enabled": self._opt_corr_enabled,
+                         "corr_az_deg": float(self._opt_corr_az),
+                         "corr_el_deg": float(self._opt_corr_el),
+                         "corr_source": self._opt_corr_last_source,
+                         "in_warmup": bool(in_warmup)}
         if eo_metrics is not None and eo_metrics.valid:
             payload["eo"] = {
                 "n_features": eo_metrics.n_features,

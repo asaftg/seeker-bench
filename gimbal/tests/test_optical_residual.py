@@ -91,3 +91,70 @@ def test_no_anchor_returns_invalid(textured_frame):
     m = t.measure(textured_frame, 0.0, 0.0)
     assert not m.valid
     assert m.note == "no_anchor"
+
+
+# ── Stage B integrator math (target-residual closed loop) ─────────
+def _simulate_integrator(world_target: float, alpha: float, cap: float,
+                         disturbance_fn, n_ticks: int = 60):
+    """Pure-math simulation of the gimbal_manager integrator. Returns
+    (final_correction, final_actual, final_residual)."""
+    correction = 0.0
+    actual = 0.0
+    residual = 0.0
+    for _ in range(n_ticks):
+        cmd = world_target + correction
+        actual = disturbance_fn(cmd)
+        residual = world_target - actual
+        new_corr = correction + alpha * residual
+        correction = max(-cap, min(cap, new_corr))
+    return correction, actual, residual
+
+
+def test_integrator_constant_offset_converges():
+    """Servo falls short by a constant 4° regardless of cmd magnitude.
+    Integrator should build correction to 4° and bring camera to target."""
+    corr, actual, resid = _simulate_integrator(
+        world_target=5.0, alpha=0.3, cap=8.0,
+        disturbance_fn=lambda cmd: cmd - 4.0)
+    assert abs(actual - 5.0) < 0.01, f"actual didn't converge to target: {actual}"
+    assert abs(corr - 4.0) < 0.01, f"correction didn't reach delta: {corr}"
+    assert abs(resid) < 0.01
+
+
+def test_integrator_proportional_undershoot_converges():
+    """Servo always delivers half the commanded motion. Correction should
+    grow until cmd*0.5 == target."""
+    corr, actual, resid = _simulate_integrator(
+        world_target=5.0, alpha=0.3, cap=20.0,
+        disturbance_fn=lambda cmd: cmd * 0.5,
+        n_ticks=200)
+    assert abs(actual - 5.0) < 0.05, f"actual didn't converge: {actual}"
+    assert abs(corr - 5.0) < 0.05
+
+
+def test_integrator_anti_windup_when_servo_unreachable():
+    """Disturbance larger than cap means camera cannot reach target.
+    Correction must clip at ±cap and not blow up."""
+    corr, actual, resid = _simulate_integrator(
+        world_target=5.0, alpha=0.3, cap=8.0,
+        disturbance_fn=lambda cmd: cmd - 12.0)
+    assert abs(corr - 8.0) < 0.01, f"correction didn't clip at cap: {corr}"
+    # Camera at cmd - 12 = (5+8) - 12 = 1. Not at target, but stable.
+    assert abs(actual - 1.0) < 0.01
+
+
+def test_integrator_no_oscillation_at_steady_state():
+    """Once converged, correction should hold steady (no jitter)."""
+    correction = 0.0
+    world_target = 2.0
+    alpha = 0.3
+    delta = 2.0
+    history = []
+    for _ in range(100):
+        cmd = world_target + correction
+        actual = cmd - delta
+        residual = world_target - actual
+        correction = max(-8.0, min(8.0, correction + alpha * residual))
+        history.append(correction)
+    last5_range = max(history[-5:]) - min(history[-5:])
+    assert last5_range < 0.001, f"oscillation in last 5 ticks: {last5_range}"

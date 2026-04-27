@@ -121,6 +121,14 @@ class OpticalResidualTracker:
     def has_anchor(self) -> bool:
         return self._anchor is not None
 
+    @property
+    def anchor_pan(self) -> Optional[float]:
+        return self._anchor.pan if self._anchor is not None else None
+
+    @property
+    def anchor_tilt(self) -> Optional[float]:
+        return self._anchor.tilt if self._anchor is not None else None
+
     def reset(self) -> None:
         self._anchor = None
         self._prev_gray = None
