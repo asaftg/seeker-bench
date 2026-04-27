@@ -68,24 +68,30 @@ thermal:
     # up out of the lower half of the histogram where they otherwise
     # sit after the percentile stretch.
     gamma: 0.90
-    # Bilateral denoise on the 8-bit display image. d=5, sigma_color=15,
-    # sigma_space=15 is a "polish" setting — knocks out fine grain
+    # Bilateral denoise on the 8-bit display image. d=3, sigma_color=10,
+    # sigma_space=10 is a "polish" setting — knocks out fine grain
     # without softening the edges of vehicle silhouettes / human
-    # outlines that the operator is trying to read. Larger sigmas blur
-    # real detail; do NOT bump these without comparing against a
-    # recording first.
+    # outlines that the operator is trying to read. Tightened from
+    # the initial d=5/15/15 (2026-04-27) after offline comparison
+    # against a JPEG'd recording showed the larger kernel was eating
+    # into legitimate detail; on live raw16 from the Boson the larger
+    # kernel was fine, but on a recorded JPEG it visibly softened the
+    # frame. d=3 stays useful on both. Larger sigmas blur real detail;
+    # do NOT bump these without comparing against a recording first.
     bilateral_denoise:
       enabled: true
-      d: 5
-      sigma_color: 15.0
-      sigma_space: 15.0
-    # Unsharp mask. amount=0.30 is conservative — on a Boson 640 frame
-    # that's been bilateral-denoised, this brings back the perceived
-    # edge crispness lost to the denoise without ringing on
-    # high-contrast edges. radius=1.0 keeps the halo invisible.
+      d: 3
+      sigma_color: 10.0
+      sigma_space: 10.0
+    # Unsharp mask. amount=0.50 counteracts the bilateral above and
+    # then a touch more — produces a visibly crisper edge on vehicle
+    # silhouettes / human outlines. radius=1.0 keeps the halo invisible.
+    # If the AFTER image looks "etched" (light/dark stripes parallel
+    # to a bright edge) drop amount to 0.30; if it looks soft, bump
+    # to 0.7 — but pair with a higher-res zoom to verify.
     unsharp_mask:
       enabled: true
-      amount: 0.30
+      amount: 0.50
       radius: 1.0
 
   # Digital zoom presets (emulated narrow FOV)
