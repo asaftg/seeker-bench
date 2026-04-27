@@ -490,11 +490,6 @@ class FusionManager:
                 trk["el"]    = a * trk["el"]    + (1 - a) * c["el"]
                 trk["ang_w"] = a * trk["ang_w"] + (1 - a) * c["ang_w"]
                 trk["ang_h"] = a * trk["ang_h"] + (1 - a) * c["ang_h"]
-                # Stamp the gimbal pose at this update so the next
-                # tick's matcher can compensate the track's camera-az
-                # for any gimbal motion that happens before the next
-                # observation arrives.
-                trk["pose_at_update"] = (cur_pan, cur_tilt)
                 # Class promotion: a radar-born track stays RADAR_TARGET
                 # until an EO/thermal observation joins, at which point
                 # we lock in the real class. Once locked, never overwrite
@@ -535,9 +530,6 @@ class FusionManager:
                     "primary": c["primary"],
                     "conf": c["conf"],
                     "hits": 1, "misses": 0,
-                    # Pose at birth — used by next tick's matcher to
-                    # gimbal-compensate the track's camera-az.
-                    "pose_at_update": (cur_pan, cur_tilt),
                 })
                 try:
                     from common.events import emit as _emit
