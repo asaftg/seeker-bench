@@ -615,6 +615,32 @@ class GimbalManager:
         # bbox at the target's true image position.
         self._latest_target_resid_az: Optional[float] = None
         self._latest_target_resid_el: Optional[float] = None
+
+        # Fused-track unified control law. Default True (per operator
+        # ask: same algorithm for static and dynamic targets). The
+        # fused-track tick branch uses the same closed-loop pixel-error
+        # proportional control as the real-heat-blob path (`fresh_heat`
+        # branch in `_tick`):
+        #     d_pan  = smooth_proportional(trk.az_deg)
+        #     d_tilt = smooth_proportional(trk.el_deg)
+        # Setpoint = cur_pan + d_pan, cur_tilt + d_tilt.
+        # For static targets, az/el converges to 0 as the camera
+        # centres → setpoint stops moving → identical end-state to
+        # the synth-lock manual-BB path. For moving targets, every
+        # fresh fused observation refreshes az/el and the loop
+        # corrects toward the new position. No mode switching, no
+        # velocity-based gating.
+        # The alpha-beta predictor (track_predictor) still runs in
+        # parallel for diagnostics and replay parity, but its
+        # lookahead output (`world + lead_time*world_dot`) is no
+        # longer fed to the controller in this mode. Lookahead helps
+        # only for very fast targets (relative to gimbal latency)
+        # and contributes lead-time*velocity-noise on slower ones —
+        # the noise is what made TRACK feel less stable than the
+        # manual BB.
+        # Set to False to use the legacy predictor-driven setpoint.
+        self._fused_closed_loop: bool = bool(
+            gcfg.get("fused_track_closed_loop", True))
         # Cumulative correction applied to the synth-target world angle.
         # Reset on lock release.
         self._opt_corr_az: float = 0.0
@@ -1161,6 +1187,49 @@ class GimbalManager:
                     fresh_fused=fresh_fused,
                     params=params,
                 )
+
+                # Closed-loop pixel-error control law (operator ask:
+                # same algorithm for static and dynamic targets, no
+                # velocity-based mode switching). Mirrors the
+                # real-heat-blob path: smooth proportional gain on the
+                # fused track's camera-frame az/el, soft deadband
+                # around image centre, low-pass error filter, per-tick
+                # max-step cap. Active when `fused_track_closed_loop`
+                # is true (default). The predictor still runs above
+                # for diagnostics; we just override its sp output here.
+                if self._fused_closed_loop and self._cameras_on_gimbal:
+                    if fresh_fused:
+                        az_in, el_in = self._lp_filter_error(
+                            float(trk.az_deg), float(trk.el_deg))
+                        kp_eff = self._kp_track
+                        d_pan_cl = _smooth_proportional(
+                            az_in, kp_eff,
+                            self._track_zero_band_deg,
+                            self._track_full_band_deg)
+                        d_tilt_cl = _smooth_proportional(
+                            el_in, kp_eff,
+                            self._track_zero_band_deg,
+                            self._track_full_band_deg)
+                        if abs(d_pan_cl)  < self._track_min_step_deg:
+                            d_pan_cl  = 0.0
+                        if abs(d_tilt_cl) < self._track_min_step_deg:
+                            d_tilt_cl = 0.0
+                        d_pan_cl  = _clip(d_pan_cl,  self._max_step_deg)
+                        d_tilt_cl = _clip(d_tilt_cl, self._max_step_deg)
+                        d_tilt_cl, _tilt_sat_cl = _pan_only_if_tilt_saturated(
+                            cur_tilt, d_tilt_cl,
+                            self._tilt_floor, self._tilt_ceil,
+                            self._tilt_sat_eps_deg)
+                        sp_pan_pred  = cur_pan  + d_pan_cl
+                        sp_tilt_pred = cur_tilt + d_tilt_cl
+                    else:
+                        # Stale tick — hold the previous setpoint so
+                        # the gimbal finishes its in-flight motion
+                        # rather than re-applying gain on stale data.
+                        if (self._last_sp_pan is not None
+                                and self._last_sp_tilt is not None):
+                            sp_pan_pred  = self._last_sp_pan
+                            sp_tilt_pred = self._last_sp_tilt
                 # Clip sp_tilt at the saturated edge. Without this the
                 # controller still clamps, but the predictor's "last
                 # setpoint" memory carries an out-of-range value.

@@ -178,11 +178,17 @@ class FusionState:
 
     def step(self, candidates: List[Dict[str, Any]],
              cur_pan: float, cur_tilt: float
-             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Run one fusion tick. Returns (births, deaths) — events that would
-        have been emitted live."""
+             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                        List[int]]:
+        """Run one fusion tick. Returns (births, deaths, matched_ids).
+
+        matched_ids = the list of track ids that received an observation
+        this tick (used by the lifespan analyzer to count observations
+        per track).
+        """
         n_existing = len(self.tracks)
         matched = [False] * n_existing
+        matched_ids: List[int] = []
         births: List[Dict[str, Any]] = []
         for c in candidates:
             best_i, best_iou = -1, 0.0
@@ -219,6 +225,7 @@ class FusionState:
                 trk["hits"] += 1
                 trk["misses"] = 0
                 matched[best_i] = True
+                matched_ids.append(int(trk["id"]))
             else:
                 new_track = {
                     "id": self.next_id,
@@ -265,7 +272,7 @@ class FusionState:
                         "reason": "max_misses",
                     })
         self.tracks = kept
-        return births, deaths
+        return births, deaths, matched_ids
 
 
 @dataclass
@@ -284,7 +291,8 @@ class WorldFrameFusionState(FusionState):
 
     def step(self, candidates: List[Dict[str, Any]],
              cur_pan: float, cur_tilt: float
-             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                        List[int]]:
         # Convert candidates camera-frame az/el → world-frame az/el
         world_cands = []
         for c in candidates:
@@ -483,6 +491,9 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
     rec_deaths: List[Tuple[float, Dict[str, Any]]] = []
     sim_births: List[Tuple[float, Dict[str, Any]]] = []
     sim_deaths: List[Tuple[float, Dict[str, Any]]] = []
+    # Per-id lifespan accumulator: id -> dict(birth_t, death_t, n_obs,
+    # birth_class, primary, born_az, born_el)
+    sim_lives: Dict[int, Dict[str, Any]] = {}
     rate_hz = 15.0
     state = None
 
@@ -558,17 +569,88 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
             cands = cross_sensor_associate(thermal_obs, eo_obs,
                                             radar_obs_list, radar_iou_gate)
             cands = dedup_candidates(cands)
-            births, deaths = state.step(cands, latest_pan, latest_tilt)
+            births, deaths, matched_ids = state.step(cands, latest_pan, latest_tilt)
             state.tracks = merge_overlapping_tracks(state.tracks)
             for b in births:
                 sim_births.append((next_fusion_t, b))
+                sim_lives[int(b["id"])] = {
+                    "birth_t": float(next_fusion_t),
+                    "death_t": None,
+                    "n_obs": 1,
+                    "class": b.get("class"),
+                    "primary": b.get("primary"),
+                    "born_az": b.get("az"),
+                    "born_el": b.get("el"),
+                }
             for d in deaths:
                 sim_deaths.append((next_fusion_t, d))
+                if int(d["id"]) in sim_lives:
+                    sim_lives[int(d["id"])]["death_t"] = float(next_fusion_t)
+            for tid in matched_ids:
+                if tid in sim_lives:
+                    sim_lives[tid]["n_obs"] += 1
             next_fusion_t += fusion_dt
 
     # Print summary
     print(f"\nrecorded births: {len(rec_births)}, deaths: {len(rec_deaths)}")
     print(f"simulated births: {len(sim_births)}, deaths: {len(sim_deaths)}")
+
+    # ── Per-track lifespan summary ──
+    # Close any tracks that never died (still alive at end of recording)
+    if state and state.tracks:
+        for trk in state.tracks:
+            tid = int(trk["id"])
+            if tid in sim_lives and sim_lives[tid]["death_t"] is None:
+                sim_lives[tid]["death_t"] = float(next_fusion_t or 0.0)
+
+    if sim_lives:
+        # Compute lifespan for each track
+        lifespans = []
+        for tid, info in sim_lives.items():
+            bt = info["birth_t"]
+            dt = info["death_t"] if info["death_t"] is not None else bt
+            life_s = dt - bt
+            lifespans.append((tid, life_s, info["n_obs"], info["class"],
+                              info["primary"]))
+        lifespans.sort(key=lambda x: -x[1])  # longest first
+
+        # Aggregate stats
+        total = len(lifespans)
+        life_values = [l[1] for l in lifespans]
+        n_obs_values = [l[2] for l in lifespans]
+        long_lived = [l for l in lifespans if l[1] >= 1.0]  # >= 1s alive
+        orphan = [l for l in lifespans if l[2] <= 1]  # born and died alone
+
+        def _stats(xs: List[float]) -> Dict[str, float]:
+            if not xs:
+                return {"min": 0.0, "median": 0.0, "mean": 0.0, "max": 0.0}
+            xs2 = sorted(xs)
+            return {
+                "min": xs2[0],
+                "median": xs2[len(xs2) // 2],
+                "mean": sum(xs2) / len(xs2),
+                "max": xs2[-1],
+            }
+
+        ls = _stats(life_values)
+        os = _stats(n_obs_values)
+        print(f"\n== PER-TRACK LIFESPAN SUMMARY ==")
+        print(f"  total tracks                  : {total}")
+        print(f"  long-lived (>= 1.0 s alive)   : {len(long_lived)}  "
+              f"({100*len(long_lived)/max(total,1):.1f}%)")
+        print(f"  orphan (1 obs, died next tick): {len(orphan)}  "
+              f"({100*len(orphan)/max(total,1):.1f}%)")
+        print(f"  lifespan_s   min/median/mean/max: "
+              f"{ls['min']:.2f} / {ls['median']:.2f} / "
+              f"{ls['mean']:.2f} / {ls['max']:.2f}")
+        print(f"  n_obs        min/median/mean/max: "
+              f"{os['min']:.0f} / {os['median']:.0f} / "
+              f"{os['mean']:.1f} / {os['max']:.0f}")
+        print(f"\n  Top 8 longest-lived tracks:")
+        print(f"  {'id':>4} {'lifespan_s':>11} {'n_obs':>6} {'class':>14} {'primary':>8}")
+        for tid, life_s, n_obs, cls, primary in lifespans[:8]:
+            print(f"  {tid:>4} {life_s:>11.2f} {n_obs:>6} "
+                  f"{str(cls):>14} {str(primary):>8}")
 
     if out_csv:
         with open(out_csv, "w", newline="", encoding="utf-8") as f:

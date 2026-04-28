@@ -669,6 +669,19 @@ gimbal:
   stuck_servo_residual_frac: 0.7          # >70 % of slew not delivered = stuck
   stuck_servo_consec_threshold: 8         # ~1.5 s at 6 Hz LK rate
 
+  # Fused-track unified control law. When true (default), the TRACK
+  # button uses the same closed-loop pixel-error proportional control
+  # as the heat-blob path — `d_pan = kp * trk.az_deg`, `d_tilt = kp *
+  # trk.el_deg`, soft deadband + max-step cap, low-pass error filter.
+  # No velocity-based mode switching; same algorithm whether the
+  # target is static or moving (per-operator ask 2026-04-27). The
+  # alpha-beta predictor still runs in parallel for diagnostics +
+  # replay parity but its lookahead output isn't fed to the
+  # controller in this mode (it added noise on static targets that
+  # made TRACK feel less stable than the synth lock).
+  # Set false to use the legacy predictor-driven setpoint.
+  fused_track_closed_loop: true
+
   # Software safety envelope & slew rate.
   #
   # Operator-measured mechanical envelope (2026-04-25, second cal):
