@@ -303,6 +303,31 @@ class WorldFrameFusionState(FusionState):
         return super().step(world_cands, cur_pan, cur_tilt)
 
 
+@dataclass
+class WorldFrameCaptureFusionState(FusionState):
+    """Same as WorldFrameFusionState but uses per-candidate
+    SENSOR-FRAME-CAPTURE-TIME pose instead of fusion-tick pose.
+
+    This is the offline simulation of the 2a16649 timing-offset fix.
+    Candidates carry `_pan_at` / `_tilt_at` set by the driver from
+    a pose-history lookup against the source frame's timestamp.
+    """
+
+    def step(self, candidates: List[Dict[str, Any]],
+             cur_pan: float, cur_tilt: float
+             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                        List[int]]:
+        world_cands = []
+        for c in candidates:
+            wc = dict(c)
+            pan_at = float(c.get("_pan_at", cur_pan))
+            tilt_at = float(c.get("_tilt_at", cur_tilt))
+            wc["az"] = c["az"] + pan_at
+            wc["el"] = c["el"] + tilt_at
+            world_cands.append(wc)
+        return super().step(world_cands, cur_pan, cur_tilt)
+
+
 def _class_compat(a: str, b: str) -> bool:
     if a == b:
         return True
@@ -486,6 +511,31 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
     latest_radar = None
     latest_pan = 0.0
     latest_tilt = 0.0
+    # Per-sensor capture-time bookkeeping for the world-frame-capture
+    # variant: when a sensor frame arrives, record its rel-time `t`
+    # alongside the gimbal pose at that moment, so the offline matcher
+    # can convert each observation with the pose from when its source
+    # frame was actually captured.
+    latest_thermal_ts = 0.0
+    latest_eo_ts = 0.0
+    latest_radar_ts = 0.0
+    pose_history: List[Tuple[float, float, float]] = []
+    POSE_HISTORY_MAX = 60   # ~2 s at 30 Hz gimbal/state
+    POSE_HISTORY_MAX_AGE_S = 2.0
+
+    def _pose_at(ts: float) -> Tuple[float, float]:
+        if not pose_history or ts <= 0.0:
+            return (latest_pan, latest_tilt)
+        latest_t = pose_history[-1][0]
+        if latest_t - ts > POSE_HISTORY_MAX_AGE_S:
+            return (latest_pan, latest_tilt)
+        best = pose_history[0]
+        best_dt = abs(best[0] - ts)
+        for entry in pose_history:
+            dt = abs(entry[0] - ts)
+            if dt < best_dt:
+                best_dt, best = dt, entry
+        return (best[1], best[2])
 
     rec_births: List[Tuple[float, Dict[str, Any]]] = []
     rec_deaths: List[Tuple[float, Dict[str, Any]]] = []
@@ -520,7 +570,12 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
             radar_az = float(rcfg.get("az_bias_deg", 0.0))
             radar_el = float(rcfg.get("el_bias_deg", 0.0))
             rate_hz = float(fcfg.get("rate_hz", 15.0))
-            cls = WorldFrameFusionState if variant == "world-frame" else FusionState
+            if variant == "world-frame-capture":
+                cls = WorldFrameCaptureFusionState
+            elif variant == "world-frame":
+                cls = WorldFrameFusionState
+            else:
+                cls = FusionState
             state = cls(
                 max_misses=int(fcfg.get("max_misses", 30)),
                 sensor_grace_ticks=int(fcfg.get("sensor_grace_ticks", 5)),
@@ -534,7 +589,12 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
 
         if state is None:
             # No header yet; assume defaults.
-            cls = WorldFrameFusionState if variant == "world-frame" else FusionState
+            if variant == "world-frame-capture":
+                cls = WorldFrameCaptureFusionState
+            elif variant == "world-frame":
+                cls = WorldFrameFusionState
+            else:
+                cls = FusionState
             state = cls(max_misses=30, sensor_grace_ticks=5)
 
         if ch == "events":
@@ -548,13 +608,19 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
 
         if ch == "thermal/frame":
             latest_thermal = msg
+            latest_thermal_ts = t
         elif ch == "eo/frame":
             latest_eo = msg
+            latest_eo_ts = t
         elif ch == "radar/frame":
             latest_radar = msg
+            latest_radar_ts = t
         elif ch == "gimbal/state":
             latest_pan = float(msg.get("pan_deg") or 0.0)
             latest_tilt = float(msg.get("tilt_deg") or 0.0)
+            pose_history.append((t, latest_pan, latest_tilt))
+            if len(pose_history) > POSE_HISTORY_MAX:
+                pose_history.pop(0)
 
         # Run a fusion tick at rate_hz.
         if next_fusion_t is None:
@@ -569,6 +635,22 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
             cands = cross_sensor_associate(thermal_obs, eo_obs,
                                             radar_obs_list, radar_iou_gate)
             cands = dedup_candidates(cands)
+            # For the world-frame-capture variant: tag each candidate
+            # with the gimbal pose at its source frame's capture time
+            # (looked up from pose_history). The matcher uses these
+            # rather than the fusion-tick pose snapshot.
+            if variant == "world-frame-capture":
+                for c in cands:
+                    p = c.get("primary")
+                    if p == "thermal":
+                        ts = latest_thermal_ts
+                    elif p == "radar":
+                        ts = latest_radar_ts
+                    else:
+                        ts = latest_eo_ts
+                    pan_at, tilt_at = _pose_at(ts)
+                    c["_pan_at"] = pan_at
+                    c["_tilt_at"] = tilt_at
             births, deaths, matched_ids = state.step(cands, latest_pan, latest_tilt)
             state.tracks = merge_overlapping_tracks(state.tracks)
             for b in births:
@@ -684,7 +766,8 @@ def main() -> int:
     ap.add_argument("--recording", "-r", required=True,
                     help="JSONL recording path")
     ap.add_argument("--variant", default="camera-frame",
-                    choices=("camera-frame", "world-frame"),
+                    choices=("camera-frame", "world-frame",
+                             "world-frame-capture"),
                     help="Matcher variant (default camera-frame for parity)")
     ap.add_argument("--out", default=None, help="CSV output path")
     args = ap.parse_args()
