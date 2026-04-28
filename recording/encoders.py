@@ -218,6 +218,17 @@ def encode_gimbal(gs: Optional[GimbalState]) -> Optional[Dict[str, Any]]:
         "target_tilt_deg": float(gs.target_tilt_deg),
         "tracked_target_id": gs.tracked_target_id,
         "error": gs.error,
+        # Synth lock + LK-corrected target residual (added 2026-04-27
+        # for the BB-drift fix; sensor_bridge uses these to render the
+        # synth bbox at the world target's actual image position).
+        "synth_world_az_deg": (None if gs.synth_world_az_deg is None
+                                else float(gs.synth_world_az_deg)),
+        "synth_world_el_deg": (None if gs.synth_world_el_deg is None
+                                else float(gs.synth_world_el_deg)),
+        "target_resid_az_deg": (None if gs.target_resid_az_deg is None
+                                 else float(gs.target_resid_az_deg)),
+        "target_resid_el_deg": (None if gs.target_resid_el_deg is None
+                                 else float(gs.target_resid_el_deg)),
     }
 
 

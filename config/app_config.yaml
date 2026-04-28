@@ -654,6 +654,21 @@ gimbal:
   optical_correction_step_max_deg: 0.08  # per-tick cap on integrator change
   optical_correction_settled_deg: 0.3    # only update when |cur - cmd| < this
 
+  # Stuck-servo safety: when a synth lock has been active for several
+  # seconds and the LK-measured camera motion is nowhere near what was
+  # commanded, release the servos to float (PWM=0) so we don't keep
+  # PWM-pumping a stalled motor. Triggers on:
+  #   - synth lock active for >= warmup_s
+  #   - |required slew| >= required_min_deg on either axis
+  #   - actual LK motion < (1 - residual_frac) * |required|
+  #   - condition holds for consec_threshold consecutive samples
+  stuck_servo_protection: true            # master kill switch
+  stuck_servo_warmup_s: 3.0               # don't trigger before this many s
+                                           # post-lock (gimbal still slewing)
+  stuck_servo_required_min_deg: 2.0       # only check on slews larger than this
+  stuck_servo_residual_frac: 0.7          # >70 % of slew not delivered = stuck
+  stuck_servo_consec_threshold: 8         # ~1.5 s at 6 Hz LK rate
+
   # Software safety envelope & slew rate.
   #
   # Operator-measured mechanical envelope (2026-04-25, second cal):
@@ -671,6 +686,11 @@ gimbal:
     pan_max_deg:  45.0
     tilt_min_deg:  0.0
     tilt_max_deg: 90.0
+    # 2026-04-27 test (recordings/diag_slew500_high_tilt.jsonl): bumped
+    # both to 500 dps and the camera moved LESS, not more (3% effective
+    # vs 79% with the conservative values). Conclusion: the slow ramp
+    # of small per-tick PWM steps is what lets the analog servo
+    # actually track. Reverted to known-good defaults.
     pan_slew_deg_per_s:  120.0
     tilt_slew_deg_per_s:  60.0
 

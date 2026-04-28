@@ -347,3 +347,20 @@ class GimbalState:
     target_tilt_deg: float = 0.0
     tracked_target_id: Optional[int] = None
     error: Optional[str] = None   # last error string, or None
+    # Synthetic-target world-frame lock (None when no synth lock is
+    # active). When set, the GUI/sensor_bridge can compute the
+    # synthetic bbox image position directly from these world angles
+    # plus the current gimbal pose, bypassing the OF tracker — which
+    # is what the bbox-drift fix relies on. Captured once at synth
+    # lock commit and held until track release.
+    synth_world_az_deg: Optional[float] = None
+    synth_world_el_deg: Optional[float] = None
+    # Where the synth-locked world target *actually* appears in the
+    # camera frame right now, in degrees off boresight. Computed from
+    # the LK-measured camera motion since the synth anchor (so it
+    # reflects PHYSICAL pose, not the controller's commanded pose
+    # which can lie when the servo isn't following). sensor_bridge
+    # uses these to position the synthetic bbox in the WS payload.
+    # None when no LK measurement is available.
+    target_resid_az_deg: Optional[float] = None
+    target_resid_el_deg: Optional[float] = None

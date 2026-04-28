@@ -18,11 +18,23 @@ from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalF
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
-def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
+def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
+                    gstate: Optional[GimbalState] = None) -> Dict[str, Any]:
     """Serialize a ThermalFrame for the WebSocket.
 
     When `tf is None` OR `tf.connected is False`, the wire frame
     signals a disconnected state with no image payload.
+
+    When ``gstate`` carries a synthetic-target world-frame lock
+    (``synth_world_az_deg / _el_deg`` set), synthetic heat-track bboxes
+    are repositioned each frame to where the locked world target
+    *should* appear in the thermal image, given the current gimbal
+    pose and the frame's FOV. This bypasses the synth ``_Track``'s
+    optical-flow propagation (which is unreliable on low-texture
+    thermal scenes — observed live in thermal_test3.jsonl where the
+    bbox drifted 100+ px off the target after slew completed). With
+    the world-angle override, the bbox stays planted on the world
+    target as long as the gimbal pose readout is correct.
     """
     if tf is None or not tf.connected:
         return {
@@ -73,17 +85,61 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80) -> Dict[
     # Dev-mode heat-blob tracker snapshot. The GUI filters on its own
     # devMode flag; we always send it so toggling dev-mode is a pure
     # client-side operation (no round-trip).
+    #
+    # Synthetic-target bbox override: if the gimbal has a synth world-
+    # frame lock active, recompute the synth track's bbox image
+    # position from the locked world angles + current gimbal pose +
+    # frame FOV. This kills the OF-propagation drift that operators
+    # see when thermal texture is low.
+    synth_world_az = synth_world_el = None
+    target_resid_az = target_resid_el = None
+    cur_pan = cur_tilt = 0.0
+    if isinstance(gstate, GimbalState):
+        synth_world_az = gstate.synth_world_az_deg
+        synth_world_el = gstate.synth_world_el_deg
+        target_resid_az = gstate.target_resid_az_deg
+        target_resid_el = gstate.target_resid_el_deg
+        cur_pan = float(gstate.pan_deg)
+        cur_tilt = float(gstate.tilt_deg)
+    have_synth_lock = (synth_world_az is not None
+                       and synth_world_el is not None
+                       and w > 0 and h > 0
+                       and tf.hfov_deg > 0 and tf.vfov_deg > 0)
+    # When LK has a fresh measurement of where the world target really
+    # is in the current camera frame (target_resid_*_deg), use that —
+    # it reflects the camera's PHYSICAL pose, not the controller's
+    # commanded pose which can lie when the servo isn't following.
+    # Fall back to the SW-pose computation when LK isn't available.
+    use_lk_residual = (have_synth_lock
+                       and target_resid_az is not None
+                       and target_resid_el is not None)
+
     heat_tracks = []
     for ht in getattr(tf, "heat_tracks", None) or []:
+        is_synth = bool(getattr(ht, "synthetic", False))
+        bx, by, bw, bh = ht.bbox.x, ht.bbox.y, ht.bbox.w, ht.bbox.h
+        if is_synth and have_synth_lock:
+            if use_lk_residual:
+                iaz = float(target_resid_az)
+                iel = float(target_resid_el)
+            else:
+                iaz = synth_world_az - cur_pan
+                iel = synth_world_el - cur_tilt
+            nx = iaz / float(tf.hfov_deg) + 0.5
+            ny = -iel / float(tf.vfov_deg) + 0.5
+            cx = nx * w
+            cy = ny * h
+            bx = int(round(cx - bw / 2.0))
+            by = int(round(cy - bh / 2.0))
         heat_tracks.append({
             "id": int(ht.id),
-            "bbox": {"x": ht.bbox.x, "y": ht.bbox.y, "w": ht.bbox.w, "h": ht.bbox.h},
+            "bbox": {"x": bx, "y": by, "w": int(bw), "h": int(bh)},
             "hits": int(ht.hits),
             "misses": int(ht.misses),
             "age": int(ht.age),
             "confirmed": bool(ht.confirmed),
             "coasting": bool(ht.coasting),
-            "synthetic": bool(getattr(ht, "synthetic", False)),
+            "synthetic": is_synth,
         })
 
     return {
@@ -521,7 +577,8 @@ def build_ws_message(
     eo_q = int(eo_jpeg_quality) if eo_jpeg_quality is not None else int(jpeg_quality)
     return {
         "ts": time.time(),
-        "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality),
+        "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality,
+                                   gstate=gstate),
         "eo": eo_to_wire(ef, jpeg_quality=eo_q),
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,

@@ -586,6 +586,35 @@ class GimbalManager:
         # in-progress slew motion as undershoot.
         self._opt_corr_settled_deg: float = float(
             gcfg.get("optical_correction_settled_deg", 0.7))
+
+        # Stuck-servo safety. When a synth lock is active and the LK-
+        # measured camera motion stays well below the commanded delta
+        # for several seconds, the servo isn't physically responding
+        # (operator hypothesis: PSU sag under simultaneous pan+tilt
+        # load + servo internal current limit). In that state our SW
+        # keeps issuing PWM commands the servo can't follow, which
+        # could damage the servo. Release the servos to float and
+        # clear the lock, emitting `servo_stuck` so the operator
+        # sees what happened.
+        self._stuck_enabled: bool = bool(
+            gcfg.get("stuck_servo_protection", True))
+        self._stuck_warmup_s: float = float(
+            gcfg.get("stuck_servo_warmup_s", 3.0))
+        self._stuck_required_min_deg: float = float(
+            gcfg.get("stuck_servo_required_min_deg", 2.0))
+        self._stuck_residual_frac: float = float(
+            gcfg.get("stuck_servo_residual_frac", 0.7))
+        self._stuck_consec_threshold: int = int(
+            gcfg.get("stuck_servo_consec_threshold", 8))
+        self._stuck_consec: int = 0
+        self._stuck_released: bool = False
+
+        # Cache the latest target-residual (where the world target
+        # actually is in the current camera frame, per LK). Published
+        # in GimbalState so sensor_bridge can render the synthetic
+        # bbox at the target's true image position.
+        self._latest_target_resid_az: Optional[float] = None
+        self._latest_target_resid_el: Optional[float] = None
         # Cumulative correction applied to the synth-target world angle.
         # Reset on lock release.
         self._opt_corr_az: float = 0.0
@@ -1277,6 +1306,12 @@ class GimbalManager:
             self._opt_corr_az = 0.0
             self._opt_corr_el = 0.0
             self._opt_corr_last_source = ""
+            # Reset stuck-servo guard counters on lock release.
+            self._stuck_consec = 0
+            self._stuck_released = False
+            # Clear cached target residual.
+            self._latest_target_resid_az = None
+            self._latest_target_resid_el = None
             # Reset alpha-beta tracker so the next engage starts
             # fresh, no stale velocity from a prior target.
             self._track_world_az = None
@@ -1344,6 +1379,10 @@ class GimbalManager:
             target_tilt_deg=sp_tilt,
             tracked_target_id=published_track,
             error=err,
+            synth_world_az_deg=self._synth_world_az_deg,
+            synth_world_el_deg=self._synth_world_el_deg,
+            target_resid_az_deg=self._latest_target_resid_az,
+            target_resid_el_deg=self._latest_target_resid_el,
         )
         BUS.publish(Topic.GIMBAL, state)
 
@@ -1426,6 +1465,91 @@ class GimbalManager:
                 log.info("Optical anchor (thermal) captured: %dx%d hfov=%.1f vfov=%.1f",
                          tf.agc8.shape[1], tf.agc8.shape[0],
                          tf.hfov_deg, tf.vfov_deg)
+
+    def _check_stuck_servo(self, source: str, m) -> None:
+        """Detect when a commanded slew isn't being delivered by the
+        servo (LK-measured actual motion stays well below required for
+        several consecutive samples post-warmup) and release the
+        servos to float so we don't keep pushing PWM at a stuck servo.
+
+        Operator-driven safety per 2026-04-27 session: at high tilt the
+        camera physically wasn't following commands (recordings/
+        diag_high_tilt_tree.jsonl, BB#3: cmd -5.9 deg pan -4.5 deg tilt,
+        actual -0.08 deg / 0.02 deg). Without this guard our SW would
+        keep commanding and potentially overheat or damage the servo.
+        """
+        if not self._stuck_enabled:
+            return
+        if (self._synth_world_az_deg is None
+                or self._synth_world_el_deg is None
+                or self._synth_lock_t is None):
+            return
+        elapsed = time.time() - self._synth_lock_t
+        if elapsed < self._stuck_warmup_s:
+            return
+        if source == "eo":
+            anchor_pan = self._opt_eo.anchor_pan
+            anchor_tilt = self._opt_eo.anchor_tilt
+        else:
+            anchor_pan = self._opt_thermal.anchor_pan
+            anchor_tilt = self._opt_thermal.anchor_tilt
+        if anchor_pan is None or anchor_tilt is None:
+            return
+        required_az = self._synth_world_az_deg - anchor_pan
+        required_el = self._synth_world_el_deg - anchor_tilt
+        # actual = LK-measured motion since anchor
+        actual_az = float(m.daz_actual_deg)
+        actual_el = float(m.del_actual_deg)
+        # "Stuck" on an axis = required > min AND actual delivered
+        # less than (1 - residual_frac) * required, i.e. we asked for
+        # a real slew but most of it didn't happen.
+        stuck_pan = (abs(required_az) >= self._stuck_required_min_deg
+                     and (abs(actual_az) <
+                          (1.0 - self._stuck_residual_frac)
+                          * abs(required_az)))
+        stuck_tilt = (abs(required_el) >= self._stuck_required_min_deg
+                      and (abs(actual_el) <
+                           (1.0 - self._stuck_residual_frac)
+                           * abs(required_el)))
+        if stuck_pan or stuck_tilt:
+            self._stuck_consec += 1
+        else:
+            self._stuck_consec = 0
+            return
+        if self._stuck_consec < self._stuck_consec_threshold:
+            return
+        # Stuck condition confirmed. Release the servos to float (PWM=0)
+        # and clear the synth lock so the gimbal stops trying.
+        if self._stuck_released:
+            return  # already released for this lock cycle
+        self._stuck_released = True
+        log.warning("SERVO STUCK detected — required=(%.2f, %.2f) "
+                    "actual=(%.2f, %.2f) source=%s elapsed=%.1fs — "
+                    "releasing servos + clearing synth lock",
+                    required_az, required_el,
+                    actual_az, actual_el, source, elapsed)
+        try:
+            emit_event("servo_stuck", {
+                "source": source,
+                "elapsed_s": float(elapsed),
+                "required_az_deg": float(required_az),
+                "required_el_deg": float(required_el),
+                "actual_az_deg": float(actual_az),
+                "actual_el_deg": float(actual_el),
+                "stuck_pan": bool(stuck_pan),
+                "stuck_tilt": bool(stuck_tilt),
+            })
+        except Exception:
+            pass
+        try:
+            self._driver.release_all([self._pan_cal.channel,
+                                       self._tilt_cal.channel])
+        except Exception as e:
+            log.warning("release_all failed: %s", e)
+        # Clear synth lock so subsequent ticks don't re-engage.
+        self._synth_world_az_deg = None
+        self._synth_world_el_deg = None
+        self._tracked_heat_id = None
 
     def _opt_pick_best(self, eo_metrics, thermal_metrics):
         """Choose which sensor's measurement to feed into the integrator.
@@ -1601,10 +1725,30 @@ class GimbalManager:
         in_warmup = (self._synth_lock_t is not None
                      and (time.time() - self._synth_lock_t)
                          < self._opt_corr_warmup_s)
-        if self._opt_corr_enabled and not in_warmup:
-            src, picked = self._opt_pick_best(eo_metrics, thermal_metrics)
-            if picked is not None:
-                self._opt_update_correction(src, picked)
+        # Pick the best source for both Stage B correction (when
+        # enabled) and stuck-servo detection.
+        src, picked = self._opt_pick_best(eo_metrics, thermal_metrics)
+        if self._opt_corr_enabled and not in_warmup and picked is not None:
+            self._opt_update_correction(src, picked)
+        if picked is not None:
+            self._check_stuck_servo(src, picked)
+            # Also cache the target residual (world target's current
+            # image-frame position in degrees) for publication.
+            if (self._synth_world_az_deg is not None
+                    and self._synth_world_el_deg is not None):
+                if src == "eo":
+                    anchor_pan = self._opt_eo.anchor_pan
+                    anchor_tilt = self._opt_eo.anchor_tilt
+                else:
+                    anchor_pan = self._opt_thermal.anchor_pan
+                    anchor_tilt = self._opt_thermal.anchor_tilt
+                if anchor_pan is not None and anchor_tilt is not None:
+                    req_az = self._synth_world_az_deg - anchor_pan
+                    req_el = self._synth_world_el_deg - anchor_tilt
+                    self._latest_target_resid_az = (
+                        req_az - float(picked.daz_actual_deg))
+                    self._latest_target_resid_el = (
+                        req_el - float(picked.del_actual_deg))
 
         payload: dict = {"tracked_heat_id": tracked_id,
                          "cur_pan": float(cur_pan),
