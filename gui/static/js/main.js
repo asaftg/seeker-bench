@@ -805,13 +805,25 @@ if (areaSlider) {
     const sl = $(row.id);
     const lbl = $(row.id + "-val");
     if (!sl) continue;
-    const paint = () => {
+    // Repaint the label to reflect slider position. Used for both the
+    // initial render and on every user `input` event.
+    const renderLabel = () => {
       const v = parseFloat(sl.value);
       if (lbl) lbl.textContent = fmt(v);
-      queue(row.key, v);
     };
-    sl.addEventListener("input", paint);
-    paint();
+    // On an actual user drag, repaint the label AND queue the value to
+    // the backend. `__hydrateExtrinsic` calls `renderLabel` directly
+    // when it snaps the slider to the persisted value — this avoids
+    // round-tripping the HTML default back to the server and silently
+    // overwriting the loaded calibration.json (the bug operator hit
+    // 2026-04-27: every restart, biases reverted to HTML defaults
+    // until the user "lightly touched" each slider).
+    const onInput = () => {
+      renderLabel();
+      queue(row.key, parseFloat(sl.value));
+    };
+    sl.addEventListener("input", onInput);
+    renderLabel();
   }
 
   // SAVE button — persist current biases to config/calibration.json so
