@@ -544,16 +544,7 @@ fusion:
   # Output FusedTrack still publishes CAMERA-frame az/el (= world -
   # cur_pan at publish time) so gimbal control + GUI overlay don't
   # need any changes. Set false to revert for A/B.
-  # 2026-04-27 evening: turning OFF after `revert not helping ghosts.jsonl`
-  # showed the Phase-2 world-frame port itself births phantom tracks during
-  # gimbal slews — independent of the timing-fix attempts in 2a16649 /
-  # 6b12523 (both reverted). Pattern: same physical target reborn within
-  # ~80ms with el shifted by ~1.5° because the world conversion uses the
-  # fusion-tick pose snapshot for both old observations (captured before
-  # the slew) and new ones (captured during it). Cam-frame matching avoids
-  # the sensor-frame-capture-vs-fusion-tick timing question entirely; the
-  # YOLO id-swap risk during fast slews returns as a known trade.
-  world_frame_fusion: false
+  world_frame_fusion: true
   rate_hz: 15                   # fusion tick rate (independent of sensors)
   match_gate_deg: 0.7           # cross-sensor: max angular distance (deg) to fuse
   track_match_gate_deg: 2.0     # per-tick: max angular distance to match existing track
