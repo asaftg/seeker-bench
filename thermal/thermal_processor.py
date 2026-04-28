@@ -71,6 +71,103 @@ def apply_agc(
     return np.clip(stretched, 0, 255).astype(np.uint8)
 
 
+def apply_roi_agc(
+    frame_u16: np.ndarray,
+    roi_top_frac: float = 0.4,
+    low_percentile: float = 2.0,
+    high_percentile: float = 98.0,
+) -> np.ndarray:
+    """ROI percentile AGC — compute percentiles over the bottom region
+    of the frame ONLY, then apply the linear stretch globally.
+
+    Use case: operator's targets sit in a known band of the frame
+    (vehicles on the road = bottom ~60%). Hot trees in the upper 40%
+    would otherwise force the AGC to allocate display range to them,
+    squishing the road into mid-gray. By computing percentiles only
+    over the ROI, the full 0-255 range gets allocated to the band the
+    operator cares about. Out-of-ROI pixels may saturate to 0 or 255 —
+    that's the intended trade.
+
+    `roi_top_frac` = 0.4 means percentile is computed over the bottom
+    60% of the frame. 0.0 reduces to global percentile (whole frame).
+    """
+    if frame_u16.ndim != 2:
+        raise ValueError(f"apply_roi_agc expects 2-D uint16, got shape {frame_u16.shape}")
+    h = frame_u16.shape[0]
+    top = max(0, min(h - 1, int(h * float(roi_top_frac))))
+    roi = frame_u16[top:, :]
+    lo, hi = np.percentile(roi, [low_percentile, high_percentile])
+    if hi <= lo:
+        return np.zeros(frame_u16.shape, dtype=np.uint8)
+    stretched = (frame_u16.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(stretched, 0, 255).astype(np.uint8)
+
+
+def apply_clahe_y16(
+    frame_u16: np.ndarray,
+    clip_limit: float = 2.0,
+    tile_grid: int = 8,
+) -> np.ndarray:
+    """CLAHE on raw 16-bit thermal data, output 8-bit.
+
+    Local-contrast equalization at full 16-bit precision before
+    quantizing to 8-bit. This is the closest pure-software
+    approximation of what the Boson's onboard AGC does (it has
+    hardware DDE — Digital Detail Enhancement — that pumps edges
+    locally). Result is typically sharper than linear stretch but
+    can amplify noise on a low-contrast scene.
+
+    Returns u8. CLAHE on uint16 is supported by OpenCV; output is
+    rescaled from the full u16 dynamic range to 0..255.
+    """
+    if frame_u16.ndim != 2:
+        raise ValueError(f"apply_clahe_y16 expects 2-D, got shape {frame_u16.shape}")
+    if frame_u16.dtype != np.uint16:
+        raise ValueError(f"apply_clahe_y16 expects uint16, got {frame_u16.dtype}")
+    g = max(2, int(tile_grid))
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(g, g))
+    eq16 = clahe.apply(frame_u16)
+    # Rescale the equalized 16-bit output to 0..255
+    lo, hi = np.percentile(eq16, [2, 98])
+    if hi <= lo:
+        return np.zeros(eq16.shape, dtype=np.uint8)
+    stretched = (eq16.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(stretched, 0, 255).astype(np.uint8)
+
+
+def apply_gates_agc(
+    frame_u16: np.ndarray,
+    cold_count: int,
+    hot_count: int,
+) -> np.ndarray:
+    """Operator-gate AGC — fixed cold/hot raw-count thresholds.
+
+    Linear stretch from `cold_count` (mapped to 0) to `hot_count`
+    (mapped to 255). Any pixel < cold_count clips to black; > hot_count
+    clips to white. No histogram dependence — output is stable
+    frame-to-frame, no scene-driven "breathing".
+
+    The operator picks the gates to bracket their working temperature
+    range (e.g. 19500..22500 raw counts on the bench scene to capture
+    the road + vehicles + warm targets, while clipping cool sky to
+    black and hot tree-tops to white).
+
+    On a Boson 640 in radiometric Y16 mode, raw counts roughly
+    correlate to scene radiance; on this rig the typical scene spans
+    18500..23000 counts. cold_count and hot_count are full uint16
+    values (0..65535).
+    """
+    if frame_u16.ndim != 2:
+        raise ValueError(f"apply_gates_agc expects 2-D uint16, got shape {frame_u16.shape}")
+    cold = float(cold_count)
+    hot = float(hot_count)
+    if hot <= cold:
+        # Degenerate — return flat mid-gray rather than blow up
+        return np.full(frame_u16.shape, 128, dtype=np.uint8)
+    stretched = (frame_u16.astype(np.float32) - cold) * (255.0 / (hot - cold))
+    return np.clip(stretched, 0, 255).astype(np.uint8)
+
+
 # ───────────────────────────────────────────────────────────────
 # CLAHE (Contrast Limited Adaptive Histogram Equalization)
 # ───────────────────────────────────────────────────────────────
@@ -209,9 +306,26 @@ class ThermalEnhanceParams:
     every enhancement stage off) so passing `ThermalEnhanceParams()`
     reproduces pre-2026-04-27 output exactly.
     """
-    # AGC
+    # AGC mode dispatch:
+    #   "global"    — percentile over whole frame (LEGACY)
+    #   "roi"       — percentile over the bottom (1-roi_top_frac) of the
+    #                 frame; out-of-ROI pixels may saturate
+    #   "gates"     — fixed cold/hot raw u16 thresholds; histogram-free
+    #   "clahe_y16" — CLAHE on raw 16-bit before bit reduction. Closest
+    #                 software approximation of the camera's onboard
+    #                 DDE/AGC; gave the highest sharpness in 4-up tests
+    mode: str = "global"
+    # Used by mode="global" and mode="roi"
     low_percentile: float = 2.0
     high_percentile: float = 98.0
+    # Used by mode="roi"
+    roi_top_frac: float = 0.4
+    # Used by mode="gates"
+    cold_count: int = 0
+    hot_count: int = 65535
+    # Used by mode="clahe_y16"
+    clahe_y16_clip_limit: float = 2.0
+    clahe_y16_tile_grid: int = 8
     colormap: str = "INFERNO"
     # Dead-pixel median (raw16 stage)
     dead_pixel_median_enabled: bool = False
@@ -233,6 +347,26 @@ class ThermalEnhanceParams:
     unsharp_radius: float = 1.0
 
 
+def apply_agc_mode(frame_u16: np.ndarray, p: "ThermalEnhanceParams") -> np.ndarray:
+    """Dispatch AGC by ``ThermalEnhanceParams.mode``.
+
+    Returns a uint8 grayscale frame in all modes. Legacy default
+    (mode="global") routes to the existing :func:`apply_agc` so
+    behaviour is byte-equivalent to pre-2026-04-27 when YAML doesn't
+    set ``thermal.agc.mode``.
+    """
+    if p.mode == "gates":
+        return apply_gates_agc(frame_u16, p.cold_count, p.hot_count)
+    if p.mode == "roi":
+        return apply_roi_agc(frame_u16, p.roi_top_frac,
+                             p.low_percentile, p.high_percentile)
+    if p.mode == "clahe_y16":
+        return apply_clahe_y16(frame_u16, p.clahe_y16_clip_limit,
+                               p.clahe_y16_tile_grid)
+    # Default: legacy global percentile
+    return apply_agc(frame_u16, p.low_percentile, p.high_percentile)
+
+
 def from_config(thermal_cfg: dict) -> ThermalEnhanceParams:
     """Build ThermalEnhanceParams from a parsed `thermal:` config block.
 
@@ -248,9 +382,25 @@ def from_config(thermal_cfg: dict) -> ThermalEnhanceParams:
     bil = (enh.get("bilateral_denoise", {}) or {})
     usm = (enh.get("unsharp_mask", {}) or {})
 
+    gates = (agc.get("gates", {}) or {})
+    roi = (agc.get("roi", {}) or {})
+    clahe_y16_cfg = (agc.get("clahe_y16", {}) or {})
+
+    # Mode default = "global" preserves legacy behaviour exactly when
+    # YAML omits the key.
+    mode = str(agc.get("mode", "global")).lower()
+    if mode not in ("global", "roi", "gates", "clahe_y16"):
+        mode = "global"
+
     return ThermalEnhanceParams(
+        mode=mode,
         low_percentile=float(agc.get("low_percentile", 2.0)),
         high_percentile=float(agc.get("high_percentile", 98.0)),
+        roi_top_frac=float(roi.get("top_frac", 0.4)),
+        cold_count=int(gates.get("cold_count", 0)),
+        hot_count=int(gates.get("hot_count", 65535)),
+        clahe_y16_clip_limit=float(clahe_y16_cfg.get("clip_limit", 2.0)),
+        clahe_y16_tile_grid=int(clahe_y16_cfg.get("tile_grid", 8)),
         colormap=str(agc.get("colormap", "INFERNO")),
         dead_pixel_median_enabled=bool(dpm.get("enabled", False)),
         dead_pixel_median_ksize=int(dpm.get("ksize", 3)),
@@ -330,7 +480,11 @@ def raw16_to_display_with_params(
     f = frame_u16
     if p.dead_pixel_median_enabled:
         f = apply_dead_pixel_median(f, p.dead_pixel_median_ksize)
-    agc = apply_agc(f, p.low_percentile, p.high_percentile)
+    # Mode dispatch — at default mode="global" this calls the legacy
+    # apply_agc with the same parameters, so output is byte-equivalent
+    # to pre-mode-dispatch behaviour. mode="roi" or "gates" route to
+    # the new primitives.
+    agc = apply_agc_mode(f, p)
     enhanced = enhance_post_agc(agc, p)
     bgr = apply_colormap(enhanced, p.colormap)
     return enhanced, bgr
