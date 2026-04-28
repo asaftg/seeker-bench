@@ -47,8 +47,14 @@ def _convert_to_world(cands, cur_pan, cur_tilt):
         c["el"] = c["el"] + cur_tilt
 
 
-def test_world_frame_default_on(fm):
-    assert fm._world_frame is True
+def test_world_frame_default_off_after_phantom_births_regression(fm):
+    # 2026-04-27 evening: default flipped to False after
+    # `revert not helping ghosts.jsonl` showed the Phase-2 world-frame
+    # port births phantom tracks during gimbal slews. See app_config.yaml
+    # comment block on `world_frame_fusion`. The world-frame logic is
+    # still tested explicitly in the cases below by setting fm._world_frame
+    # = True manually.
+    assert fm._world_frame is False
 
 
 def test_world_frame_static_target_survives_slew(fm):
