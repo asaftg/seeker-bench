@@ -8,6 +8,17 @@ with various warm objects. Outdoor test scheduled for next day.
 - **The current YAML default (`mode: clahe_y16, tile_grid: 8, gain HIGH`)
   is the best configuration for this indoor scene.** No YAML change
   recommended.
+- Visual proof: [recordings/optim/sdk_indoor_v1/FINAL_COMPARE.png](recordings/optim/sdk_indoor_v1/FINAL_COMPARE.png)
+  — 2×2 grid of A) current YAML, B) tile=12 alternate, C) legacy
+  global, D) over-processed tile=20. A wins the eye test.
+- Re-scored leaderboard with the noise-aware metric:
+  ```
+  gainHIGH_avg0  clahe_y16_tile8    composite 77.55  struct_ratio 0.97  ← winner
+  gainHIGH_avg0  clahe_y16_tile12                76.18              0.96
+  gainHIGH_avg0  clahe_y16_tile16                75.43              0.94
+  gainHIGH_avg0  global_2_98                     53                 0.99  (very soft)
+  gainLOW/AUTO   anything                        ≤ 64               0.69  (NOISE)
+  ```
 - **gain LOW and gain AUTO are not usable on this Boson firmware** —
   every capture in those modes returned pure noise (980KB PNGs vs
   ~400KB for real scenes). May need camera disconnect+reconnect
