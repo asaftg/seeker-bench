@@ -150,21 +150,6 @@ class FusionManager:
         # camera-frame for the first publish).
         self._cur_gimbal_pose: tuple[float, float] = (0.0, 0.0)
 
-        # Gimbal pose history (timestamp, pan_deg, tilt_deg) — populated
-        # at the start of each _tick. The world-frame conversion uses
-        # the gimbal pose at the SENSOR FRAME CAPTURE TIME, not the
-        # fusion tick time, because there's a ~50-150 ms gap between
-        # capture and fusion that, during slow tilt motion, was enough
-        # to make the same physical target's world_el shift by ~1° per
-        # observation -> IoU mismatch -> phantom new track births
-        # ('changing tilt adds bb.jsonl' showed 7 fused_track_born
-        # events with manual tilt slewing 0->8.5°).
-        # 2 s history at 15 Hz fusion = 30 entries; covers any
-        # plausible capture-to-fusion lag.
-        from collections import deque
-        self._pose_history: deque = deque(maxlen=30)
-        self._pose_history_max_age_s: float = 2.0
-
     # ───────────────────────── lifecycle ─────────────────────────
     def start(self) -> None:
         if self._thread is not None:
@@ -252,14 +237,6 @@ class FusionManager:
         cur_pan = float(gs.pan_deg) if isinstance(gs, _GS) else 0.0
         cur_tilt = float(gs.tilt_deg) if isinstance(gs, _GS) else 0.0
         self._cur_gimbal_pose = (cur_pan, cur_tilt)
-        # Append to pose history. Use the gimbal-state timestamp if
-        # available so the lookup matches sensor-frame capture times
-        # (which are also wall-clock time.time()); fall back to "now"
-        # when no GIMBAL message exists yet.
-        gs_ts = float(getattr(gs, "timestamp", 0.0)) if isinstance(gs, _GS) else 0.0
-        if gs_ts <= 0.0:
-            gs_ts = time.time()
-        self._pose_history.append((gs_ts, cur_pan, cur_tilt))
 
         thermal_obs = self._observations_from_thermal(tf)
         eo_obs = self._observations_from_eo(ef)
@@ -299,7 +276,6 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    max(e["conf"], t["conf"]),
-                    "_frame_ts": e.get("_frame_ts", 0.0),
                 })
             else:
                 candidates.append({
@@ -309,7 +285,6 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    e["conf"],
-                    "_frame_ts": e.get("_frame_ts", 0.0),
                 })
         for i, t in enumerate(thermal_obs):
             if used_t[i]:
@@ -321,7 +296,6 @@ class FusionManager:
                 "az":      t["az"],   "el":    t["el"],
                 "ang_w":   t["ang_w"],"ang_h": t["ang_h"],
                 "conf":    t["conf"],
-                "_frame_ts": t.get("_frame_ts", 0.0),
             })
 
         # ── Pass 3: radar joins ──
@@ -374,7 +348,6 @@ class FusionManager:
                     "az":      r["az"],   "el":    r["el"],
                     "ang_w":   r["ang_w"],"ang_h": r["ang_h"],
                     "conf":    r["conf"],
-                    "_frame_ts": r.get("_frame_ts", 0.0),
                 })
 
         # Collapse near-duplicate candidates within this tick before
@@ -396,17 +369,8 @@ class FusionManager:
         # is constant.
         if self._world_frame:
             for c in candidates:
-                # Use the gimbal pose at SENSOR FRAME CAPTURE TIME, not
-                # the fusion tick time. Capture-to-fusion lag (~50-150ms)
-                # during a slow tilt slew was enough to make the same
-                # physical target's world_el shift by ~1° per observation
-                # — `changing tilt adds bb.jsonl` showed 7 phantom track
-                # births during a 0→8.5° manual tilt. _pose_at_time falls
-                # back to current pose for missing/stale timestamps.
-                ts = float(c.get("_frame_ts", 0.0))
-                pan_at, tilt_at = self._pose_at_time(ts)
-                c["az"] = c["az"] + pan_at
-                c["el"] = c["el"] + tilt_at
+                c["az"] = c["az"] + cur_pan
+                c["el"] = c["el"] + cur_tilt
 
         self._update_tracks(candidates)
         # Final safety net: merge any fusion tracks that now overlap in
@@ -414,31 +378,6 @@ class FusionManager:
         # (more hits, then lower id) keeps its ID; the younger is dropped.
         self._merge_overlapping_tracks()
         self._publish()
-
-    # ───────────────────────── pose lookup ───────────────────────
-    def _pose_at_time(self, ts: float) -> tuple[float, float]:
-        """Return (pan, tilt) at sensor-frame capture time `ts`.
-
-        Looks up the closest entry in `_pose_history`. If `ts` falls
-        between two entries, returns the closer one (no interpolation —
-        gimbal state ticks at >= 50 Hz so the nearest sample is within
-        ~10 ms of any plausible capture timestamp). If history is empty
-        or `ts` is too stale, falls back to the last-known pose.
-        """
-        if not self._pose_history or ts <= 0.0:
-            return self._cur_gimbal_pose
-        # Reject obviously-stale ts: caller probably forgot to set it.
-        # Use current pose in that case.
-        latest_ts = self._pose_history[-1][0]
-        if latest_ts - ts > self._pose_history_max_age_s:
-            return self._cur_gimbal_pose
-        best = self._pose_history[0]
-        best_dt = abs(best[0] - ts)
-        for entry in self._pose_history:
-            dt = abs(entry[0] - ts)
-            if dt < best_dt:
-                best_dt, best = dt, entry
-        return (best[1], best[2])
 
     # ───────────────────────── observation builders ──────────────
     def _observations_from_thermal(self, tf: Optional[ThermalFrame]) -> list[dict]:
@@ -466,7 +405,6 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,
                 "conf": float(d.classification.confidence),
-                "_frame_ts": float(tf.timestamp),
             })
         return out
 
@@ -516,7 +454,6 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
                 "class": TargetClass.RADAR_TARGET.value,
                 "conf": float(t.confidence),
-                "_frame_ts": float(rf.timestamp),
             })
         return out
 
@@ -537,7 +474,6 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,
                 "conf": float(d.confidence),
-                "_frame_ts": float(ef.timestamp),
             })
         return out
 
