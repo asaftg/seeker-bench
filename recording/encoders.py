@@ -252,9 +252,5 @@ def encode_fused(tracks: Optional[list]) -> Optional[Dict[str, Any]]:
             "ang_h_deg": round(float(t.ang_h_deg), 3),
             "hits": int(t.hits),
             "misses": int(t.misses),
-            "world_az_deg": (None if t.world_az_deg is None
-                              else round(float(t.world_az_deg), 3)),
-            "world_el_deg": (None if t.world_el_deg is None
-                              else round(float(t.world_el_deg), 3)),
         })
     return {"tracks": out}

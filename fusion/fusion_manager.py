@@ -827,12 +827,6 @@ class FusionManager:
             # track az/el is already camera frame and we subtract zero.
             pub_az = float(trk["az"]) - cur_pan
             pub_el = float(trk["el"]) - cur_tilt
-            # World-frame az/el is the track's own stored value when
-            # running in world-frame mode (no timing-sensitive recovery
-            # required by consumers). Set None for the legacy camera-
-            # frame mode, which has no notion of world angles.
-            world_az = float(trk["az"]) if self._world_frame else None
-            world_el = float(trk["el"]) if self._world_frame else None
             out.append(FusedTrack(
                 id=int(trk["id"]),
                 target_class=tc,
@@ -845,7 +839,5 @@ class FusionManager:
                 ang_h_deg=float(trk["ang_h"]),
                 hits=int(trk["hits"]),
                 misses=int(trk["misses"]),
-                world_az_deg=world_az,
-                world_el_deg=world_el,
             ))
         BUS.publish(Topic.FUSED, out)

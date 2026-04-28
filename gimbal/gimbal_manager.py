@@ -1196,23 +1196,12 @@ class GimbalManager:
                     no_obs_lead_zero_after_s=self._track_no_obs_lead_zero_after_s,
                     tilt_saturated=tilt_sat_now,
                 )
-                # Prefer the world-frame angles published directly by
-                # fusion (timing-invariant). Fall back to camera-frame
-                # for back-compat when running legacy fusion mode that
-                # leaves world_az_deg/world_el_deg unset.
-                trk_world_az = getattr(trk, "world_az_deg", None)
-                trk_world_el = getattr(trk, "world_el_deg", None)
-                use_world = (fresh_fused
-                              and trk_world_az is not None
-                              and trk_world_el is not None)
                 sp_pan_pred, sp_tilt_pred, diag = track_predictor.step(
                     self._predictor_state,
                     now=now,
                     cur_pan=cur_pan, cur_tilt=cur_tilt,
                     obs_az_deg=(float(trk.az_deg) if fresh_fused else None),
                     obs_el_deg=(float(trk.el_deg) if fresh_fused else None),
-                    obs_world_az_deg=(float(trk_world_az) if use_world else None),
-                    obs_world_el_deg=(float(trk_world_el) if use_world else None),
                     fresh_fused=fresh_fused,
                     params=params,
                 )
@@ -1228,24 +1217,8 @@ class GimbalManager:
                 # for diagnostics; we just override its sp output here.
                 if self._fused_closed_loop and self._cameras_on_gimbal:
                     if fresh_fused:
-                        # Prefer world-frame error: trk.az_deg/el_deg is
-                        # camera-frame relative to fusion's pose snapshot
-                        # at publish time, not the gimbal's NOW pose.
-                        # During a slew the difference (cur_pan_now −
-                        # cur_pan_at_fusion_publish) leaks into the
-                        # closed-loop error and makes the controller
-                        # over-correct by exactly that delta. Computing
-                        # the error from world angles uses the gimbal's
-                        # current pose and is timing-invariant.
-                        if (trk_world_az is not None
-                                and trk_world_el is not None):
-                            cam_err_az = float(trk_world_az) - cur_pan
-                            cam_err_el = float(trk_world_el) - cur_tilt
-                        else:
-                            cam_err_az = float(trk.az_deg)
-                            cam_err_el = float(trk.el_deg)
                         az_in, el_in = self._lp_filter_error(
-                            cam_err_az, cam_err_el)
+                            float(trk.az_deg), float(trk.el_deg))
                         kp_eff = self._kp_track
                         d_pan_cl = _smooth_proportional(
                             az_in, kp_eff,

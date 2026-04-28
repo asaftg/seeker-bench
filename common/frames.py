@@ -204,20 +204,6 @@ class FusedTrack:
     ang_h_deg: float
     hits: int = 1
     misses: int = 0
-    # World-frame az/el of the track. Populated by fusion when running
-    # in world-frame mode; None otherwise (legacy camera-frame fusion).
-    # Why this exists: az_deg/el_deg are camera-frame, derived as
-    # (world − cur_pan_at_fusion_publish). A consumer that wants world
-    # angles back has to add cur_pan again, but if it reads cur_pan at a
-    # different moment (e.g. the gimbal control loop runs faster than
-    # fusion), the round-trip leaks the gimbal-publish latency as
-    # PHANTOM VELOCITY in the consumer's world-frame estimate. On
-    # `track test 6.jsonl` this caused a static target's apparent
-    # world_az to drift at ~−13 dps during a slew, and the Phase 3
-    # velocity-feed-forward turned that into runaway over-steering.
-    # Carrying world angles directly here removes the round-trip.
-    world_az_deg: Optional[float] = None
-    world_el_deg: Optional[float] = None
 
 
 # ───────────────────────────────────────────────────────────────
