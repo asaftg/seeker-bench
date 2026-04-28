@@ -34,7 +34,13 @@ from typing import List, Optional
 import serial
 
 from common.frame_bus import BUS
-from common.frames import RadarDetection, RadarFrame, RadarTarget, Topic
+from common.frames import (
+    GimbalState,
+    RadarDetection,
+    RadarFrame,
+    RadarTarget,
+    Topic,
+)
 from common.logging_setup import get_logger
 from radar.cfg_sender import send_cfg
 from radar.clustering import ClusterParams, RadarClusterer
@@ -429,6 +435,16 @@ class RadarManager:
         gated, targets = self._clusterer.step(gated)
 
         self._frame_id += 1
+        # See ThermalManager._process_and_publish — bind gimbal pose
+        # at frame ingest so fusion can convert to world-frame using
+        # the pose at capture, not at fusion-tick time.
+        gs_for_capture = BUS.get_latest(Topic.GIMBAL)
+        if isinstance(gs_for_capture, GimbalState):
+            gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
+            gimbal_tilt_at_capture = float(gs_for_capture.tilt_deg)
+        else:
+            gimbal_pan_at_capture = None
+            gimbal_tilt_at_capture = None
         rf = RadarFrame(
             timestamp=time.time(),
             frame_id=self._frame_id,
@@ -440,6 +456,8 @@ class RadarManager:
             num_targets=len(targets),
             max_range_m=self.max_range_m,
             fov_half_deg=self.az_half_deg,
+            gimbal_pan_at_capture=gimbal_pan_at_capture,
+            gimbal_tilt_at_capture=gimbal_tilt_at_capture,
         )
         BUS.publish(Topic.RADAR, rf)
 

@@ -127,6 +127,21 @@ class ThermalFrame:
     # own devMode flag.
     heat_tracks: List[HeatTrackDebug] = field(default_factory=list)
 
+    # Gimbal pose at the time this frame entered the processing pipeline.
+    # ThermalManager stamps these from BUS.get_latest(Topic.GIMBAL) at the
+    # top of _process_and_publish, before detection runs. Fusion uses
+    # these to convert each detection's az/el into world frame using the
+    # pose that was actually true when the sensor saw the target —
+    # NOT the pose at fusion-tick time, which can drift by 1-2° during a
+    # fast slew and births phantom track IDs ('revert not helping ghosts'
+    # cluster analysis showed the same physical target reborn 3-6 times
+    # under different IDs because of this offset).
+    # Optional[float]; None when the gimbal/state stream isn't yet
+    # available (first frames after startup) — fusion falls back to its
+    # legacy fusion-tick pose snapshot in that case.
+    gimbal_pan_at_capture: Optional[float] = None
+    gimbal_tilt_at_capture: Optional[float] = None
+
 
 # ───────────────────────────────────────────────────────────────
 # EO (visible / NIR RGB) frames — Ticket 3
@@ -174,6 +189,11 @@ class EOFrame:
     hfov_deg: float = 11.05
     vfov_deg: float = 9.23
     source_device: Optional[int] = None  # cv2 device index in use
+
+    # See ThermalFrame.gimbal_pan_at_capture for the contract — same
+    # purpose, populated by EOManager at process-start time.
+    gimbal_pan_at_capture: Optional[float] = None
+    gimbal_tilt_at_capture: Optional[float] = None
 
 
 # ───────────────────────────────────────────────────────────────
@@ -301,6 +321,11 @@ class RadarFrame:
     # The GUI uses this to draw the ±FOV sector lines so the operator
     # sees exactly which wedge is "in-gate".
     fov_half_deg: float = 60.0
+
+    # See ThermalFrame.gimbal_pan_at_capture — same contract, populated
+    # by RadarManager at frame ingest.
+    gimbal_pan_at_capture: Optional[float] = None
+    gimbal_tilt_at_capture: Optional[float] = None
 
 
 # ───────────────────────────────────────────────────────────────

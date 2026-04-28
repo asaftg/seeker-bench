@@ -105,6 +105,8 @@ def thermal_obs_from_frame(msg: Dict[str, Any], thermal_az_bias: float,
             "conf": float((d.get("classification") or {}).get("confidence", 0.0)),
             "primary": "thermal",
             "sensors": ["thermal"],
+            "_pose_pan": msg.get("gimbal_pan_at_capture"),
+            "_pose_tilt": msg.get("gimbal_tilt_at_capture"),
         })
     return out
 
@@ -133,6 +135,8 @@ def eo_obs_from_frame(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
             "az": az, "el": el, "ang_w": aw, "ang_h": ah,
             "class": cls, "conf": float(d.get("confidence", 0.0)),
             "primary": "eo", "sensors": ["eo"],
+            "_pose_pan": msg.get("gimbal_pan_at_capture"),
+            "_pose_tilt": msg.get("gimbal_tilt_at_capture"),
         })
     return out
 
@@ -161,6 +165,8 @@ def radar_obs_from_frame(msg: Dict[str, Any], radar_az_bias: float,
             "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
             "class": RADAR_TARGET, "conf": float(t.get("conf", 0.5)),
             "primary": "radar", "sensors": ["radar"],
+            "_pose_pan": msg.get("gimbal_pan_at_capture"),
+            "_pose_tilt": msg.get("gimbal_tilt_at_capture"),
         })
     return out
 
@@ -324,6 +330,37 @@ class WorldFrameCaptureFusionState(FusionState):
             tilt_at = float(c.get("_tilt_at", cur_tilt))
             wc["az"] = c["az"] + pan_at
             wc["el"] = c["el"] + tilt_at
+            world_cands.append(wc)
+        return super().step(world_cands, cur_pan, cur_tilt)
+
+
+@dataclass
+class WorldFrameStampedFusionState(FusionState):
+    """Sensor-stamped pose at frame capture: uses _pose_pan / _pose_tilt
+    set by the obs builders directly from the recorded gimbal_pan_at_capture
+    / gimbal_tilt_at_capture fields. Mirrors the live fix that has the
+    sensor manager bind gimbal pose at process-start time.
+
+    Distinct from WorldFrameCaptureFusionState (which interpolates from
+    pose history at the source frame's timestamp): this variant
+    requires the recording to carry the new sensor-stamped fields.
+    Falls back to fusion-tick pose when the field is missing (older
+    recordings).
+    """
+
+    def step(self, candidates: List[Dict[str, Any]],
+             cur_pan: float, cur_tilt: float
+             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                        List[int]]:
+        world_cands = []
+        for c in candidates:
+            wc = dict(c)
+            pp = c.get("_pose_pan")
+            pt = c.get("_pose_tilt")
+            if pp is None: pp = cur_pan
+            if pt is None: pt = cur_tilt
+            wc["az"] = c["az"] + float(pp)
+            wc["el"] = c["el"] + float(pt)
             world_cands.append(wc)
         return super().step(world_cands, cur_pan, cur_tilt)
 
@@ -492,9 +529,12 @@ def merge_overlapping_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any
 # ──────────────────────────────────────────────────────────────────
 # Driver
 # ──────────────────────────────────────────────────────────────────
-def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
+def replay(path: str, variant: str, out_csv: Optional[str],
+           max_misses_override: Optional[int] = None) -> int:
     print(f"recording: {path}")
     print(f"variant:   {variant}")
+    if max_misses_override is not None:
+        print(f"max_misses override: {max_misses_override}")
 
     # Pull config snapshot for fusion params + extrinsics.
     header = None
@@ -570,14 +610,19 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
             radar_az = float(rcfg.get("az_bias_deg", 0.0))
             radar_el = float(rcfg.get("el_bias_deg", 0.0))
             rate_hz = float(fcfg.get("rate_hz", 15.0))
-            if variant == "world-frame-capture":
+            if variant == "world-frame-stamped":
+                cls = WorldFrameStampedFusionState
+            elif variant == "world-frame-capture":
                 cls = WorldFrameCaptureFusionState
             elif variant == "world-frame":
                 cls = WorldFrameFusionState
             else:
                 cls = FusionState
+            mm = (int(max_misses_override)
+                  if max_misses_override is not None
+                  else int(fcfg.get("max_misses", 30)))
             state = cls(
-                max_misses=int(fcfg.get("max_misses", 30)),
+                max_misses=mm,
                 sensor_grace_ticks=int(fcfg.get("sensor_grace_ticks", 5)),
             )
             fusion_dt = 1.0 / rate_hz
@@ -589,13 +634,17 @@ def replay(path: str, variant: str, out_csv: Optional[str]) -> int:
 
         if state is None:
             # No header yet; assume defaults.
-            if variant == "world-frame-capture":
+            if variant == "world-frame-stamped":
+                cls = WorldFrameStampedFusionState
+            elif variant == "world-frame-capture":
                 cls = WorldFrameCaptureFusionState
             elif variant == "world-frame":
                 cls = WorldFrameFusionState
             else:
                 cls = FusionState
-            state = cls(max_misses=30, sensor_grace_ticks=5)
+            mm = (int(max_misses_override)
+                  if max_misses_override is not None else 30)
+            state = cls(max_misses=mm, sensor_grace_ticks=5)
 
         if ch == "events":
             tp = msg.get("type")
@@ -767,14 +816,18 @@ def main() -> int:
                     help="JSONL recording path")
     ap.add_argument("--variant", default="camera-frame",
                     choices=("camera-frame", "world-frame",
-                             "world-frame-capture"),
+                             "world-frame-capture",
+                             "world-frame-stamped"),
                     help="Matcher variant (default camera-frame for parity)")
+    ap.add_argument("--max-misses", default=None, type=int,
+                    help="Override fusion max_misses (test FOV exit/re-entry)")
     ap.add_argument("--out", default=None, help="CSV output path")
     args = ap.parse_args()
     if not os.path.exists(args.recording):
         print(f"recording not found: {args.recording}")
         return 2
-    return replay(args.recording, args.variant, args.out)
+    return replay(args.recording, args.variant, args.out,
+                   max_misses_override=args.max_misses)
 
 
 if __name__ == "__main__":

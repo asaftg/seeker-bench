@@ -62,6 +62,10 @@ def encode_thermal(tf: Optional[ThermalFrame], jpeg_quality: int = 92) -> Option
         "hfov_deg": float(tf.hfov_deg),
         "vfov_deg": float(tf.vfov_deg),
         "zoom_preset": str(tf.zoom_preset),
+        "gimbal_pan_at_capture": (None if tf.gimbal_pan_at_capture is None
+                                   else round(float(tf.gimbal_pan_at_capture), 4)),
+        "gimbal_tilt_at_capture": (None if tf.gimbal_tilt_at_capture is None
+                                    else round(float(tf.gimbal_tilt_at_capture), 4)),
         "jpeg_b64": _jpeg_b64(tf.agc8, jpeg_quality),
         "detections": [
             {
@@ -119,6 +123,10 @@ def encode_eo(ef: Optional[EOFrame], jpeg_quality: int = 92) -> Optional[Dict[st
         "hfov_deg": float(ef.hfov_deg),
         "vfov_deg": float(ef.vfov_deg),
         "source_device": ef.source_device,
+        "gimbal_pan_at_capture": (None if ef.gimbal_pan_at_capture is None
+                                   else round(float(ef.gimbal_pan_at_capture), 4)),
+        "gimbal_tilt_at_capture": (None if ef.gimbal_tilt_at_capture is None
+                                    else round(float(ef.gimbal_tilt_at_capture), 4)),
         "jpeg_b64": _jpeg_b64(ef.bgr, jpeg_quality),
         "detections": [
             {
@@ -167,6 +175,10 @@ def encode_radar(rf: Optional[RadarFrame]) -> Optional[Dict[str, Any]]:
         "fov_half_deg": float(rf.fov_half_deg),
         "num_points": int(rf.num_points),
         "num_targets": int(rf.num_targets),
+        "gimbal_pan_at_capture": (None if rf.gimbal_pan_at_capture is None
+                                   else round(float(rf.gimbal_pan_at_capture), 4)),
+        "gimbal_tilt_at_capture": (None if rf.gimbal_tilt_at_capture is None
+                                    else round(float(rf.gimbal_tilt_at_capture), 4)),
         "points": [
             {
                 "x": round(float(d.x_m), 3),

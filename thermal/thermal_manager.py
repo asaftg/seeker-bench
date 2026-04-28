@@ -24,7 +24,7 @@ import numpy as np
 
 from common.config import load_config
 from common.frame_bus import BUS
-from common.frames import BBox, HeatTrackDebug, ThermalFrame, Topic
+from common.frames import BBox, GimbalState, HeatTrackDebug, ThermalFrame, Topic
 from common.logging_setup import get_logger
 from thermal.classifier_hv import HumanVehicleClassifier
 from thermal.detection_tracker import DetectionTracker, TrackerConfig
@@ -453,6 +453,21 @@ class ThermalManager:
     def _process_and_publish(self, frame: np.ndarray) -> None:
         self._frame_id += 1
         ts = time.time()
+        # Snapshot the gimbal pose at the top of the pipeline. This binds
+        # the pose to the FRAME at the closest moment to capture we have
+        # access to (the actual sensor exposure happened a few ms earlier
+        # in the camera driver). Fusion uses these to compute world-frame
+        # az/el for each detection — without this stamp it would have to
+        # use cur_pan/cur_tilt at fusion-tick time, which can be 100ms+
+        # after capture and during a slew leaks 1-2° of pose into
+        # apparent target motion → phantom track births.
+        gs = BUS.get_latest(Topic.GIMBAL)
+        if isinstance(gs, GimbalState):
+            gimbal_pan_at_capture = float(gs.pan_deg)
+            gimbal_tilt_at_capture = float(gs.tilt_deg)
+        else:
+            gimbal_pan_at_capture = None
+            gimbal_tilt_at_capture = None
         orig_h, orig_w = frame.shape[:2]
 
         # ── 1. Derive raw16 + display from the FULL frame ──────────
@@ -727,6 +742,8 @@ class ThermalManager:
             vfov_deg=vfov_cur,
             zoom_preset=self._zoom_preset,
             heat_tracks=heat_tracks_debug,
+            gimbal_pan_at_capture=gimbal_pan_at_capture,
+            gimbal_tilt_at_capture=gimbal_tilt_at_capture,
         )
         BUS.publish(Topic.THERMAL, tf)
 

@@ -551,21 +551,23 @@ fusion:
                                 # (cameras are coplanar <5cm apart so parallax ~= 0°;
                                 #  looser gate prevents small bbox jitter spawning dup IDs)
   min_hits: 1                   # ticks before a track is visible in the GUI
-  # Extended 2026-04-27 from 15→30 (~2.0s @ 15Hz). Replay analysis of
-  # the 5 human-tracking attempts showed every fused track was EO-only
-  # (no thermal h/v support on this rig at present), and YOLO loses
-  # the person briefly during fast gimbal slews. With max_misses=15
-  # the track id died after ~1s of YOLO drop and the user's TRACK
-  # lock grace-expired soon after. With 30 the angular position
-  # survives long enough for YOLO to re-acquire on the same target,
-  # keeping the same fused-track id and the user's lock alive.
-  # Coupled with the predictor's new no_obs_lead_zero_after_s=0.3,
-  # the gimbal holds last-observed position cleanly during the
-  # extended grace window — no runaway, just a pause.
-  max_misses: 30
-                                # (~1s at 15Hz). ByteTrack (per-sensor) already
-                                # coasts through brief dropouts via Kalman, so
-                                # fusion's grace can stay short.
+  # Extended 2026-04-27 night from 30→300 (~20s @ 15Hz). Recording
+  # `revert not helping ghosts.jsonl` cluster analysis showed 35
+  # fused_track_born events but only 14 distinct world clusters —
+  # i.e., the same parked car was re-issuing IDs every time the user
+  # panned away then back. With max_misses=30 (~2s) any FOV exit >2s
+  # killed the track. With world-frame storage and sensor-stamped
+  # pose-at-capture (no phantom velocity drift), holding a track in
+  # memory for 20s is cheap and lets the same world position revive
+  # the original ID when the user pans back. Tracks that age out for
+  # real (target physically left the area) eventually still die.
+  # The publish gate (active_sensors) stops drawing the bbox after
+  # sensor_grace_ticks (~333ms) so a coasting track never visually
+  # confuses the operator — only the persistence ID is preserved.
+  max_misses: 300
+                                # (~20s at 15Hz). Long enough for a
+                                # static parked target to survive a
+                                # gimbal pan-away → pan-back cycle.
   # Phase 2 — radar as third late-fusion sensor.
   # Radar bboxes are derived from 3D cluster size projected at slant
   # range, so they're coarser than EO/thermal pixel-detector boxes.

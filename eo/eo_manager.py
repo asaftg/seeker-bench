@@ -20,7 +20,7 @@ import numpy as np
 
 from common.config import load_config
 from common.frame_bus import BUS
-from common.frames import BBox, EODetection, EOFrame, TargetClass, Topic
+from common.frames import BBox, EODetection, EOFrame, GimbalState, TargetClass, Topic
 from common.logging_setup import get_logger
 from eo.eo_classifier import EOClassifier
 from eo.eo_processor import enhance, passthrough, scene_mean
@@ -1078,6 +1078,17 @@ class EOManager:
     def _process_and_publish(self, frame: np.ndarray) -> None:
         self._frame_id += 1
         ts = time.time()
+        # Snapshot the gimbal pose. See ThermalManager._process_and_publish
+        # for the rationale — this binds pose to the frame at processing
+        # start time, used by fusion to convert detections to world-frame
+        # az/el using the actual pose at capture, not at fusion-tick time.
+        gs_for_capture = BUS.get_latest(Topic.GIMBAL)
+        if isinstance(gs_for_capture, GimbalState):
+            gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
+            gimbal_tilt_at_capture = float(gs_for_capture.tilt_deg)
+        else:
+            gimbal_pan_at_capture = None
+            gimbal_tilt_at_capture = None
 
         # 0. IMX568 pipeline: downscale → AGC → profile switching.
         #
@@ -1292,6 +1303,8 @@ class EOManager:
             hfov_deg=self._hfov,
             vfov_deg=self._vfov,
             source_device=dev_idx,
+            gimbal_pan_at_capture=gimbal_pan_at_capture,
+            gimbal_tilt_at_capture=gimbal_tilt_at_capture,
         )
         BUS.publish(Topic.EO, ef)
 

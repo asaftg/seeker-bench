@@ -276,6 +276,9 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    max(e["conf"], t["conf"]),
+                    # Primary's pose-at-capture wins (az/el also from EO).
+                    "_pose_pan":  e.get("_pose_pan"),
+                    "_pose_tilt": e.get("_pose_tilt"),
                 })
             else:
                 candidates.append({
@@ -285,6 +288,8 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    e["conf"],
+                    "_pose_pan":  e.get("_pose_pan"),
+                    "_pose_tilt": e.get("_pose_tilt"),
                 })
         for i, t in enumerate(thermal_obs):
             if used_t[i]:
@@ -296,6 +301,8 @@ class FusionManager:
                 "az":      t["az"],   "el":    t["el"],
                 "ang_w":   t["ang_w"],"ang_h": t["ang_h"],
                 "conf":    t["conf"],
+                "_pose_pan":  t.get("_pose_pan"),
+                "_pose_tilt": t.get("_pose_tilt"),
             })
 
         # ── Pass 3: radar joins ──
@@ -348,6 +355,8 @@ class FusionManager:
                     "az":      r["az"],   "el":    r["el"],
                     "ang_w":   r["ang_w"],"ang_h": r["ang_h"],
                     "conf":    r["conf"],
+                    "_pose_pan":  r.get("_pose_pan"),
+                    "_pose_tilt": r.get("_pose_tilt"),
                 })
 
         # Collapse near-duplicate candidates within this tick before
@@ -369,8 +378,22 @@ class FusionManager:
         # is constant.
         if self._world_frame:
             for c in candidates:
-                c["az"] = c["az"] + cur_pan
-                c["el"] = c["el"] + cur_tilt
+                # Use the SENSOR-STAMPED pose at frame capture time (set
+                # by the sensor manager at the top of its pipeline) so
+                # the world conversion is bound to when the target was
+                # actually observed, not when fusion happens to tick.
+                # This eliminates the 1-2° world_el drift during a slew
+                # that birthed phantom track IDs in
+                # `revert not helping ghosts.jsonl`. Falls back to the
+                # fusion-tick pose snapshot when the stamp is missing
+                # (e.g. first frame after startup, or replays of older
+                # recordings that predate the stamp).
+                pp = c.get("_pose_pan")
+                pt = c.get("_pose_tilt")
+                if pp is None: pp = cur_pan
+                if pt is None: pt = cur_tilt
+                c["az"] = c["az"] + pp
+                c["el"] = c["el"] + pt
 
         self._update_tracks(candidates)
         # Final safety net: merge any fusion tracks that now overlap in
@@ -384,6 +407,10 @@ class FusionManager:
         if tf is None or not tf.connected or tf.agc8 is None:
             return []
         h, w = tf.agc8.shape[:2]
+        # Pose-at-capture from the frame itself (sensor-stamped); fall
+        # back to None to signal "use fusion-tick pose".
+        pose_pan = getattr(tf, "gimbal_pan_at_capture", None)
+        pose_tilt = getattr(tf, "gimbal_tilt_at_capture", None)
         out = []
         for d in tf.detections:
             if d.classification is None:
@@ -405,6 +432,8 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,
                 "conf": float(d.classification.confidence),
+                "_pose_pan": pose_pan,
+                "_pose_tilt": pose_tilt,
             })
         return out
 
@@ -422,6 +451,8 @@ class FusionManager:
         if rf is None or not rf.connected:
             return []
         out = []
+        pose_pan = getattr(rf, "gimbal_pan_at_capture", None)
+        pose_tilt = getattr(rf, "gimbal_tilt_at_capture", None)
         # Pull the bias once under the lock — match _observations_from_thermal
         # so a mid-tick GUI slider update doesn't tear the two reads.
         with self._ext_lock:
@@ -454,6 +485,8 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
                 "class": TargetClass.RADAR_TARGET.value,
                 "conf": float(t.confidence),
+                "_pose_pan": pose_pan,
+                "_pose_tilt": pose_tilt,
             })
         return out
 
@@ -461,6 +494,8 @@ class FusionManager:
         if ef is None or not ef.connected or ef.bgr is None:
             return []
         h, w = ef.bgr.shape[:2]
+        pose_pan = getattr(ef, "gimbal_pan_at_capture", None)
+        pose_tilt = getattr(ef, "gimbal_tilt_at_capture", None)
         out = []
         for d in ef.detections:
             cls = d.target_class
@@ -474,6 +509,8 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,
                 "conf": float(d.confidence),
+                "_pose_pan": pose_pan,
+                "_pose_tilt": pose_tilt,
             })
         return out
 
