@@ -126,6 +126,30 @@ class FusionManager:
         self._tracks: list[dict] = []
         self._next_id = 1
 
+        # Phase 2 — world-frame fusion. When enabled (default), candidate
+        # az/el is converted to world frame at ingest:
+        #     world_az = cam_az + cur_pan_at_obs
+        #     world_el = cam_el + cur_tilt_at_obs
+        # Tracks STORE world az/el. Matching is in world frame, so a
+        # target's identity survives gimbal motion (camera-frame matching
+        # silently transfers a track to whichever vehicle currently sits
+        # at the same camera-frame az — the bug behind both the YOLO
+        # id-swap mistrack case AND the apparent "oscillation" on a
+        # static target visible in 'single track oscilating after being
+        # in the center.jsonl').
+        # Output FusedTrack carries CAMERA-frame az/el (= world - cur_pan
+        # at publish time) so the gimbal control path and GUI overlay
+        # don't need any changes — they keep reading az_deg/el_deg as
+        # offsets from current boresight.
+        # Set false to revert to legacy camera-frame matching for A/B.
+        self._world_frame: bool = bool(
+            fcfg.get("world_frame_fusion", True))
+        # Cached gimbal pose snapshot — captured at the start of each
+        # _tick so all candidates use a consistent pose for world-frame
+        # conversion. Default 0,0 until first tick (effectively
+        # camera-frame for the first publish).
+        self._cur_gimbal_pose: tuple[float, float] = (0.0, 0.0)
+
     # ───────────────────────── lifecycle ─────────────────────────
     def start(self) -> None:
         if self._thread is not None:
@@ -332,6 +356,21 @@ class FusionManager:
         # become a candidate, and greedy track matching means only one
         # claims the existing track — the other spawns a duplicate.
         candidates = self._dedup_candidates(candidates)
+
+        # ── Phase 2: convert to WORLD frame for persistence-tracker
+        # matching. Camera-frame matching silently transfers a track
+        # to whichever vehicle currently sits at the same camera-frame
+        # az during a gimbal slew — the bug behind the YOLO id-swap
+        # in `Human_and_vehicle_mistrack.jsonl` AND the apparent
+        # oscillation on a static target in
+        # 'single track oscilating after being in the center.jsonl'.
+        # World-frame matching preserves the target's identity across
+        # arbitrary gimbal motion, since a static target's world az/el
+        # is constant.
+        if self._world_frame:
+            for c in candidates:
+                c["az"] = c["az"] + cur_pan
+                c["el"] = c["el"] + cur_tilt
 
         self._update_tracks(candidates)
         # Final safety net: merge any fusion tracks that now overlap in
@@ -692,6 +731,12 @@ class FusionManager:
 
     # ───────────────────────── publish ───────────────────────────
     def _publish(self) -> None:
+        # When matching in world frame (Phase 2), tracks store world
+        # az/el. Output FusedTrack carries CAMERA-frame az/el so the
+        # gimbal control path and GUI overlay (which subtract cur_pan
+        # from track az implicitly via "image position from boresight"
+        # math) don't need any changes.
+        cur_pan, cur_tilt = self._cur_gimbal_pose if self._world_frame else (0.0, 0.0)
         out: list[FusedTrack] = []
         for trk in self._tracks:
             if trk["hits"] < self.min_hits:
@@ -713,14 +758,19 @@ class FusionManager:
                 tc = TargetClass(trk["class"])
             except ValueError:
                 tc = TargetClass.UNKNOWN
+            # Convert track-stored world az/el back to camera frame for
+            # the published FusedTrack. When _world_frame is False the
+            # track az/el is already camera frame and we subtract zero.
+            pub_az = float(trk["az"]) - cur_pan
+            pub_el = float(trk["el"]) - cur_tilt
             out.append(FusedTrack(
                 id=int(trk["id"]),
                 target_class=tc,
                 confidence=float(trk["conf"]),
                 sensors=active_sensors,
                 primary=str(trk["primary"]),
-                az_deg=float(trk["az"]),
-                el_deg=float(trk["el"]),
+                az_deg=pub_az,
+                el_deg=pub_el,
                 ang_w_deg=float(trk["ang_w"]),
                 ang_h_deg=float(trk["ang_h"]),
                 hits=int(trk["hits"]),

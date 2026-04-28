@@ -516,6 +516,18 @@ fusion:
   # each fused track into every panel's pixel grid so the bbox is
   # "the same bbox" across sensors.
   enabled: true
+  # Phase 2 — store and match tracks in WORLD frame
+  # (cur_pan + cam_az_obs, cur_tilt + cam_el_obs) instead of camera
+  # frame. Keeps a target's track ID stable through gimbal motion;
+  # the camera-frame matcher silently transferred a track to whatever
+  # vehicle currently sat at the same camera-frame az during a slew
+  # (visible in 'single track oscilating after being in the center.jsonl'
+  # where world_az drifted ±2.5° in lock-step with the gimbal's
+  # commanded pan, instead of staying constant for the static target).
+  # Output FusedTrack still publishes CAMERA-frame az/el (= world -
+  # cur_pan at publish time) so gimbal control + GUI overlay don't
+  # need any changes. Set false to revert for A/B.
+  world_frame_fusion: true
   rate_hz: 15                   # fusion tick rate (independent of sensors)
   match_gate_deg: 0.7           # cross-sensor: max angular distance (deg) to fuse
   track_match_gate_deg: 2.0     # per-tick: max angular distance to match existing track
