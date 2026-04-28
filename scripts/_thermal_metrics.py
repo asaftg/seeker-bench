@@ -25,7 +25,7 @@ class FrameMetrics:
 
     Higher is better for: sharpness_lap, sharpness_tenengrad,
     rms_contrast, edge_density, hist_entropy, snr_db,
-    yolo_confidence_sum.
+    yolo_confidence_sum, structure_ratio.
 
     Lower is better for: saturation_pct, blackclip_pct, frame_diff
     (temporal stability — measured separately as it's pairwise).
@@ -40,6 +40,7 @@ class FrameMetrics:
     snr_db: float = 0.0
     yolo_confidence_sum: float = 0.0
     yolo_n_detections: int = 0
+    structure_ratio: float = 0.0  # 0..1, structure/noise discriminator
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class StackMetrics:
     snr_db: float = 0.0
     yolo_confidence_sum: float = 0.0
     yolo_n_detections: float = 0.0
+    structure_ratio: float = 0.0
     temporal_diff_mean: float = 0.0     # mean abs frame-to-frame diff
     temporal_diff_std: float = 0.0
     composite: float = 0.0
@@ -107,6 +109,37 @@ def saturation_pct(gray_u8: np.ndarray, threshold: int = 254) -> float:
 def blackclip_pct(gray_u8: np.ndarray, threshold: int = 1) -> float:
     """Fraction of pixels at/near the black floor (0). High = crushed."""
     return float(np.count_nonzero(gray_u8 <= threshold)) / float(gray_u8.size)
+
+
+def structure_to_noise_ratio(gray_u8: np.ndarray) -> float:
+    """Discriminate real scene structure from noise.
+
+    Computes ``std(blur(image)) / std(image)``. The intuition:
+    real scenes have most of their pixel variance in low + mid
+    spatial frequencies (object boundaries, gradients) which survive
+    a small blur. Pure noise has its variance concentrated in HIGH
+    spatial frequencies and is largely destroyed by even a 5×5
+    blur, so its post-blur std is much smaller.
+
+    Returns a value typically in [0, 1]:
+      - ~0.95 → essentially all variance is structure (clean real scene)
+      - ~0.7-0.9 → real scene with some grain (typical thermal frame)
+      - ~0.3 → noise-dominated
+      - ~0.05 → pure noise (gainLOW-broken state we hit on the bench)
+
+    Validated empirically on the indoor 2-3m sweep: gainHIGH real
+    scenes scored 0.85-0.95; gainLOW pure-noise scored 0.06-0.10.
+    A 5× discriminator power, plenty for the composite to use as a
+    gate term.
+    """
+    if gray_u8.size == 0:
+        return 0.0
+    full_std = float(gray_u8.std())
+    if full_std < 1e-3:
+        return 0.0
+    blurred = cv2.GaussianBlur(gray_u8, (5, 5), 1.0)
+    blur_std = float(blurred.std())
+    return min(1.0, blur_std / full_std)
 
 
 def snr_db_estimate(gray_u8: np.ndarray, patch: int = 32) -> float:
@@ -169,6 +202,7 @@ def per_frame_metrics(
         snr_db=snr_db_estimate(gray_u8),
         yolo_confidence_sum=yconf,
         yolo_n_detections=yn,
+        structure_ratio=structure_to_noise_ratio(gray_u8),
     )
 
 
@@ -194,10 +228,16 @@ def temporal_diff(stack_u8: np.ndarray) -> tuple[float, float]:
 # ───────────────────────────────────────────────────────────────
 
 DEFAULT_WEIGHTS = {
-    "sharpness_lap":          1.0,
+    # Lessons from indoor 2-3m sweep (2026-04-27): pure laplacian
+    # variance over-rewards noise. structure_ratio is now the GATE
+    # term — without real scene structure, no amount of sharpness
+    # helps. Frame stacks with ratio < 0.3 are likely noise; we
+    # multiply by it to crush noise scores.
+    "structure_ratio":       50.0,    # NEW: noise-vs-detail discriminator
+    "sharpness_lap":          0.5,    # halved — too easily fooled by grain
     "sharpness_tenengrad":    0.5,
     "rms_contrast":           0.4,
-    "edge_density":          50.0,    # tiny absolute value, big multiplier
+    "edge_density":          30.0,    # halved for same reason
     "hist_entropy":           0.6,
     "saturation_pct":       -50.0,    # PENALTY
     "blackclip_pct":        -50.0,    # PENALTY
@@ -234,6 +274,8 @@ def normalize_metric(name: str, raw: float) -> float:
         return min(1.0, raw / 6.0)
     if name == "temporal_diff_mean":
         return min(1.0, raw / 5.0)  # 0..5 grayscale-units of avg diff
+    if name == "structure_ratio":
+        return raw  # already 0..1
     return 0.0
 
 
@@ -251,7 +293,7 @@ def aggregate(frame_mlist: list[FrameMetrics],
         "sharpness_lap", "sharpness_tenengrad", "rms_contrast",
         "edge_density", "hist_entropy", "saturation_pct",
         "blackclip_pct", "snr_db", "yolo_confidence_sum",
-        "yolo_n_detections",
+        "yolo_n_detections", "structure_ratio",
     ]
     for k in keys:
         means[k] = float(np.mean([getattr(fm, k) for fm in frame_mlist]))
@@ -280,6 +322,7 @@ def aggregate(frame_mlist: list[FrameMetrics],
         snr_db=means["snr_db"],
         yolo_confidence_sum=means["yolo_confidence_sum"],
         yolo_n_detections=means["yolo_n_detections"],
+        structure_ratio=means["structure_ratio"],
         temporal_diff_mean=tdiff_mean,
         temporal_diff_std=tdiff_std,
         composite=composite,
