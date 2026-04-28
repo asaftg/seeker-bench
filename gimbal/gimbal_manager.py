@@ -503,6 +503,17 @@ class GimbalManager:
         self._track_no_obs_lead_zero_after_s: float = float(
             gcfg.get("track_no_obs_lead_zero_after_s", 0.30))
 
+        # Phase 3 — confidence gate for the velocity feed-forward in
+        # the closed-loop fused-track tick branch. Only apply
+        # `lead_time * world_dot` lookahead when the smoothed velocity
+        # is above this threshold on that axis. Below threshold the
+        # axis is treated as static and we rely on the closed-loop's
+        # pixel-error correction alone (no lookahead noise on a static
+        # target). Tuned to be just above the alpha-beta filter's
+        # noise floor on YOLO bbox jitter (~0.5°/s on a 5 m target).
+        self._track_lookahead_min_dps: float = float(
+            gcfg.get("track_lookahead_min_dps", 1.0))
+
         # Pure-function predictor (algorithms.track_predictor) — both
         # the live tick AND scripts/replay_algo.py call into this one
         # implementation. The state object is owned by this manager;
@@ -674,7 +685,14 @@ class GimbalManager:
         self._tilt_saturated_logged = False
 
         # Driver — may or may not actually open.
-        self._driver = MaestroDriver(port=port or gcfg.get("port"))
+        # PWM-gating: skip Maestro writes when |new_us - last_sent_us| <
+        # min_us_step. Turns a stream of tiny per-tick PWM updates into
+        # discrete steps the servo can act on. See MaestroDriver init
+        # docstring for details. 5 µs ≈ 0.5° at our calibration; matches
+        # the Yahboom internal servo deadband. Set 0 to disable.
+        min_us_step = float(gcfg.get("maestro_min_us_step", 5.0))
+        self._driver = MaestroDriver(port=port or gcfg.get("port"),
+                                      min_us_step=min_us_step)
         self._connected = False
         # Counter for consecutive write failures (auto-reconnect logic).
         self._consec_write_fail = 0
@@ -1220,8 +1238,42 @@ class GimbalManager:
                             cur_tilt, d_tilt_cl,
                             self._tilt_floor, self._tilt_ceil,
                             self._tilt_sat_eps_deg)
-                        sp_pan_pred  = cur_pan  + d_pan_cl
-                        sp_tilt_pred = cur_tilt + d_tilt_cl
+                        # Phase 3: confidence-gated velocity feed-forward.
+                        # The closed-loop above corrects the *current*
+                        # observed pixel error. For a moving target the
+                        # observation already lags reality by the
+                        # capture/process pipeline (~50-200 ms), and the
+                        # gimbal then takes more time to reach the
+                        # commanded position — so the camera always
+                        # arrives where the target *was*. Adding
+                        # lead_time × predicted_world_velocity pre-empts
+                        # the lag.
+                        # Gating: skip lookahead when the predictor
+                        # isn't confident in its velocity estimate
+                        # (so noise doesn't perturb a static target):
+                        #   - obs_count >= predict_warmup_n
+                        #   - last fresh obs < no_obs_lead_zero_after_s ago
+                        #   - |world_dot| >= track_lookahead_min_dps
+                        # Per-axis: a target moving fast in pan but
+                        # static in tilt gets pan lookahead only.
+                        ff_az_deg = 0.0
+                        ff_el_deg = 0.0
+                        ps = self._predictor_state
+                        if (ps.obs_count >= self._track_predict_warmup_n
+                                and ps.world_last_t is not None
+                                and (now - ps.world_last_t) <
+                                    self._track_no_obs_lead_zero_after_s):
+                            if abs(ps.world_az_dot) >= self._track_lookahead_min_dps:
+                                ff_az_deg = self._track_lead_time_s * ps.world_az_dot
+                            if abs(ps.world_el_dot) >= self._track_lookahead_min_dps:
+                                ff_el_deg = self._track_lead_time_s * ps.world_el_dot
+                            # Reuse predictor's existing extrap cap so
+                            # a velocity spike can't slam the setpoint.
+                            cap = self._track_predict_cap_deg
+                            ff_az_deg = max(-cap, min(cap, ff_az_deg))
+                            ff_el_deg = max(-cap, min(cap, ff_el_deg))
+                        sp_pan_pred  = cur_pan  + d_pan_cl  + ff_az_deg
+                        sp_tilt_pred = cur_tilt + d_tilt_cl + ff_el_deg
                     else:
                         # Stale tick — hold the previous setpoint so
                         # the gimbal finishes its in-flight motion

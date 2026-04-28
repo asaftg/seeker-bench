@@ -39,10 +39,33 @@ POLOLU_VID = 0x1FFB  # Pololu Corporation
 class MaestroDriver:
     """Minimal Maestro command interface over pyserial."""
 
-    def __init__(self, port: Optional[str] = None) -> None:
+    def __init__(self, port: Optional[str] = None,
+                 min_us_step: float = 0.0) -> None:
+        """``min_us_step`` (microseconds): if non-zero, ``set_target_us``
+        skips the actual write when the change from the last successfully-
+        sent target on a channel is < this threshold. Holds the previous
+        PWM until accumulated change exceeds the gate, then sends one
+        bigger step.
+
+        Why this exists: when the closed-loop gain produces small
+        per-tick corrections (e.g. 0.05° = ~0.5 µs PWM step), 60 Hz of
+        these tiny updates ride below the Yahboom servo's internal
+        deadband (~5 µs PWM ≈ 0.5°) and the servo's feedback loop
+        treats them as noise. Camera doesn't physically follow even
+        though the controller's commanded position advances. Gating
+        the writes turns a stream of tiny PWM changes into a sequence
+        of larger discrete steps the servo can actually act on.
+
+        Default 0.0 = legacy behaviour (write every command). Operator-
+        recommended starting value: 5 µs (~0.5°).
+        """
         self._explicit_port = port
         self._port: Optional[str] = None
         self._ser = None  # serial.Serial | None
+        self._min_us_step = float(min_us_step)
+        # Last successfully-written target per channel (used by the gate).
+        # Channel index → microseconds. Missing key = no prior write.
+        self._last_us: dict = {}
 
     # ── discovery ─────────────────────────────────────────────
 
@@ -133,15 +156,34 @@ class MaestroDriver:
 
         Pass ``microseconds == 0`` to release (servo goes floppy).
         Returns False if the port isn't open or the write fails.
+
+        When ``min_us_step`` is non-zero, the call is a no-op (returns
+        True without writing) if the change from the last successfully-
+        sent target on this channel is below the threshold. ``micro-
+        seconds == 0`` (release) is always sent.
         """
         if not self.is_open:
             return False
+        # PWM-gating: skip writes that fall below the servo's response
+        # threshold so per-tick commands accumulate into a real step.
+        # ``0`` (release) bypasses the gate so shutdown-release works.
+        if (self._min_us_step > 0.0 and microseconds > 0.0
+                and channel in self._last_us
+                and abs(microseconds - self._last_us[channel])
+                    < self._min_us_step):
+            return True  # gated; previous PWM stays in effect
         target_qus = 0 if microseconds <= 0 else int(round(microseconds * 4.0))
         lo = target_qus & 0x7F
         hi = (target_qus >> 7) & 0x7F
         packet = bytes([0x84, int(channel) & 0x7F, lo, hi])
         try:
             self._ser.write(packet)
+            if microseconds > 0.0:
+                self._last_us[channel] = float(microseconds)
+            else:
+                # Released — clear the cached "last" so the next non-
+                # zero command always writes regardless of gate.
+                self._last_us.pop(int(channel), None)
             return True
         except Exception as e:
             log.warning("Maestro write failed on ch %d: %s", channel, e)

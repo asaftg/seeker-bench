@@ -45,7 +45,7 @@ thermal:
   # Digital zoom presets (emulated narrow FOV)
   digital_zoom:
     enabled: true
-    preset: full                # full | wide | mid | narrow | tight
+    preset: wide                # full | wide | mid | narrow | tight — wide=37.5° matches operator baseline (2026-04-27)
     presets:
       full:   { hfov_deg: 75.0 }
       wide:   { hfov_deg: 37.5 }
@@ -605,6 +605,44 @@ gimbal:
   kp_track:    0.30           # was 0.15 — faster slew toward target
   deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
   max_step_deg: 2.0           # per-tick setpoint cap (unchanged)
+
+  # Soft-deadband band edges for the proportional control law. Below
+  # `track_zero_band_deg` of error: zero command. Between zero_band and
+  # `track_full_band_deg`: smooth ramp from 0 to kp*err. Above full_band:
+  # full proportional gain.
+  # 2026-04-27 phase-1 tuning: raised from 0.20/1.00 to 0.50/1.50 so the
+  # closed-loop stops generating tiny per-tick commands that fall below
+  # the Yahboom servo's internal deadband (~5-10 µs PWM ≈ 0.5-1°). Below
+  # the threshold the servo's feedback loop ignores the command as
+  # noise and the camera doesn't physically follow — controller's
+  # cur_pan advances anyway, gimbal_state lies. Operator-reported
+  # symptom: "gimbal is lazy" / "doesn't move at all" on small
+  # corrections in tracking number 4 + 5 recordings.
+  track_zero_band_deg: 0.50
+  track_full_band_deg: 1.50
+  track_min_step_deg: 0.05
+
+  # Maestro driver PWM-gating threshold (microseconds). Each tick the
+  # gimbal_manager pushes a fresh us target to the Maestro at 60 Hz.
+  # When the change from the last successfully-sent us target is below
+  # this threshold the driver skips the write — the previous PWM stays
+  # active until accumulated change crosses the gate. The Yahboom servo
+  # has an internal feedback deadband ~5-10 µs (≈0.5-1°); below that it
+  # ignores commands. Without this gate, fine corrections never reach
+  # the servo because each per-tick PWM step is too small. With the
+  # gate, fine corrections accumulate into a single discrete step.
+  # Set 0 to disable (legacy behaviour, write every tick).
+  maestro_min_us_step: 5.0
+
+  # Phase 3 — confidence gate for the velocity feed-forward applied
+  # in the closed-loop fused-track tick branch. Only add
+  # `lead_time * world_dot` lookahead when |world_dot| >= this
+  # threshold (per axis). Below threshold the axis is treated as
+  # static and lookahead is zero, so the noise floor in the alpha-
+  # beta velocity estimate (~0.5 °/s from YOLO bbox jitter) doesn't
+  # perturb a stationary target. 1.0 °/s is comfortably above noise,
+  # below typical walking-target rate (~12 °/s at 5 m range).
+  track_lookahead_min_dps: 1.0
 
   # Alpha-beta predictor knobs (algorithms/track_predictor.py).
   # Defaults are baked into PredictorParams; override here per rig.
