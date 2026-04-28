@@ -129,12 +129,27 @@ def tier1_baselines() -> List[PipelineConfig]:
 
 
 def tier2_clahe_y16_sweep() -> List[PipelineConfig]:
-    """Tier-2: CLAHE-Y16 parameter sweep (only if T1 winner is clahe_y16)."""
+    """Tier-2: CLAHE-Y16 tile_grid sweep.
+
+    NOTE 2026-04-27 dry-run finding: clip_limit doesn't change output
+    on the bench scene (its histogram doesn't trigger CLAHE's clip-
+    then-redistribute logic). Dropped from the sweep to save compute.
+    Tile_grid is the real lever — wider grid = more aggressive local
+    contrast.
+    """
     out = []
-    for clip in [1.0, 2.0, 3.0, 4.0, 6.0]:
-        for tile in [4, 8, 16]:
+    for tile in [4, 6, 8, 12, 16, 20, 24, 32]:
+        out.append(PipelineConfig(
+            f"clahe_y16_tile{tile}",
+            mode="clahe_y16",
+            clahe_y16_clip_limit=2.0, clahe_y16_tile_grid=tile,
+        ))
+    # Two extra clip_limit variants for the most-likely winner tile
+    # sizes, in case scene varies and the histogram hits CLAHE's clip:
+    for tile in [16, 24]:
+        for clip in [4.0, 8.0]:
             out.append(PipelineConfig(
-                f"clahe_y16_clip{clip}_tile{tile}",
+                f"clahe_y16_tile{tile}_clip{clip}",
                 mode="clahe_y16",
                 clahe_y16_clip_limit=clip, clahe_y16_tile_grid=tile,
             ))
@@ -257,8 +272,23 @@ class SweepResult:
     error: Optional[str] = None
 
 
+def _try_load_yolo() -> Optional[object]:
+    """Load the HV classifier model once for scoring. Returns None if
+    unavailable (no model file, no torch, etc.) — sweep then runs
+    without YOLO contribution to the composite score."""
+    model_path = os.path.join(_REPO_ROOT, "models", "seeker_thermal_hv.pt")
+    if not os.path.exists(model_path):
+        return None
+    try:
+        from ultralytics import YOLO  # type: ignore
+        return YOLO(model_path)
+    except Exception:
+        return None
+
+
 def sweep(y16_stack: np.ndarray, configs: Iterable[PipelineConfig],
-          out_dir: str, on_progress=None) -> List[SweepResult]:
+          out_dir: str, on_progress=None,
+          yolo_model: Optional[object] = None) -> List[SweepResult]:
     """Run the sweep, save per-config preview + metrics, return ranked results."""
     os.makedirs(out_dir, exist_ok=True)
     results: List[SweepResult] = []
@@ -268,7 +298,25 @@ def sweep(y16_stack: np.ndarray, configs: Iterable[PipelineConfig],
         os.makedirs(cfg_dir, exist_ok=True)
         try:
             u8_stack = render_pipeline(y16_stack, cfg)
-            mlist = [_tm.per_frame_metrics(u8_stack[k]) for k in range(u8_stack.shape[0])]
+            # YOLO inference on a SUBSET of frames to keep the sweep
+            # fast (one inference per ~5 frames is plenty for
+            # confidence-sum statistics).
+            yolo_results_per_frame = [None] * u8_stack.shape[0]
+            if yolo_model is not None:
+                stride = max(1, u8_stack.shape[0] // 6)
+                for k in range(0, u8_stack.shape[0], stride):
+                    bgr = cv2.cvtColor(u8_stack[k], cv2.COLOR_GRAY2BGR)
+                    try:
+                        ys = yolo_model.predict(bgr, conf=0.4, imgsz=640,
+                                                verbose=False, device=0)
+                        if ys:
+                            yolo_results_per_frame[k] = ys[0]
+                    except Exception:
+                        pass
+            mlist = [
+                _tm.per_frame_metrics(u8_stack[k], yolo_results_per_frame[k])
+                for k in range(u8_stack.shape[0])
+            ]
             sm = _tm.aggregate(mlist, u8_stack)
             # Save mid-frame preview (apply colormap)
             mid = u8_stack.shape[0] // 2
@@ -416,6 +464,13 @@ def main(argv=None) -> int:
         )
     print(f"[harness] y16 stack: {y16.shape}, agc8 stack: {agc8.shape}")
 
+    # Load HV model for YOLO scoring (None if model file missing).
+    yolo_model = _try_load_yolo()
+    if yolo_model is None:
+        print("[harness] YOLO model not loaded — sweep will run without YOLO scoring")
+    else:
+        print("[harness] YOLO HV model loaded — YOLO scoring will contribute to composite")
+
     # Build full sweep
     sweep_configs = tier1_baselines() + tier2_clahe_y16_sweep()
     if args.resume:
@@ -433,7 +488,8 @@ def main(argv=None) -> int:
     state.tier = "tier12_sweep"
     write_state(state, out_dir)
     try:
-        results = sweep(y16, sweep_configs, out_dir, on_progress=on_prog)
+        results = sweep(y16, sweep_configs, out_dir,
+                        on_progress=on_prog, yolo_model=yolo_model)
     except KeyboardInterrupt as e:
         print(f"[harness] stopped: {e}")
         return 130
@@ -448,7 +504,8 @@ def main(argv=None) -> int:
         state.tier = "tier3_post_enhance"
         write_state(state, out_dir)
         try:
-            t3_results = sweep(y16, t3_configs, out_dir, on_progress=on_prog)
+            t3_results = sweep(y16, t3_configs, out_dir,
+                               on_progress=on_prog, yolo_model=yolo_model)
         except KeyboardInterrupt as e:
             print(f"[harness] stopped during T3: {e}")
             return 130
