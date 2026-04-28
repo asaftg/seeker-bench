@@ -56,7 +56,7 @@ thermal:
       hot_count: 22500          # mode: gates — clip above this to 255 (white)
     clahe_y16:
       clip_limit: 2.0           # mode: clahe_y16 — CLAHE clip limit on raw u16
-      tile_grid: 8              # mode: clahe_y16 — CLAHE tile grid size
+      tile_grid: 12             # 2026-04-28 outdoor sweep winner: tile_12 composite 78.6 vs tile_8 75.3
     colormap: WHITE_HOT         # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA — operator preference 2026-04-27
 
   # Digital zoom presets (emulated narrow FOV)
