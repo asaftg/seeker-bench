@@ -800,6 +800,12 @@ class FusionManager:
             # track az/el is already camera frame and we subtract zero.
             pub_az = float(trk["az"]) - cur_pan
             pub_el = float(trk["el"]) - cur_tilt
+            # Also publish world-frame az/el directly. Consumers needing
+            # world coords (gimbal_manager's predictor) read these to
+            # avoid the (cur_pan + cam_az) round-trip, which leaks the
+            # publish-to-read latency as phantom velocity.
+            world_az = float(trk["az"]) if self._world_frame else None
+            world_el = float(trk["el"]) if self._world_frame else None
             out.append(FusedTrack(
                 id=int(trk["id"]),
                 target_class=tc,
@@ -812,5 +818,7 @@ class FusionManager:
                 ang_h_deg=float(trk["ang_h"]),
                 hits=int(trk["hits"]),
                 misses=int(trk["misses"]),
+                world_az_deg=world_az,
+                world_el_deg=world_el,
             ))
         BUS.publish(Topic.FUSED, out)

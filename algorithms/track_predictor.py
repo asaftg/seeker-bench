@@ -123,6 +123,8 @@ def step(
     obs_el_deg: Optional[float],
     fresh_fused: bool,
     params: PredictorParams,
+    obs_world_az_deg: Optional[float] = None,
+    obs_world_el_deg: Optional[float] = None,
 ) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
     """One predictor tick.
 
@@ -130,6 +132,15 @@ def step(
         cur_pan/cur_tilt: gimbal pose right now (deg, world-frame)
         obs_az/el_deg: camera-frame angle of the target on the latest
             fused track. May be None on a dropped tick.
+        obs_world_az/el_deg: PRE-CONVERTED world-frame angles of the
+            same observation. When provided, these are used directly
+            and the (cur_pan + obs_az_deg) reconstruction is skipped.
+            Timing-invariant path: callers that already have the track
+            in world frame (e.g. FusedTrack.world_az_deg from the
+            sensor-stamped fusion pipeline) avoid the latency leak from
+            recovering world-frame via cur_pan, which causes phantom
+            velocity during gimbal slews (the bug from `track test
+            6.jsonl`).
         fresh_fused: True when this tick has a NEW fused observation
             (i.e. the (id, hits) tuple changed since last call).
         params: PredictorParams snapshot — caller may swap variants
@@ -159,9 +170,22 @@ def step(
 
     obs_world_az: Optional[float] = None
     obs_world_el: Optional[float] = None
-    if fresh_fused and obs_az_deg is not None and obs_el_deg is not None:
-        obs_world_az = float(cur_pan)  + float(obs_az_deg)
-        obs_world_el = float(cur_tilt) + float(obs_el_deg)
+    have_world_inputs = (obs_world_az_deg is not None
+                          and obs_world_el_deg is not None)
+    have_cam_inputs = (obs_az_deg is not None and obs_el_deg is not None)
+    if fresh_fused and (have_world_inputs or have_cam_inputs):
+        if have_world_inputs:
+            # Timing-invariant: caller supplied world angles directly.
+            # No cur_pan dependency, so a fast gimbal slew between the
+            # observation's capture and this tick can't leak into a
+            # phantom world-frame velocity.
+            obs_world_az = float(obs_world_az_deg)
+            obs_world_el = float(obs_world_el_deg)
+        else:
+            # Legacy reconstruction: world = cur_pan + cam_az. Subject
+            # to publish-to-read latency leak (see docstring).
+            obs_world_az = float(cur_pan)  + float(obs_az_deg)
+            obs_world_el = float(cur_tilt) + float(obs_el_deg)
         # Velocity update — gated on settled.
         if (settled and state.world_az is not None
                 and state.world_last_t is not None):
