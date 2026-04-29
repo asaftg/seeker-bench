@@ -947,6 +947,11 @@ function connect() {
   const wsStatus = $("ws-status");
   if (wsStatus) wsStatus.textContent = "WS: connecting…";
   ws = new WebSocket(wsUrl);
+  // Binary WS frames carry the EO JPEG without base64+JSON wrap. The
+  // framing is [4 bytes LE header length][JSON header][JPEG bytes],
+  // emitted by gui/app.py:_eo_sender. Decoding via DataView+Blob is
+  // dramatically cheaper than base64-decoding a 600 KB string.
+  ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
     if (wsStatus) wsStatus.textContent = "WS: connected";
@@ -966,30 +971,47 @@ function connect() {
 
   ws.onmessage = (ev) => {
     tickFps();
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch(_) { return; }
 
-    // Fast EO path. The server now publishes EO frames on a dedicated
-    // task at sensor-arrival cadence (see gui/app.py:_eo_sender) tagged
-    // {"type":"eo_only", ...}. Render the image immediately using the
-    // last-known fused/radar overlay data cached from the shared
-    // "sensors" message — so the EO panel refreshes at the sensor's
-    // real fps instead of the shared periodic loop's slowest-common
-    // cadence. The shared "sensors" message keeps everything else
-    // (thermal, fused, radar, gimbal) and updates EO overlays at its
-    // own cadence; image bytes are stripped out of it server-side
-    // (`eo.jpeg_b64 = null`) so we don't pay the encode twice.
-    if (msg && msg.type === "eo_only") {
-      const eo = msg.eo || {};
-      _tickFrameFps(_eoFps, eo.frame_id);
-      eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
-      if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
-      const eoPill = "pill-eo";
-      setPill(eoPill, eo.connected ? "on" : "off", "EO");
-      const eoHz = $("eo-hz");
-      if (eoHz) eoHz.textContent = eo.connected ? (_eoFps.current + " Hz") : "— Hz";
+    // Binary EO fast path. gui/app.py:_eo_sender emits one binary
+    // WS frame per EO sensor frame, formatted as:
+    //   [4 bytes LE header length N][N bytes JSON header][JPEG bytes]
+    // Skipping base64 + JSON-string-wrap of a ~464 KB JPEG saves both
+    // wire bytes (~33%) and Python serialization cost. Render via
+    // URL.createObjectURL so the JPEG is decoded by the browser's
+    // native image pipeline, not from a data: URL.
+    if (ev.data instanceof ArrayBuffer) {
+      try {
+        const buf = ev.data;
+        const dv = new DataView(buf);
+        const hdrLen = dv.getUint32(0, true);
+        const hdrBytes = new Uint8Array(buf, 4, hdrLen);
+        const hdrStr = new TextDecoder("utf-8").decode(hdrBytes);
+        const hdrMsg = JSON.parse(hdrStr);
+        if (hdrMsg && hdrMsg.type === "eo_only") {
+          const eo = hdrMsg.eo || {};
+          _tickFrameFps(_eoFps, eo.frame_id);
+          // Wrap raw JPEG bytes in a Blob → object URL → img.src.
+          // Old object URL is revoked inside eo_view.update() to
+          // prevent the per-frame Blob leak from ballooning memory.
+          const jpegBytes = new Uint8Array(buf, 4 + hdrLen);
+          if (jpegBytes.byteLength > 0) {
+            const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+            eo._blobUrl = URL.createObjectURL(blob);
+          }
+          eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
+          if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
+          setPill("pill-eo", eo.connected ? "on" : "off", "EO");
+          const eoHz = $("eo-hz");
+          if (eoHz) eoHz.textContent = eo.connected ? (_eoFps.current + " Hz") : "— Hz";
+        }
+      } catch (e) {
+        console.warn("binary EO parse failed", e);
+      }
       return;
     }
+
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch(_) { return; }
 
     // Replay-mode banner + clock. The replay server stamps `replay:true`
     // on every envelope plus `replay_t_s` (seconds since session start).

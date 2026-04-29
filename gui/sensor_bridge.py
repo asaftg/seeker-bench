@@ -330,6 +330,82 @@ def radar_to_wire(
     }
 
 
+def eo_to_wire_split(
+    ef: Optional[EOFrame], jpeg_quality: int = 80
+) -> tuple[Dict[str, Any], Optional[bytes]]:
+    """Like eo_to_wire, but returns (header_dict, jpeg_bytes) instead of
+    folding base64'd JPEG into the JSON. Used by the binary WS path —
+    see gui/app.py:_eo_sender.
+
+    The header dict is identical to eo_to_wire's output EXCEPT
+    `jpeg_b64` is replaced with `jpeg_size` (just the byte length, so
+    the client knows what to expect). JPEG bytes go on the wire as
+    raw binary — no base64 (33% bytes + CPU saved), no JSON wrap.
+
+    Falls back to (header, None) for disconnected/empty frames.
+    """
+    if ef is None or not ef.connected:
+        hdr = {
+            "connected": False,
+            "initializing": bool(getattr(ef, "initializing", False)) if ef is not None else False,
+            "frame_id": ef.frame_id if ef is not None else 0,
+            "timestamp": ef.timestamp if ef is not None else 0.0,
+            "jpeg_size": 0,
+            "width": 0,
+            "height": 0,
+            "hfov_deg": ef.hfov_deg if ef is not None else 11.05,
+            "vfov_deg": ef.vfov_deg if ef is not None else 9.23,
+            "source_device": None,
+            "detections": [],
+        }
+        return hdr, None
+
+    w, h = 0, 0
+    if ef.bgr is not None:
+        h, w = ef.bgr.shape[:2]
+
+    # Fast path: reuse cached encode from EO process thread.
+    cached = getattr(ef, "jpeg_bytes", None)
+    cached_q = int(getattr(ef, "jpeg_quality", -1))
+    jpeg_bytes: Optional[bytes] = None
+    if cached and cached_q == int(jpeg_quality):
+        jpeg_bytes = cached
+    elif ef.bgr is not None:
+        ok, buf = cv2.imencode(".jpg", ef.bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+        if ok:
+            jpeg_bytes = bytes(buf)
+
+    det_list = []
+    for det in ef.detections:
+        det_list.append({
+            "bbox": {
+                "x": det.bbox.x, "y": det.bbox.y,
+                "w": det.bbox.w, "h": det.bbox.h,
+            },
+            "track_id": det.track_id,
+            "classification": {
+                "target_class": det.target_class.value,
+                "confidence": round(float(det.confidence), 3),
+                "classifier_used": "yolo_eo",
+            },
+        })
+
+    hdr = {
+        "connected": True,
+        "initializing": bool(getattr(ef, "initializing", False)),
+        "frame_id": ef.frame_id,
+        "timestamp": ef.timestamp,
+        "jpeg_size": len(jpeg_bytes) if jpeg_bytes is not None else 0,
+        "width": w,
+        "height": h,
+        "hfov_deg": ef.hfov_deg,
+        "vfov_deg": ef.vfov_deg,
+        "source_device": ef.source_device,
+        "detections": det_list,
+    }
+    return hdr, jpeg_bytes
+
+
 def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
     """Serialize an EOFrame for the WebSocket.
 

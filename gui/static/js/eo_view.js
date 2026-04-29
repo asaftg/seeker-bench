@@ -217,7 +217,19 @@ export class EOView {
     this._lastDetections = eo.detections || [];
     if (eo.hfov_deg != null) this._lastHfovDeg = Number(eo.hfov_deg);
 
-    if (eo.jpeg_b64) {
+    if (eo._blobUrl) {
+      // Binary WS path (preferred): main.js wraps the raw JPEG bytes
+      // in a Blob and hands us the object URL. Revoke the previous
+      // URL once we set the new one — without this, every frame
+      // leaks a ~464 KB Blob and memory climbs unboundedly within
+      // a few minutes.
+      const old = this._lastBlobUrl;
+      this._lastBlobUrl = eo._blobUrl;
+      this.img.src = eo._blobUrl;
+      if (old) {
+        try { URL.revokeObjectURL(old); } catch (_) {}
+      }
+    } else if (eo.jpeg_b64) {
       this.img.src = "data:image/jpeg;base64," + eo.jpeg_b64;
     } else {
       this._draw();

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 import sys
 import time
 from pathlib import Path
@@ -27,7 +28,7 @@ from common.events import emit as emit_event
 from common.frame_bus import BUS
 from common.frames import Topic
 from common.logging_setup import get_logger
-from gui.sensor_bridge import build_ws_message, eo_to_wire
+from gui.sensor_bridge import build_ws_message, eo_to_wire, eo_to_wire_split
 
 log = get_logger(__name__)
 
@@ -488,20 +489,26 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 await asyncio.sleep(period)
 
         async def _eo_sender() -> None:
-            """EO fast path — emit the full EO wire dict (with JPEG)
-            whenever EOFrame.frame_id advances, decoupled from the
-            shared periodic sender.
+            """EO fast path — binary WS frames.
 
-            Sleeps `_eo_idle_poll_s` (5 ms) ONLY when no new frame is
-            on the bus. After a successful send we loop straight back
-            to polling — the bus is latest-only, so any wait here
-            risks the next sensor frame being overwritten before we
-            see it.
+            For each new EOFrame on the bus, emits ONE binary message
+            framed as:
 
-            eo_to_wire reuses the cached jpeg_bytes the EO process
-            thread attached to the EOFrame (see eo/eo_manager.py) —
-            only base64 of the cached bytes happens on this coroutine,
-            no cv2.imencode.
+                [4 bytes LE  = header length N]
+                [N bytes     = UTF-8 JSON header  {type, ts, eo: {...}}]
+                [rest        = raw JPEG bytes (already encoded by the
+                               EO process thread)]
+
+            Skipping the base64 + JSON-string-escape + UTF-8-encode of
+            the entire JPEG (~620 KB after expansion at 464 KB JPEGs)
+            cuts both wire bytes (~33%) and Python serialization cost
+            on every frame. Atomic per-message — header and JPEG can
+            never get out of order with concurrent shared-sender
+            messages, no client-side pairing logic required.
+
+            JS counterpart parses the framing in `gui/static/js/main.js`
+            ws.onmessage and renders via URL.createObjectURL so the
+            JPEG never round-trips through a base64 data: URL.
             """
             last_frame_id = -1
             while True:
@@ -512,28 +519,30 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     continue
                 last_frame_id = int(fid)
                 try:
-                    eo_wire = eo_to_wire(ef, jpeg_quality=eo_jpeg_quality)
-                    text = json.dumps(
-                        {"type": "eo_only", "ts": time.time(), "eo": eo_wire},
-                        default=str,
+                    eo_hdr, jpeg_bytes = eo_to_wire_split(
+                        ef, jpeg_quality=eo_jpeg_quality
+                    )
+                    hdr_obj = {"type": "eo_only", "ts": time.time(), "eo": eo_hdr}
+                    hdr_bytes = json.dumps(hdr_obj, default=str).encode("utf-8")
+                    payload = (
+                        struct.pack("<I", len(hdr_bytes))
+                        + hdr_bytes
+                        + (jpeg_bytes if jpeg_bytes is not None else b"")
                     )
                 except Exception:
                     log.exception("eo_sender encode failed — skipping frame")
                     await asyncio.sleep(_eo_idle_poll_s)
                     continue
                 try:
-                    await ws.send_text(text)
+                    await ws.send_bytes(payload)
                 except WebSocketDisconnect:
                     raise
                 except RuntimeError as e:
                     log.info("WebSocket send after close: %s", e)
                     return
                 # Yield to the shared _sender / _receiver so a tight
-                # eo_only loop doesn't monopolize the event loop. A
-                # zero-duration sleep is a cooperative yield only —
-                # NO throttling. Without this yield, total throughput
-                # actually drops because the shared sender starves
-                # and the WS pipe ends up idle while we busy-encode.
+                # eo_only loop doesn't monopolize the event loop.
+                # Zero-duration sleep = cooperative yield, no rate cap.
                 await asyncio.sleep(0)
 
         async def _receiver() -> None:
