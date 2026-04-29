@@ -275,7 +275,10 @@ def main() -> int:
                         dims=_dims,
                         pmm_band_low_hz=50.0,
                         pmm_band_high_hz=500.0,
-                        pmm_threshold_db=6.0,
+                        # 12 dB default per pmm_detector docstring —
+                        # 6 dB produced ~45% false-alarm rate per
+                        # range bin in the field test.
+                        pmm_threshold_db=12.0,
                         profile_name="awr2944p_unified",
                         max_range_m=float(radar_cfg.get("max_range_m", 250.0)),
                         az_half_deg=float(radar_cfg.get("az_half_deg", 60.0)),

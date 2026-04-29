@@ -75,7 +75,7 @@ def detect_pmm(
     prf_hz: float,
     band_low_hz: float = 50.0,
     band_high_hz: float = 500.0,
-    threshold_db: float = 6.0,
+    threshold_db: float = 12.0,
 ) -> PMMResult:
     """Run PMM detection on a 1-D slow-time slice at one range bin.
 
@@ -93,7 +93,13 @@ def detect_pmm(
         when aliased into Nyquist; Shahed-class ~150–250 Hz un-aliased).
     threshold_db : float
         Peak-to-noise-floor ratio above which we declare detection.
-        Default 6 dB. Tunable via the GUI slider in production.
+        Default 12 dB — pure-noise statistics of "best score over
+        ~340 candidate offsets" land around +6 dB by chance, so a
+        threshold below ~10 dB will produce ~50 % false alarm rate
+        per range bin (we saw 45 % at threshold=3 dB in the field).
+        Real propeller signatures land at +20–40 dB, so 12 dB
+        gives a wide margin without rejecting real drones.
+        Tunable via the GUI slider in production.
 
     Returns
     -------
@@ -132,7 +138,22 @@ def detect_pmm(
     #    Δ ∈ [band_low_hz, band_high_hz]. Score is min(|X[+Δ]|, |X[-Δ]|)
     #    — both sidebands must be strong; either one can be a
     #    coincidence. The propeller signature is the symmetry.
-    delta_min = max(1, int(round(band_low_hz / bin_hz)))
+    #
+    # IMPORTANT — Hann main-lobe guard. The Hann window we applied at
+    # step 2 has a main lobe ~2 FFT bins wide on each side of any
+    # tone (and a first sidelobe at -31 dB ~3 bins out). A strong
+    # body-Doppler return therefore SPILLS into delta ∈ {±1..±3}
+    # via window leakage, producing what looks like a symmetric
+    # sideband pair on EVERY bright range bin — even pure body-tone
+    # returns with no propeller. We saw this in practice: a brick
+    # wall at 250 m produced "blade rate 17.5 Hz" detections on
+    # every frame because 17.5 Hz = 2 bins at our 8.78 Hz/bin
+    # resolution. Force delta_min ≥ HANN_GUARD_BINS to skip that
+    # leakage region. The cost is we can't detect blade rates
+    # below ~4 × bin_hz (35 Hz at our cfg), which is well below
+    # any real propeller anyway.
+    HANN_GUARD_BINS = 4
+    delta_min = max(HANN_GUARD_BINS, int(round(band_low_hz / bin_hz)))
     delta_max = min(n_fft // 2 - 1, int(round(band_high_hz / bin_hz)))
     if delta_min >= delta_max:
         return PMMResult(detected=False, band_snr_db=float("-inf"),
@@ -189,7 +210,7 @@ def scan_range_bins(
     *,
     band_low_hz: float = 50.0,
     band_high_hz: float = 500.0,
-    threshold_db: float = 6.0,
+    threshold_db: float = 12.0,
 ) -> List[Tuple[int, PMMResult]]:
     """Run ``detect_pmm`` on every range bin of a (n_range, n_chirps)
     slow-time matrix. Returns ``[(range_bin_idx, PMMResult), ...]``

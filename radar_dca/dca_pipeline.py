@@ -340,6 +340,13 @@ class DCAPipeline:
         """
         bpf = self._dims.bytes_per_frame
         TICK_S = 0.020
+        # LVDS stall watchdog. If the listener has been packet-silent
+        # for this long, log ONCE per stall — chip-side problems
+        # (FPGA timeout, AWR LVDS shutdown, cable yanked) are
+        # invisible otherwise: TLV keeps working over UART so the
+        # other manager looks healthy.
+        STALL_WARN_S = 5.0
+        _stall_logged = False
 
         while not self._stop.is_set():
             # 1. Pull all queued payloads from the listener.
@@ -348,6 +355,31 @@ class DCAPipeline:
                 # bytearray.extend(bytes) is amortized O(N).
                 for p in payloads:
                     self._buf.extend(p)
+
+            # 1b. Stall watchdog. ``last_packet_age_s`` is +inf before
+            # the first packet ever arrives — don't warn about boot
+            # quiescence, only about a stream that USED to flow and
+            # has gone silent.
+            try:
+                ds = self._listener.stats()
+                age = ds.last_packet_age_s
+                if (ds.packets_total > 0
+                        and age != float("inf")
+                        and age > STALL_WARN_S):
+                    if not _stall_logged:
+                        log.warning(
+                            "LVDS stalled: no UDP for %.1fs (chip stopped "
+                            "streaming?) — power-cycle the AWR if this "
+                            "persists. packets_total=%d seq_drops=%d",
+                            age, ds.packets_total, ds.seq_drops_total,
+                        )
+                        _stall_logged = True
+                else:
+                    if _stall_logged and age < 0.5:
+                        log.info("LVDS recovered (last_packet_age=%.2fs)", age)
+                    _stall_logged = False
+            except Exception:
+                pass
 
             # 2. Process as many full frames as the buffer holds.
             processed_any = False
