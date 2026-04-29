@@ -568,6 +568,10 @@ def fused_to_wire(
             "hits": trk.hits,
             "bbox_thermal": bt,
             "bbox_eo": be,
+            # Pass-through EO ByteTrack id so the EO panel's raw-det
+            # labeller can match by id instead of bbox-IoU (more robust
+            # under EMA smoothing of the fused track's stored angles).
+            "eo_track_id": getattr(trk, "eo_track_id", None),
         })
     return out
 

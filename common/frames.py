@@ -249,6 +249,13 @@ class FusedTrack:
     # the round-trip.
     world_az_deg: Optional[float] = None
     world_el_deg: Optional[float] = None
+    # Latest EO ByteTrack id contributing to this fused track. Used by
+    # the GUI to label raw EO detections with the same fused id (was
+    # falling back to bbox-IoU which fails after a few ticks of EMA
+    # smoothing — operator saw `E#15` on the EO panel while the same
+    # target's projection on thermal showed `#30`). None if no EO
+    # observation has updated this track recently.
+    eo_track_id: Optional[int] = None
 
 
 # ───────────────────────────────────────────────────────────────

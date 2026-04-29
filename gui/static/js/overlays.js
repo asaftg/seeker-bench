@@ -168,11 +168,39 @@ export function isSubsumedByFused(rawBBox, fusedTracks, sideKey, iouMin = 0.15) 
   return false;
 }
 
-// Best fused ID for a raw detection on a given side, or null. Matching
-// is greedy IoU on the side-specific projected bbox. Used to stamp raw
-// detection labels with the same fusion ID shown in the targets list.
-export function fusedIdForDet(rawBBox, fusedTracks, sideKey, iouMin = 0.20) {
-  if (!rawBBox || !fusedTracks || !fusedTracks.length) return null;
+// Best fused ID for a raw detection on a given side, or null. Used to
+// stamp raw detection labels with the same fusion ID shown in the
+// targets list and on the cross-sensor projection.
+//
+// Two-stage match:
+//   1. Direct ID (sideKey="bbox_eo" → match `det.track_id` against
+//      fused track's `eo_track_id`). Robust under EMA smoothing
+//      where the fused track's stored angles drift slightly off the
+//      raw EO bbox and IoU drops below threshold despite being the
+//      same physical target. This is the path that fixes the
+//      operator-reported "E#15 on EO panel, #30 on thermal" desync.
+//   2. Greedy IoU fallback on the projected bbox — for thermal raw
+//      dets (no track_id), or when the fused track was just born
+//      and hasn't recorded its source eo_track_id yet.
+export function fusedIdForDet(rawBBox, fusedTracks, sideKey, iouMin = 0.20, det = null) {
+  if (!fusedTracks || !fusedTracks.length) return null;
+
+  // Stage 1: direct ID match (EO side only — only EO carries
+  // per-detection track_id on the wire).
+  if (sideKey === "bbox_eo" && det && det.track_id != null) {
+    const tid = Number(det.track_id);
+    if (tid >= 0) {
+      for (const t of fusedTracks) {
+        if (!t) continue;
+        if (t.eo_track_id != null && Number(t.eo_track_id) === tid) {
+          return t.id;
+        }
+      }
+    }
+  }
+
+  // Stage 2: bbox-IoU fallback.
+  if (!rawBBox) return null;
   let bestId = null;
   let bestIou = iouMin;
   for (const t of fusedTracks) {

@@ -276,6 +276,7 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    max(e["conf"], t["conf"]),
+                    "eo_track_id": e.get("eo_track_id"),
                     # Primary's pose-at-capture wins (az/el also from EO).
                     "_pose_pan":  e.get("_pose_pan"),
                     "_pose_tilt": e.get("_pose_tilt"),
@@ -288,6 +289,7 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    e["conf"],
+                    "eo_track_id": e.get("eo_track_id"),
                     "_pose_pan":  e.get("_pose_pan"),
                     "_pose_tilt": e.get("_pose_tilt"),
                 })
@@ -509,6 +511,13 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,
                 "conf": float(d.confidence),
+                # Pass-through the EO ByteTrack id so the eventual fused
+                # track can be cross-referenced from the EO panel by id
+                # (more robust than bbox-IoU which drifts with EMA
+                # smoothing). None when ByteTrack hasn't confirmed yet.
+                "eo_track_id": (int(d.track_id)
+                                if getattr(d, "track_id", None) is not None
+                                and int(d.track_id) >= 0 else None),
                 "_pose_pan": pose_pan,
                 "_pose_tilt": pose_tilt,
             })
@@ -576,6 +585,14 @@ class FusionManager:
                     trk["last_obs_pose_pan"] = float(c["_pose_pan"])
                 if c.get("_pose_tilt") is not None:
                     trk["last_obs_pose_tilt"] = float(c["_pose_tilt"])
+                # Latest EO ByteTrack id contributing to this track,
+                # so the GUI can label raw EO detections with the same
+                # fused id (was using bbox IoU which drifts with EMA
+                # smoothing → label fell back to E#N even when fusion
+                # had a track for it). None if this update was thermal-
+                # or radar-only.
+                if c.get("eo_track_id") is not None:
+                    trk["eo_track_id"] = int(c["eo_track_id"])
                 # Class promotion: a radar-born track stays RADAR_TARGET
                 # until an EO/thermal observation joins, at which point
                 # we lock in the real class. Once locked, never overwrite
@@ -622,6 +639,9 @@ class FusionManager:
                     "last_obs_pose_tilt": (float(c["_pose_tilt"])
                                             if c.get("_pose_tilt") is not None
                                             else None),
+                    "eo_track_id": (int(c["eo_track_id"])
+                                     if c.get("eo_track_id") is not None
+                                     else None),
                 })
                 try:
                     from common.events import emit as _emit
@@ -895,5 +915,6 @@ class FusionManager:
                 misses=int(trk["misses"]),
                 world_az_deg=world_az,
                 world_el_deg=world_el,
+                eo_track_id=trk.get("eo_track_id"),
             ))
         BUS.publish(Topic.FUSED, out)
