@@ -329,10 +329,17 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
         # _eo_sender below). The shared periodic sender continues to
         # carry thermal/fused/radar/gimbal at `period`, but its EO
         # field is metadata-only (no jpeg_b64) so per-tick cost is no
-        # longer dominated by the EO encode/serialize. Cap the EO fast
-        # path at 30 Hz — beyond that we're shipping faster than any
-        # downstream consumer benefits from.
-        eo_fast_period = 1.0 / 30.0
+        # longer dominated by the EO encode/serialize.
+        #
+        # `_eo_idle_poll_s` is the only sleep on the EO fast path —
+        # 5 ms when no new frame is on the bus, so we don't burn CPU
+        # busy-looping. There is intentionally NO post-send throttle:
+        # an earlier 33 ms post-send sleep was added as a "30 Hz cap"
+        # but at sensor publish ~50 ms we'd miss roughly a third of
+        # frames (cycle 50+15 > 50, lossy), and the GUI saw 14 Hz
+        # instead of 20. Removing it lets us deliver every frame the
+        # process thread publishes.
+        _eo_idle_poll_s = 0.005
 
         # Per-connection mutable state.
         #   tracked_target_id: the fused-track ID the user pressed TRACK
@@ -483,22 +490,25 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
         async def _eo_sender() -> None:
             """EO fast path — emit the full EO wire dict (with JPEG)
             whenever EOFrame.frame_id advances, decoupled from the
-            shared periodic sender. Throttled at `eo_fast_period`
-            ceiling so we don't ship more than the GUI can render.
+            shared periodic sender.
 
-            Crucially, eo_to_wire reuses the cached jpeg_bytes the EO
-            process thread attached to the EOFrame (see
-            eo/eo_manager.py:_process_and_publish) — only base64 of the
-            cached bytes happens on this coroutine, no cv2.imencode.
+            Sleeps `_eo_idle_poll_s` (5 ms) ONLY when no new frame is
+            on the bus. After a successful send we loop straight back
+            to polling — the bus is latest-only, so any wait here
+            risks the next sensor frame being overwritten before we
+            see it.
+
+            eo_to_wire reuses the cached jpeg_bytes the EO process
+            thread attached to the EOFrame (see eo/eo_manager.py) —
+            only base64 of the cached bytes happens on this coroutine,
+            no cv2.imencode.
             """
             last_frame_id = -1
             while True:
                 ef = BUS.get_latest(Topic.EO)
                 fid = getattr(ef, "frame_id", None) if ef is not None else None
                 if fid is None or fid == last_frame_id:
-                    # No fresh frame; sleep a short tick and re-poll.
-                    # 5 ms keeps the loop responsive without burning CPU.
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(_eo_idle_poll_s)
                     continue
                 last_frame_id = int(fid)
                 try:
@@ -509,7 +519,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     )
                 except Exception:
                     log.exception("eo_sender encode failed — skipping frame")
-                    await asyncio.sleep(eo_fast_period)
+                    await asyncio.sleep(_eo_idle_poll_s)
                     continue
                 try:
                     await ws.send_text(text)
@@ -518,7 +528,13 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 except RuntimeError as e:
                     log.info("WebSocket send after close: %s", e)
                     return
-                await asyncio.sleep(eo_fast_period)
+                # Yield to the shared _sender / _receiver so a tight
+                # eo_only loop doesn't monopolize the event loop. A
+                # zero-duration sleep is a cooperative yield only —
+                # NO throttling. Without this yield, total throughput
+                # actually drops because the shared sender starves
+                # and the WS pipe ends up idle while we busy-encode.
+                await asyncio.sleep(0)
 
         async def _receiver() -> None:
             async for raw in ws.iter_text():
