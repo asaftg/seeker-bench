@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional, Protocol
 
+import cv2
 import numpy as np
 
 from common.config import load_config
@@ -335,6 +336,13 @@ class EOManager:
         # native is overkill for every downstream stage; cutting width in
         # half quarters the per-frame pixel work everywhere.
         self._display_max_width = int(ecfg.get("display_max_width", 1236))
+
+        # JPEG-encode the final BGR frame ONCE on this thread, attach to
+        # EOFrame.jpeg_bytes, so the asyncio WS sender doesn't pay the
+        # cv2.imencode + base64 cost on every tick. Same quality knob
+        # the GUI WS endpoint reads at gui/app.py — keep them in sync.
+        gui_cfg = cfg.get("gui", {}) or {}
+        self._eo_jpeg_quality = int(gui_cfg.get("eo_jpeg_quality", 82))
 
         # Test-webcam FOV override. The real IMX568 + 35mm is ~11° HFOV;
         # a generic webcam is ~60-70°. If fusion is told the wrong FOV,
@@ -1294,6 +1302,25 @@ class EOManager:
         # now. If/when the INITIALIZING scrim is reintroduced, restore the
         # field on EOFrame and re-add the kwarg here.
         del is_initializing  # silences "unused" lint
+        # Encode the JPEG once, here, on the EO process thread. Removes
+        # the dominant per-tick cost from the asyncio WS sender — see
+        # gui/sensor_bridge.py:eo_to_wire and gui/app.py:_sender for the
+        # consumers, which now reuse these bytes instead of re-encoding
+        # the same frame on every WS tick. JSONL recorder also reuses
+        # them via recording/encoders.encode_eo.
+        jpeg_bytes: Optional[bytes] = None
+        try:
+            ok, buf = cv2.imencode(
+                ".jpg", frame,
+                [cv2.IMWRITE_JPEG_QUALITY, int(self._eo_jpeg_quality)],
+            )
+            if ok:
+                jpeg_bytes = bytes(buf)
+        except Exception as e:
+            log.warning("EO JPEG encode failed (frame_id=%d): %s",
+                        self._frame_id, e)
+            jpeg_bytes = None
+
         ef = EOFrame(
             timestamp=ts,
             frame_id=self._frame_id,
@@ -1305,6 +1332,8 @@ class EOManager:
             source_device=dev_idx,
             gimbal_pan_at_capture=gimbal_pan_at_capture,
             gimbal_tilt_at_capture=gimbal_tilt_at_capture,
+            jpeg_bytes=jpeg_bytes,
+            jpeg_quality=int(self._eo_jpeg_quality),
         )
         BUS.publish(Topic.EO, ef)
 

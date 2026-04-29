@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -26,7 +27,7 @@ from common.events import emit as emit_event
 from common.frame_bus import BUS
 from common.frames import Topic
 from common.logging_setup import get_logger
-from gui.sensor_bridge import build_ws_message
+from gui.sensor_bridge import build_ws_message, eo_to_wire
 
 log = get_logger(__name__)
 
@@ -324,6 +325,14 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
         # foliage/brick. Default 92 ≈ visually lossless on mono.
         eo_jpeg_quality = int(cfg.get("gui", {}).get("eo_jpeg_quality", 92))
         period = 1.0 / max(1e-3, ws_fps)
+        # EO publishes on its own task at sensor-arrival cadence (see
+        # _eo_sender below). The shared periodic sender continues to
+        # carry thermal/fused/radar/gimbal at `period`, but its EO
+        # field is metadata-only (no jpeg_b64) so per-tick cost is no
+        # longer dominated by the EO encode/serialize. Cap the EO fast
+        # path at 30 Hz — beyond that we're shipping faster than any
+        # downstream consumer benefits from.
+        eo_fast_period = 1.0 / 30.0
 
         # Per-connection mutable state.
         #   tracked_target_id: the fused-track ID the user pressed TRACK
@@ -441,6 +450,17 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                             pass
                     if ext:
                         payload["extrinsic"] = ext
+                    # Tag the message type — JS demuxes on this. The
+                    # shared "sensors" message carries everything BUT the
+                    # EO image bytes; the EO image is delivered via the
+                    # `_eo_sender` fast path below so the EO panel can
+                    # render at sensor-arrival cadence rather than at
+                    # `period`. EO metadata (size, fov, detections) stays
+                    # in the shared message because fused-track bbox_eo
+                    # projection on the EO panel uses it every tick.
+                    payload["type"] = "sensors"
+                    if isinstance(payload.get("eo"), dict):
+                        payload["eo"]["jpeg_b64"] = None
                     text = json.dumps(payload, default=str)
                 except WebSocketDisconnect:
                     raise
@@ -459,6 +479,46 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     log.info("WebSocket send after close: %s", e)
                     return
                 await asyncio.sleep(period)
+
+        async def _eo_sender() -> None:
+            """EO fast path — emit the full EO wire dict (with JPEG)
+            whenever EOFrame.frame_id advances, decoupled from the
+            shared periodic sender. Throttled at `eo_fast_period`
+            ceiling so we don't ship more than the GUI can render.
+
+            Crucially, eo_to_wire reuses the cached jpeg_bytes the EO
+            process thread attached to the EOFrame (see
+            eo/eo_manager.py:_process_and_publish) — only base64 of the
+            cached bytes happens on this coroutine, no cv2.imencode.
+            """
+            last_frame_id = -1
+            while True:
+                ef = BUS.get_latest(Topic.EO)
+                fid = getattr(ef, "frame_id", None) if ef is not None else None
+                if fid is None or fid == last_frame_id:
+                    # No fresh frame; sleep a short tick and re-poll.
+                    # 5 ms keeps the loop responsive without burning CPU.
+                    await asyncio.sleep(0.005)
+                    continue
+                last_frame_id = int(fid)
+                try:
+                    eo_wire = eo_to_wire(ef, jpeg_quality=eo_jpeg_quality)
+                    text = json.dumps(
+                        {"type": "eo_only", "ts": time.time(), "eo": eo_wire},
+                        default=str,
+                    )
+                except Exception:
+                    log.exception("eo_sender encode failed — skipping frame")
+                    await asyncio.sleep(eo_fast_period)
+                    continue
+                try:
+                    await ws.send_text(text)
+                except WebSocketDisconnect:
+                    raise
+                except RuntimeError as e:
+                    log.info("WebSocket send after close: %s", e)
+                    return
+                await asyncio.sleep(eo_fast_period)
 
         async def _receiver() -> None:
             async for raw in ws.iter_text():
@@ -830,7 +890,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     log.warning("Unknown WS command: %s", command)
 
         try:
-            await asyncio.gather(_sender(), _receiver())
+            await asyncio.gather(_sender(), _eo_sender(), _receiver())
         except WebSocketDisconnect:
             log.info("WebSocket client disconnected")
         except Exception as e:

@@ -360,10 +360,19 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
 
     jpeg_b64 = None
     w, h = 0, 0
+    # Fast path: EOManager already encoded the JPEG on its process
+    # thread (see eo/eo_manager.py:_process_and_publish). Reuse those
+    # bytes if the requested quality matches — this is the whole point
+    # of the EOFrame.jpeg_bytes cache. Falls back to inline encode for
+    # legacy EOFrames (fake source, replay) that don't carry bytes.
+    cached = getattr(ef, "jpeg_bytes", None)
+    cached_q = int(getattr(ef, "jpeg_quality", -1))
     if ef.bgr is not None:
-        img = ef.bgr
-        h, w = img.shape[:2]
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+        h, w = ef.bgr.shape[:2]
+    if cached and cached_q == int(jpeg_quality):
+        jpeg_b64 = base64.b64encode(cached).decode("ascii")
+    elif ef.bgr is not None:
+        ok, buf = cv2.imencode(".jpg", ef.bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
         if ok:
             jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 

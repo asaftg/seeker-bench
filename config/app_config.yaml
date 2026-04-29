@@ -128,13 +128,15 @@ eo:
   sensor: imx568                # imx568 | webcam
   device_index: auto            # auto | 0 | 1 | 2 ...
   skip_builtin_webcam: false    # webcam-mode only: skip index 0 if it's a built-in
-  target_fps: 20                # IMX568 over USB3 sustains ~19 fps at full res
+  target_fps: 25                # IMX568 over USB3 sustains ~19 fps at full res
   # SDK stream cadence (only used in sensor=imx568 mode). The SDK helper
   # actively throttles delivered frames to this rate. 10 was the historical
   # default (chosen for power); 20 doubles motion smoothness on moving
   # vehicles with no measured downside. Cap at 25 — beyond that we start
-  # competing with the FX3 USB3 bus saturation under RAW12.
-  stream_fps: 20.0
+  # competing with the FX3 USB3 bus saturation under RAW12. Bumped from
+  # 20 → 25 once the WS-side encode/serialize bottleneck was lifted (EO
+  # JPEG now encoded on the process thread + dedicated _eo_sender task).
+  stream_fps: 25.0
   # Resolution is ignored when sensor=imx568 (native 2472×2064 is forced).
   resolution: [1920, 1080]      # webcam mode: will negotiate closest supported
 

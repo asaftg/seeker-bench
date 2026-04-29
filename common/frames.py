@@ -195,6 +195,17 @@ class EOFrame:
     gimbal_pan_at_capture: Optional[float] = None
     gimbal_tilt_at_capture: Optional[float] = None
 
+    # Pre-encoded JPEG bytes of `bgr` at `jpeg_quality`. Encoded ONCE on
+    # the EO process thread so the asyncio WS sender doesn't pay the
+    # cv2.imencode + base64 cost per tick (re-encoding the same frame
+    # on every WS tick was the dominant per-tick cost — see
+    # gui/sensor_bridge.py:eo_to_wire). Consumers that need the JPEG
+    # (WS sender, JSONL recorder) reuse these bytes; consumers that
+    # need raw pixels (fusion, gimbal, replay) keep using `bgr`.
+    # None when no encode happened yet (disconnected sentinel frames).
+    jpeg_bytes: Optional[bytes] = None
+    jpeg_quality: int = 92
+
 
 # ───────────────────────────────────────────────────────────────
 # Fused tracks — Ticket 5 (cross-sensor fusion)
@@ -224,6 +235,20 @@ class FusedTrack:
     ang_h_deg: float
     hits: int = 1
     misses: int = 0
+    # World-frame az/el of the track. Populated by fusion when running
+    # in world-frame mode; None otherwise (legacy camera-frame fusion).
+    # Why: az_deg/el_deg is camera-frame, computed in fusion as
+    # (world − cur_pan_at_fusion_publish). A consumer that wants world
+    # angles back has to add cur_pan again, but reading cur_pan at a
+    # different moment (gimbal control loop runs faster than fusion's
+    # 15Hz tick) leaks the gimbal-publish latency as PHANTOM VELOCITY in
+    # the consumer's world-frame estimate. On `track test 6.jsonl` this
+    # caused a static target's apparent world_az_dot ≈ -13 dps during
+    # a slew, and the Phase-3 velocity feed-forward turned that into
+    # runaway over-steering. Carrying world angles directly here removes
+    # the round-trip.
+    world_az_deg: Optional[float] = None
+    world_el_deg: Optional[float] = None
 
 
 # ───────────────────────────────────────────────────────────────

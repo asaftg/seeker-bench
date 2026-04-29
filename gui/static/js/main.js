@@ -107,6 +107,16 @@ let _devMode          = false;    // developer overlays: heat-blob tracker debug
 let _recOn            = false;    // REC pill toggle — driven by JSONL recorder lifecycle on the backend
 let _replayActive     = false;    // true when the WS envelope arrives with `replay:true` (replay_server.py)
 
+// Cached overlay data from the most recent shared "sensors" message.
+// The EO fast path (msg.type === "eo_only") arrives at sensor cadence
+// (~25 Hz target) while the shared message arrives at the periodic
+// `ws_fps` cadence (~60 Hz target with much lower per-tick cost now
+// that EO is split off). Between sensors-message ticks, the EO panel
+// reuses these cached overlays so fused/radar boxes don't disappear.
+let _lastMainTargetId = null;
+let _lastFusedEO      = [];
+let _lastRadarForEO   = [];
+
 // Replay-mode UI: pulse a red REPLAY badge in the topbar and show
 // the playback clock so the user has a single visible time reference
 // they can quote to the agent ("at 0:12 the gimbal jumped"). The
@@ -884,9 +894,16 @@ if (areaSlider) {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────
-// FPS counter
+// FPS counters
+// `_fps` measures WebSocket message rate — useful for diagnosing the WS
+// pipeline but NOT what the operator wants to see for "sensor FPS". The
+// operator wants the rate at which fresh sensor frames are arriving,
+// which is the frame_id advance rate — measured by `_eoFps` / `_thFps`.
+// Header pills now read these so "EO Hz" is the actual sensor cadence.
 // ─────────────────────────────────────────────────────────────────────────
-let _fps = { t0: performance.now(), frames: 0, current: "—" };
+let _fps   = { t0: performance.now(), frames: 0, current: "—" };
+let _eoFps = { t0: performance.now(), lastId: -1, frames: 0, current: "—" };
+let _thFps = { t0: performance.now(), lastId: -1, frames: 0, current: "—" };
 function tickFps() {
   _fps.frames++;
   const now = performance.now();
@@ -895,6 +912,22 @@ function tickFps() {
     _fps.current = (_fps.frames * 1000 / dt).toFixed(0);
     _fps.t0      = now;
     _fps.frames  = 0;
+  }
+}
+function _tickFrameFps(state, frameId) {
+  // Count one tick whenever frame_id advances. Same windowing as
+  // tickFps so the displayed value is comparable.
+  if (frameId == null) return;
+  if (state.lastId !== frameId) {
+    state.frames++;
+    state.lastId = frameId;
+  }
+  const now = performance.now();
+  const dt  = now - state.t0;
+  if (dt >= 1000) {
+    state.current = (state.frames * 1000 / dt).toFixed(0);
+    state.t0      = now;
+    state.frames  = 0;
   }
 }
 
@@ -936,6 +969,28 @@ function connect() {
     let msg;
     try { msg = JSON.parse(ev.data); } catch(_) { return; }
 
+    // Fast EO path. The server now publishes EO frames on a dedicated
+    // task at sensor-arrival cadence (see gui/app.py:_eo_sender) tagged
+    // {"type":"eo_only", ...}. Render the image immediately using the
+    // last-known fused/radar overlay data cached from the shared
+    // "sensors" message — so the EO panel refreshes at the sensor's
+    // real fps instead of the shared periodic loop's slowest-common
+    // cadence. The shared "sensors" message keeps everything else
+    // (thermal, fused, radar, gimbal) and updates EO overlays at its
+    // own cadence; image bytes are stripped out of it server-side
+    // (`eo.jpeg_b64 = null`) so we don't pay the encode twice.
+    if (msg && msg.type === "eo_only") {
+      const eo = msg.eo || {};
+      _tickFrameFps(_eoFps, eo.frame_id);
+      eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
+      if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
+      const eoPill = "pill-eo";
+      setPill(eoPill, eo.connected ? "on" : "off", "EO");
+      const eoHz = $("eo-hz");
+      if (eoHz) eoHz.textContent = eo.connected ? (_eoFps.current + " Hz") : "— Hz";
+      return;
+    }
+
     // Replay-mode banner + clock. The replay server stamps `replay:true`
     // on every envelope plus `replay_t_s` (seconds since session start).
     // We toggle a red badge in the topbar and render the clock as
@@ -974,14 +1029,21 @@ function connect() {
     const radarForThermal = _overlay.radar ? radarTargetsAll : [];
     const radarForEO      = _overlay.radar ? radarTargetsAll : [];
 
+    // Cache the EO overlay data so the fast `eo_only` path can keep
+    // drawing fused/radar boxes between shared-sensors ticks.
+    _lastMainTargetId = msg.main_target_id || null;
+    _lastFusedEO      = fusedEO;
+    _lastRadarForEO   = radarForEO;
+
     // ── Thermal panel ──
     const thermal = msg.thermal || {};
     thermalView.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
     if (thermalMini) thermalMini.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
     syncZoomButtons(thermal.zoom_preset);
 
+    _tickFrameFps(_thFps, (msg.thermal && msg.thermal.frame_id));
     const thermHz = $("thermal-hz");
-    if (thermHz) thermHz.textContent = _fps.current + " Hz";
+    if (thermHz) thermHz.textContent = _thFps.current + " Hz";
 
     setPill("pill-thermal",
             thermal.connected ? "on" : "off",
@@ -997,8 +1059,14 @@ function connect() {
     // can lock the box onto the actual target without leaving DEV.
     if (eoMini) eoMini.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
+    // NOTE: do NOT call _tickFrameFps for EO here — the shared
+    // "sensors" message strips eo.jpeg_b64 and only refreshes EO
+    // OVERLAYS. Real EO frames come via the eo_only fast path,
+    // which already advanced the counter. Re-counting here would
+    // double-count for legacy untagged messages — but those don't
+    // exist on this server. The fast path is authoritative.
     const eoHz = $("eo-hz");
-    if (eoHz) eoHz.textContent = eo.connected ? (_fps.current + " Hz") : "— Hz";
+    if (eoHz) eoHz.textContent = eo.connected ? (_eoFps.current + " Hz") : "— Hz";
     const eoFovEl = $("eo-fov");
     if (eoFovEl && eo.hfov_deg != null) {
       eoFovEl.textContent = Number(eo.hfov_deg).toFixed(1) + "° HFOV";
