@@ -193,3 +193,24 @@ class MaestroDriver:
         """Float every listed channel so servos stop holding torque."""
         for ch in channels:
             self.set_target_us(ch, 0)
+
+    def get_last_written_us(self, channel: int) -> Optional[float]:
+        """Return the last microseconds value actually WRITTEN to the
+        servo on this channel, or None if nothing has been written yet
+        (or the last write was a release).
+
+        Distinct from the COMMANDED setpoint kept in the controller:
+        when the PWM gate (``min_us_step``) suppresses a small command,
+        the controller advances its internal setpoint but no PWM is
+        sent → the servo hasn't moved. Callers that need the
+        servo's actual pose (e.g. publishing it on the bus, stamping
+        sensor frames with capture-time gimbal pose) must read THIS
+        value, not the controller's commanded setpoint. Otherwise
+        downstream world-frame conversions assign each frame to the
+        wrong pose during fast manual slews and the same physical
+        target appears at multiple world positions ('multiple bbs.jsonl'
+        bug — same parked car got 5 distinct fused-track IDs as the
+        user dpad-tilted, because the published commanded pose
+        advanced 0.5°/tick while the servo stayed put).
+        """
+        return self._last_us.get(int(channel))

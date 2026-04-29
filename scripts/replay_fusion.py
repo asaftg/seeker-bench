@@ -468,6 +468,7 @@ def dedup_candidates(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         reverse=True)
     used = [False] * len(cands)
     out: List[Dict[str, Any]] = []
+    DEDUP_CENTROID_DEG = 0.5
     for i in order:
         if used[i]:
             continue
@@ -481,7 +482,16 @@ def dedup_candidates(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             iou = angular_iou(
                 w["az"], w["el"], w["ang_w"], w["ang_h"],
                 c["az"], c["el"], c["ang_w"], c["ang_h"])
-            if iou >= DEDUP_IOU:
+            d_az = abs(w["az"] - c["az"])
+            d_el = abs(w["el"] - c["el"])
+            centroid_ok = (
+                iou > 0.0
+                and d_az <= max(DEDUP_CENTROID_DEG,
+                                 0.5 * max(w["ang_w"], c["ang_w"]))
+                and d_el <= max(DEDUP_CENTROID_DEG,
+                                 0.5 * max(w["ang_h"], c["ang_h"]))
+            )
+            if iou >= DEDUP_IOU or centroid_ok:
                 used[j] = True
                 for s in c["sensors"]:
                     if s not in w["sensors"]:
@@ -502,6 +512,7 @@ def merge_overlapping_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any
         key=lambda i: (tracks[i]["class"] != rt, tracks[i]["hits"], -tracks[i]["id"]),
         reverse=True)
     drop = [False] * len(tracks)
+    MERGE_CENTROID_DEG = 0.5
     for oi, i in enumerate(order):
         if drop[i]:
             continue
@@ -515,7 +526,18 @@ def merge_overlapping_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any
             iou = angular_iou(
                 a["az"], a["el"], a["ang_w"], a["ang_h"],
                 b["az"], b["el"], b["ang_w"], b["ang_h"])
-            if iou >= MERGE_IOU:
+            d_az = abs(a["az"] - b["az"])
+            d_el = abs(a["el"] - b["el"])
+            centroid_ok = (
+                iou > 0.0
+                and a["class"] == b["class"]
+                and a["class"] != rt
+                and d_az <= max(MERGE_CENTROID_DEG,
+                                 0.5 * max(a["ang_w"], b["ang_w"]))
+                and d_el <= max(MERGE_CENTROID_DEG,
+                                 0.5 * max(a["ang_h"], b["ang_h"]))
+            )
+            if iou >= MERGE_IOU or centroid_ok:
                 for s, m in b["sensor_misses"].items():
                     cur = a["sensor_misses"].get(s)
                     a["sensor_misses"][s] = m if cur is None else min(cur, m)

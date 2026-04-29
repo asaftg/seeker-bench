@@ -633,7 +633,22 @@ gimbal:
   # the servo because each per-tick PWM step is too small. With the
   # gate, fine corrections accumulate into a single discrete step.
   # Set 0 to disable (legacy behaviour, write every tick).
-  maestro_min_us_step: 5.0
+  #
+  # 2026-04-28 evening: bumped 5.0 → 11.0 (≈1.0°) after `multiple bbs.jsonl`
+  # diagnosis. Tilt cal: 1° ≈ 10.78 µs, pan cal: 1° ≈ 7.78 µs. With the
+  # old 5 µs gate, single 0.5° dpad clicks (5.4 µs / 3.9 µs) just barely
+  # passed and the SERVO physically didn't move (Yahboom internal
+  # deadband > 5 µs). gimbal_manager.get_last_written_us still saw the
+  # 5.4 µs step land on the wire and advanced the published pose, but the
+  # camera pixels stayed put — so fusion's world conversion got a fresh
+  # pose every tick while bbox stayed at the same cam_el → phantom
+  # track births, every 0.5° of "commanded" tilt. With the gate at
+  # 11 µs, two 0.5° dpad clicks accumulate to 10.8 µs (still gated),
+  # three to 16.2 µs (passes) → servo gets a 1.5° step it can actually
+  # respond to, and get_last_written_us returns the value that
+  # corresponds to ACTUAL motion. New servos in 2 days will respond
+  # to smaller steps and we can dial this back.
+  maestro_min_us_step: 11.0
 
   # Phase 3 — confidence gate for the velocity feed-forward applied
   # in the closed-loop fused-track tick branch. Only add

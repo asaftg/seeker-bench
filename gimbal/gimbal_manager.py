@@ -1510,6 +1510,27 @@ class GimbalManager:
         cmd_pan, cmd_tilt = self._controller.step(sp_pan, sp_tilt)
         self._command_now(cmd_pan, cmd_tilt)
 
+        # Recover the SERVO'S ACTUAL-LAST-WRITTEN pose from the Maestro
+        # driver. `cmd_pan/cmd_tilt` is the controller's per-tick rate-
+        # limited setpoint, but the PWM gate (min_us_step) suppresses
+        # commands smaller than the servo's deadband — when that happens
+        # cmd_pan advances but the servo doesn't move. Publishing
+        # cmd_pan as the gimbal pose makes downstream world-frame
+        # conversions assign each sensor frame to a pose the camera
+        # never reached, and the same physical target ends up at
+        # different world_az/el across consecutive ticks → phantom
+        # track births. ('multiple bbs.jsonl' showed the EO image
+        # CONTENT staying frozen across a 2.5° commanded tilt change
+        # — the servo wasn't moving, but published tilt advanced
+        # 0.5°/tick.)
+        # Falls back to cmd_pan/tilt when nothing has been written yet.
+        last_us_pan  = self._driver.get_last_written_us(self._pan_cal.channel)
+        last_us_tilt = self._driver.get_last_written_us(self._tilt_cal.channel)
+        actual_pan  = (self._pan_cal.us_to_angle(last_us_pan)
+                        if last_us_pan is not None else cmd_pan)
+        actual_tilt = (self._tilt_cal.us_to_angle(last_us_tilt)
+                        if last_us_tilt is not None else cmd_tilt)
+
         # Publish state. `tracked_target_id` carries whichever lock is
         # live — fused id if that's set, else the heat id. The GUI only
         # uses this for display, and the two namespaces don't collide
@@ -1518,8 +1539,8 @@ class GimbalManager:
         state = GimbalState(
             timestamp=time.time(),
             connected=self._connected,
-            pan_deg=cmd_pan,
-            tilt_deg=cmd_tilt,
+            pan_deg=actual_pan,
+            tilt_deg=actual_tilt,
             mode=mode,
             target_pan_deg=sp_pan,
             target_tilt_deg=sp_tilt,

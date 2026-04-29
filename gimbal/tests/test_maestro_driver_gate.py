@@ -96,3 +96,47 @@ def test_gate_zero_threshold_writes_every_call():
     d.set_target_us(0, 1500.0)
     d.set_target_us(0, 1500.0001)
     assert len(s.writes) == 2  # not gated when threshold == 0
+
+
+# ── get_last_written_us — used by gimbal_manager to publish the
+#    SERVO'S actual-written position rather than the controller's
+#    commanded setpoint. Distinction matters during fast manual
+#    slews where per-tick commands fall below the gate threshold
+#    and the servo physically does not move.
+
+def test_last_written_returns_none_before_any_write():
+    d = MaestroDriver(min_us_step=5.0)
+    _attach_stub(d)
+    assert d.get_last_written_us(0) is None
+
+
+def test_last_written_tracks_actual_writes_only():
+    d = MaestroDriver(min_us_step=5.0)
+    _attach_stub(d)
+    d.set_target_us(0, 1500.0)
+    assert d.get_last_written_us(0) == 1500.0
+    # Below-threshold command is gated → last_written stays at the
+    # previous actually-sent value.
+    d.set_target_us(0, 1502.0)
+    assert d.get_last_written_us(0) == 1500.0
+    # Big enough step → a new write happens, last_written advances.
+    d.set_target_us(0, 1510.0)
+    assert d.get_last_written_us(0) == 1510.0
+
+
+def test_last_written_per_channel_independent():
+    d = MaestroDriver(min_us_step=5.0)
+    _attach_stub(d)
+    d.set_target_us(0, 1500.0)
+    d.set_target_us(1, 1700.0)
+    assert d.get_last_written_us(0) == 1500.0
+    assert d.get_last_written_us(1) == 1700.0
+
+
+def test_last_written_cleared_on_release():
+    d = MaestroDriver(min_us_step=5.0)
+    _attach_stub(d)
+    d.set_target_us(0, 1500.0)
+    assert d.get_last_written_us(0) == 1500.0
+    d.set_target_us(0, 0.0)   # release
+    assert d.get_last_written_us(0) is None

@@ -43,7 +43,7 @@ def main(path: str) -> None:
             d = max(abs(daz), abs(dele))
             if d < best_d:
                 best_d, best_i = d, i
-        if best_i >= 0 and best_d < 2.0:
+        if best_i >= 0 and best_d < 0.8:
             c = clusters[best_i]
             c["az"] += az; c["el"] += el; c["n"] += 1
             c["ids"].append(tid)

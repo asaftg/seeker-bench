@@ -45,6 +45,19 @@ class ServoCalibration:
         t = (a - self.min_deg) / span
         return self.us_at_min_deg + t * (self.us_at_max_deg - self.us_at_min_deg)
 
+    def us_to_angle(self, microseconds: float) -> float:
+        """Inverse of ``angle_to_us``: convert a PWM value back to the
+        software angle. Used to recover the servo's actual-commanded
+        pose from MaestroDriver.get_last_written_us — the value the
+        SERVO actually saw, not the controller's commanded setpoint.
+        """
+        us_span = (self.us_at_max_deg - self.us_at_min_deg) or 1.0
+        t = (float(microseconds) - self.us_at_min_deg) / us_span
+        a = self.min_deg + t * (self.max_deg - self.min_deg)
+        if self.invert:
+            a = self.min_deg + (self.max_deg - a)
+        return max(self.min_deg, min(self.max_deg, a))
+
 
 @dataclass
 class GimbalLimits:

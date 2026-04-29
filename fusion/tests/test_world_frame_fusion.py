@@ -191,6 +191,70 @@ def test_stamped_pose_static_target_survives_slew_no_phantom(fm):
     assert fm._tracks[0]["el"] == pytest.approx(4.0, abs=0.01)
 
 
+def test_dedup_centroid_fallback_merges_multi_bbox_per_target(fm):
+    """`multiple bbs.jsonl` showed YOLO emitting 2-3 bboxes for the
+    same physical car, with bbox edges barely touching (IoU < 0.35).
+    Legacy strict-IoU dedup let them through as distinct candidates;
+    centroid+positive-overlap fallback collapses them.
+
+    Geometry recreated from the recording (cluster 0 phantoms #100
+    + #101 at cam (-2.96, 0.78) and (-2.18, 0.75) — 0.78° apart,
+    same class, both ang_w ≈ 1.6°)."""
+    fm._world_frame = False  # cam-frame, simpler to inspect
+    cands = [
+        {"sensors": ["eo"], "primary": "eo", "class": "vehicle",
+         "az": -2.96, "el": 0.78, "ang_w": 1.6, "ang_h": 1.0,
+         "conf": 0.9},
+        {"sensors": ["eo"], "primary": "eo", "class": "vehicle",
+         "az": -2.18, "el": 0.75, "ang_w": 0.7, "ang_h": 0.8,
+         "conf": 0.7},
+    ]
+    deduped = fm._dedup_candidates(cands)
+    assert len(deduped) == 1, (
+        "two same-class candidates with close centers and tiny "
+        "overlap should merge")
+
+
+def test_dedup_distinct_targets_at_safe_distance_stay_separate(fm):
+    """The 2026-04-27 morning revert specifically removed a 3°-wide
+    centroid soft-match that merged distinct vehicles. The new
+    centroid fallback uses a much tighter 0.5° gate AND requires
+    positive overlap. Verify two same-class targets ~1.5° apart
+    with non-overlapping bboxes stay separate."""
+    fm._world_frame = False
+    cands = [
+        {"sensors": ["eo"], "primary": "eo", "class": "vehicle",
+         "az": -3.0, "el": 0.0, "ang_w": 0.8, "ang_h": 0.8,
+         "conf": 0.9},
+        {"sensors": ["eo"], "primary": "eo", "class": "vehicle",
+         "az": -1.0, "el": 0.0, "ang_w": 0.8, "ang_h": 0.8,
+         "conf": 0.9},
+    ]
+    deduped = fm._dedup_candidates(cands)
+    assert len(deduped) == 2, "distinct same-class targets stay separate"
+
+
+def test_merge_overlapping_tracks_centroid_fallback(fm):
+    """Same fix at the persistence-tracker layer: two LIVE same-class
+    tracks that drifted toward each other under EMA but never quite
+    cross IoU=0.35 should merge."""
+    fm._world_frame = False
+    fm._tracks = [
+        {"id": 1, "class": "vehicle", "az": -3.0, "el": 0.0,
+         "ang_w": 1.5, "ang_h": 1.0,
+         "sensor_misses": {"eo": 0}, "primary": "eo",
+         "conf": 0.9, "hits": 50, "misses": 0},
+        {"id": 2, "class": "vehicle", "az": -2.6, "el": 0.05,
+         "ang_w": 0.8, "ang_h": 0.7,
+         "sensor_misses": {"eo": 0}, "primary": "eo",
+         "conf": 0.7, "hits": 5, "misses": 0},
+    ]
+    fm._merge_overlapping_tracks()
+    # Elder (id=1, 50 hits) survives; younger (id=2, 5 hits) merges.
+    assert len(fm._tracks) == 1
+    assert fm._tracks[0]["id"] == 1
+
+
 def test_legacy_unstamped_falls_back_to_fusion_tick_pose(fm):
     """When _pose_pan/_pose_tilt are missing (e.g. older recording or
     a sensor that hasn't stamped its frames yet), the fusion-tick pose

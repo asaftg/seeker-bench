@@ -61,6 +61,35 @@ def test_angle_to_us_invert_flips_direction():
     assert cal.angle_to_us(22.0) == pytest.approx(1000.0)
 
 
+def test_us_to_angle_inverts_angle_to_us():
+    """Round-trip via the new us_to_angle reverse. Used to recover the
+    SERVO'S actual-written pose from MaestroDriver.get_last_written_us
+    so gimbal_manager can publish what the camera ACTUALLY sees, not
+    the controller's commanded setpoint (which advances even when the
+    PWM gate eats the command — see 'multiple bbs.jsonl' diagnosis)."""
+    cal = _pan_cal()
+    for ang in (-90.0, -45.0, 0.0, 30.0, 90.0):
+        round_trip = cal.us_to_angle(cal.angle_to_us(ang))
+        assert round_trip == pytest.approx(ang, abs=1e-6)
+
+
+def test_us_to_angle_invert_flips_direction():
+    cal = _tilt_cal(invert=True)
+    # angle 0 -> us 2000 -> angle 0 (round-trip survives invert).
+    for ang in (0.0, 5.5, 11.0, 22.0):
+        round_trip = cal.us_to_angle(cal.angle_to_us(ang))
+        assert round_trip == pytest.approx(ang, abs=1e-6)
+
+
+def test_us_to_angle_clamps_to_software_limits():
+    cal = _tilt_cal()
+    # PWM well above us_at_max_deg should clamp to max angle.
+    huge_us = 99999.0
+    assert cal.us_to_angle(huge_us) == pytest.approx(cal.max_deg)
+    tiny_us = -99999.0
+    assert cal.us_to_angle(tiny_us) == pytest.approx(cal.min_deg)
+
+
 # ── GimbalController: clamp + slew ───────────────────────────────
 
 def _ctrl(slew_fast: bool = True) -> GimbalController:

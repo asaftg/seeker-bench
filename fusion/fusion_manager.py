@@ -680,10 +680,24 @@ class FusionManager:
             used[i] = True
             # Gate: generous — anything roughly co-angular & same class
             # is the same real-world target given our geometry.
-            # Within-tick dedup: strict IoU threshold. Must really
-            # overlap — don't collapse neighbors that merely classify
-            # the same.
+            # Within-tick dedup combines two checks:
+            #   (a) Strict IoU >= 0.35 — clear bbox overlap.
+            #   (b) Same class AND centroid within max(0.5°, 0.5×min_dim)
+            #       AND any positive overlap. Catches the YOLO failure mode
+            #       seen in `multiple bbs.jsonl` where the same physical
+            #       car gets 2-3 distinct bboxes (different scales /
+            #       sub-parts) that touch but have IoU < 0.35. Track #100
+            #       (cam_az=-2.96) and #101 (cam_az=-2.18) coexisted for
+            #       5 ticks at 0.78° apart — both same-class same-time,
+            #       clearly the same target.
+            #   The 2026-04-27 morning revert called out a "3° centroid
+            #   soft-match" fallback as dangerous — that was at the
+            #   PERSISTENCE-tracker matching layer (new candidates → old
+            #   tracks). This is the WITHIN-TICK dedup layer with a
+            #   tighter 0.5° gate AND a positive-overlap requirement, so
+            #   spatially-distinct same-class targets stay separate.
             DEDUP_IOU = 0.35
+            DEDUP_CENTROID_DEG = 0.5
             for j in order:
                 if used[j] or cands[j]["class"] != w["class"]:
                     continue
@@ -692,7 +706,24 @@ class FusionManager:
                     w["az"], w["el"], w["ang_w"], w["ang_h"],
                     c["az"], c["el"], c["ang_w"], c["ang_h"],
                 )
-                if iou >= DEDUP_IOU:
+                # Centroid-distance fallback: if bboxes barely overlap
+                # but centers are within both 0.5° and the smaller
+                # bbox's half-width, treat as duplicate.
+                d_az = abs(w["az"] - c["az"])
+                d_el = abs(w["el"] - c["el"])
+                centroid_ok = (
+                    iou > 0.0  # require ANY positive overlap
+                    # Use max bbox dim, not min: a small same-class
+                    # detection inside (or barely outside) a larger
+                    # same-class bbox is the YOLO multi-detection-on-
+                    # one-target case. Both centers within the larger
+                    # bbox's half-width = "they're on the same target".
+                    and d_az <= max(DEDUP_CENTROID_DEG,
+                                     0.5 * max(w["ang_w"], c["ang_w"]))
+                    and d_el <= max(DEDUP_CENTROID_DEG,
+                                     0.5 * max(w["ang_h"], c["ang_h"]))
+                )
+                if iou >= DEDUP_IOU or centroid_ok:
                     used[j] = True
                     for s in c["sensors"]:
                         if s not in w["sensors"]:
@@ -744,12 +775,29 @@ class FusionManager:
                 # their angular bboxes substantially overlap. A small
                 # distant same-class track sitting inside a big track's
                 # bbox has IoU ≈ 0, so it's safe.
+                # Centroid fallback (mirrors _dedup_candidates): same
+                # class, centers within 0.5°, AND positive overlap
+                # → merge. This catches the case where two tracks
+                # spawned from neighboring YOLO bboxes drift toward
+                # each other but their bboxes never quite hit IoU 0.35.
                 MERGE_IOU = 0.35
+                MERGE_CENTROID_DEG = 0.5
                 iou = angular_iou(
                     a["az"], a["el"], a["ang_w"], a["ang_h"],
                     b["az"], b["el"], b["ang_w"], b["ang_h"],
                 )
-                if iou >= MERGE_IOU:
+                d_az = abs(a["az"] - b["az"])
+                d_el = abs(a["el"] - b["el"])
+                centroid_ok = (
+                    iou > 0.0
+                    and a["class"] == b["class"]   # strict equality
+                    and a["class"] != rt           # don't touch radar wildcard
+                    and d_az <= max(MERGE_CENTROID_DEG,
+                                     0.5 * max(a["ang_w"], b["ang_w"]))
+                    and d_el <= max(MERGE_CENTROID_DEG,
+                                     0.5 * max(a["ang_h"], b["ang_h"]))
+                )
+                if iou >= MERGE_IOU or centroid_ok:
                     # Fold b into a: union the active-sensor dict
                     # taking min misses for any shared sensor (so a
                     # freshly-seen sensor on either track wins).
