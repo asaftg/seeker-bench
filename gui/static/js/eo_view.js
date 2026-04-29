@@ -333,10 +333,13 @@ export class EOView {
     // Raw detections — suppressed only by 2+ sensor fused overlays.
     for (const det of this._lastDetections) {
       if (isSubsumedByFused(det.bbox, this._lastFused, "bbox_eo")) continue;
-      // Pass the raw det through so fusedIdForDet can match by
-      // det.track_id against the fused track's eo_track_id (more
-      // robust than IoU, which drifts after a few EMA ticks).
-      const fusedId = fusedIdForDet(det.bbox, this._lastFused, "bbox_eo", 0.20, det);
+      // Backend stamps det.fused_id directly on the wire — we just
+      // read it. No client-side matcher, no IoU drift, no E#vs#
+      // desync. fusedIdForDet stays around as the bbox-IoU fallback
+      // for older recordings without the fused_id field.
+      const fusedId = (det.fused_id != null)
+        ? det.fused_id
+        : fusedIdForDet(det.bbox, this._lastFused, "bbox_eo", 0.20, det);
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);

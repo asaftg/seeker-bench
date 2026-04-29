@@ -248,10 +248,12 @@ export class ThermalView {
         continue;
       }
       if (isSubsumedByFused(det.bbox, this._lastFused, "bbox_thermal")) continue;
-      // Pass the raw det through so fusedIdForDet can match by
-      // det.track_id ↔ FusedTrack.thermal_heat_id (Phase B1, mirror
-      // of the EO panel's eo_track_id link).
-      const fusedId = fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal", 0.20, det);
+      // Backend stamps det.fused_id directly on the wire — we just
+      // read it. fusedIdForDet stays around as the bbox-IoU fallback
+      // for older recordings without the fused_id field.
+      const fusedId = (det.fused_id != null)
+        ? det.fused_id
+        : fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal", 0.20, det);
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);

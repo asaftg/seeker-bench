@@ -222,6 +222,45 @@ def main() -> int:
     )
     run_chain("radar only", None, None, rf, expect_radar=4)
 
+    # ── Verify build_ws_message stamps fused_id on raw dets ──
+    # This is the architectural simplification: backend resolves
+    # per-sensor track_id → fused_id once, GUI just renders it.
+    print()
+    print("End-to-end build_ws_message fused_id stamping:")
+    from gui.sensor_bridge import build_ws_message
+    fm2 = FusionManager()
+    # Push EO det through fusion so a fused track exists.
+    eo_obs = fm2._observations_from_eo(ef)
+    fm2._update_tracks([{
+        "sensors": ["eo"], "primary": "eo",
+        "class": eo_obs[0]["class"],
+        "az": eo_obs[0]["az"], "el": eo_obs[0]["el"],
+        "ang_w": eo_obs[0]["ang_w"], "ang_h": eo_obs[0]["ang_h"],
+        "conf": eo_obs[0]["conf"],
+        "eo_track_id": eo_obs[0]["eo_track_id"],
+    }])
+    trk = fm2._tracks[0]
+    ft = FusedTrack(
+        id=int(trk["id"]),
+        target_class=TargetClass.VEHICLE,
+        confidence=float(trk["conf"]),
+        sensors=list(trk["sensor_misses"].keys()),
+        primary=str(trk["primary"]),
+        az_deg=float(trk["az"]), el_deg=float(trk["el"]),
+        ang_w_deg=float(trk["ang_w"]), ang_h_deg=float(trk["ang_h"]),
+        hits=int(trk["hits"]), misses=int(trk["misses"]),
+        eo_track_id=trk.get("eo_track_id"),
+    )
+    payload = build_ws_message(tf=None, ef=ef, fused=[ft])
+    eo_dets = payload["eo"]["detections"]
+    if not eo_dets:
+        fail("[ws] no EO detections in payload")
+    if eo_dets[0].get("fused_id") != ft.id:
+        fail(f"[ws] EO det.fused_id={eo_dets[0].get('fused_id')!r}, "
+             f"expected {ft.id}")
+    print(f"  EO det.fused_id={eo_dets[0]['fused_id']} "
+          f"(matches fused #{ft.id})  OK")
+
     # ── EO + thermal pair (overlapping angular position) ──────
     # EO det at center → az=0, el=0. Thermal det at center too → fused.
     ef2 = EOFrame(

@@ -346,7 +346,11 @@ export class RadarView {
       // ID prefix follows the global namespace convention:
       //   #N  — fused track id when fusion has linked this radar tid
       //   R#N — raw radar Kalman id (per-sensor, transient)
-      const fusedId = fusedIdForRadarTarget(t.tid, this._lastFused);
+      // Backend stamps t.fused_id directly; fusedIdForRadarTarget is
+      // the legacy fallback for older recordings.
+      const fusedId = (t.fused_id != null)
+        ? t.fused_id
+        : fusedIdForRadarTarget(t.tid, this._lastFused);
       const idPrefix = (fusedId != null) ? `#${fusedId}` : `R#${t.tid}`;
       const speed = Math.hypot(t.vx, t.vy);
       const range = Math.hypot(t.x, t.y);

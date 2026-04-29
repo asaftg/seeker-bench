@@ -18,8 +18,43 @@ from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalF
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
+def _build_fused_id_index(fused: Optional[list]) -> tuple[dict, dict, dict]:
+    """Build three lookup tables: per-sensor track id → fused track id.
+
+    Computed once per WS frame in build_ws_message and threaded into
+    each ``*_to_wire`` so raw detections can be stamped with their
+    fused id directly. The GUI then renders a single ``det.fused_id``
+    field — no client-side matcher logic, no IoU drift, no E#vs#
+    desync. This is the architectural simplification that replaces
+    the per-render ``fusedIdForDet`` lookup.
+
+    Returns (eo_map, thermal_map, radar_map). Each maps sensor's
+    track id → fused track id. Keys are the per-sensor ids
+    (``EODetection.track_id``, ``ThermalDetection.track_id`` /
+    ``HeatTrackSnapshot.id``, ``RadarTarget.tid``); values are the
+    cross-sensor ``FusedTrack.id``. Missing key = no fused link.
+    """
+    eo_map: dict = {}
+    th_map: dict = {}
+    rd_map: dict = {}
+    if not fused:
+        return eo_map, th_map, rd_map
+    for trk in fused:
+        if not isinstance(trk, FusedTrack):
+            continue
+        fid = int(trk.id)
+        if trk.eo_track_id is not None:
+            eo_map[int(trk.eo_track_id)] = fid
+        if trk.thermal_heat_id is not None:
+            th_map[int(trk.thermal_heat_id)] = fid
+        if trk.radar_tid is not None:
+            rd_map[int(trk.radar_tid)] = fid
+    return eo_map, th_map, rd_map
+
+
 def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
-                    gstate: Optional[GimbalState] = None) -> Dict[str, Any]:
+                    gstate: Optional[GimbalState] = None,
+                    fused_id_by_thermal: Optional[dict] = None) -> Dict[str, Any]:
     """Serialize a ThermalFrame for the WebSocket.
 
     When `tf is None` OR `tf.connected is False`, the wire frame
@@ -63,7 +98,9 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
 
     # Detections
     det_list = []
+    th_map = fused_id_by_thermal or {}
     for det in tf.detections:
+        det_tid = getattr(det, "track_id", None)
         entry = {
             "bbox": {
                 "x": det.bbox.x, "y": det.bbox.y,
@@ -73,10 +110,14 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
             "contrast": round(float(det.contrast), 1),
             "classification": None,
             "synthetic": bool(getattr(det, "synthetic", False)),
-            # Heat-tracker id stamped by DetectionTracker. Lets the GUI
-            # match the raw thermal det to its fused track by id (same
-            # mechanism EO uses with track_id, Phase B1).
-            "track_id": getattr(det, "track_id", None),
+            # Per-sensor heat-tracker id stamped by DetectionTracker.
+            "track_id": det_tid,
+            # Fused track id, pre-resolved by the backend from the
+            # eo_track_id / thermal_heat_id / radar_tid map. None when
+            # this raw det isn't yet linked to any fused track. The
+            # GUI just renders this — no client-side matcher logic.
+            "fused_id": (th_map.get(int(det_tid))
+                          if det_tid is not None else None),
         }
         if det.classification is not None:
             entry["classification"] = {
@@ -234,6 +275,7 @@ def radar_to_wire(
     ef: Optional[EOFrame] = None,
     radar_az_bias_deg: float = 0.0,
     radar_el_bias_deg: float = 0.0,
+    fused_id_by_radar: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Serialize a RadarFrame for the WebSocket.
 
@@ -300,8 +342,12 @@ def radar_to_wire(
         # raw radar targets into camera pixel space here — that was
         # duplicating every box once the fusion path was wired in. The
         # radar PANEL still renders this targets payload via radar_view.js.
+        rd_map = fused_id_by_radar or {}
         targets_wire.append({
             "tid": int(t.tid),
+            # Backend-resolved fused id for this radar Kalman track,
+            # or None when fusion hasn't linked it yet.
+            "fused_id": rd_map.get(int(t.tid)),
             "x": round(t.pos_x_m, 3),
             "y": round(t.pos_y_m, 3),
             "z": round(t.pos_z_m, 3),
@@ -335,7 +381,8 @@ def radar_to_wire(
 
 
 def eo_to_wire_split(
-    ef: Optional[EOFrame], jpeg_quality: int = 80
+    ef: Optional[EOFrame], jpeg_quality: int = 80,
+    fused_id_by_eo: Optional[dict] = None,
 ) -> tuple[Dict[str, Any], Optional[bytes]]:
     """Like eo_to_wire, but returns (header_dict, jpeg_bytes) instead of
     folding base64'd JPEG into the JSON. Used by the binary WS path —
@@ -380,6 +427,7 @@ def eo_to_wire_split(
             jpeg_bytes = bytes(buf)
 
     det_list = []
+    eo_map = fused_id_by_eo or {}
     for det in ef.detections:
         det_list.append({
             "bbox": {
@@ -387,6 +435,8 @@ def eo_to_wire_split(
                 "w": det.bbox.w, "h": det.bbox.h,
             },
             "track_id": det.track_id,
+            "fused_id": (eo_map.get(int(det.track_id))
+                          if det.track_id is not None else None),
             "classification": {
                 "target_class": det.target_class.value,
                 "confidence": round(float(det.confidence), 3),
@@ -410,7 +460,8 @@ def eo_to_wire_split(
     return hdr, jpeg_bytes
 
 
-def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
+def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
+               fused_id_by_eo: Optional[dict] = None) -> Dict[str, Any]:
     """Serialize an EOFrame for the WebSocket.
 
     Wire format matches ThermalFrame as closely as possible so the GUI
@@ -457,6 +508,7 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
             jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
     det_list = []
+    eo_map = fused_id_by_eo or {}
     for det in ef.detections:
         det_list.append({
             "bbox": {
@@ -464,6 +516,8 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80) -> Dict[str, Any]:
                 "w": det.bbox.w, "h": det.bbox.h,
             },
             "track_id": det.track_id,
+            "fused_id": (eo_map.get(int(det.track_id))
+                          if det.track_id is not None else None),
             "classification": {
                 "target_class": det.target_class.value,
                 "confidence": round(float(det.confidence), 3),
@@ -624,6 +678,12 @@ def build_ws_message(
         thermal_el_bias_deg=thermal_el_bias_deg,
     )
 
+    # Resolve per-sensor track id → fused id ONCE per WS frame. The
+    # individual *_to_wire helpers stamp ``fused_id`` on each raw det
+    # using these maps so the GUI doesn't run a per-render matcher.
+    # Single source of truth for "is this raw det fused, and into what?"
+    eo_to_fused, thermal_to_fused, radar_to_fused = _build_fused_id_index(fused)
+
     # Ranked target list — pick top-N by score, then re-sort by stable
     # key (fused track id) so rows don't shuffle as scores fluctuate
     # tick-to-tick. A row that jumps slot 3 → 1 → 2 mid-click is how
@@ -675,12 +735,15 @@ def build_ws_message(
     return {
         "ts": time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality,
-                                   gstate=gstate),
-        "eo": eo_to_wire(ef, jpeg_quality=eo_q),
+                                   gstate=gstate,
+                                   fused_id_by_thermal=thermal_to_fused),
+        "eo": eo_to_wire(ef, jpeg_quality=eo_q,
+                          fused_id_by_eo=eo_to_fused),
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
             radar_az_bias_deg=radar_az_bias_deg,
             radar_el_bias_deg=radar_el_bias_deg,
+            fused_id_by_radar=radar_to_fused,
         ),
         "fused": fused_wire,
         "tracks": [],
