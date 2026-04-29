@@ -719,6 +719,16 @@ class ThermalManager:
                             classifier_used="yolo_hv",
                         )
                 else:
+                    # Spawn-new path: h/v classifier sees a vehicle/person
+                    # the heat tracker doesn't (cold parked car, etc.).
+                    # Stamp the h/v ByteTrack id onto this synthetic
+                    # ThermalDetection so the GUI can render T#<id>
+                    # instead of an unlabeled box, and so fusion's
+                    # thermal_heat_id link has something to key on.
+                    # The id namespace overlaps with heat-tracker ids in
+                    # principle, but in practice the two trackers see
+                    # disjoint targets (heat: warm blobs, h/v: shape) so
+                    # collision is rare. Document if it bites us.
                     detections.append(ThermalDetection(
                         bbox=_BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
                         area_px=int(bw * bh),
@@ -728,6 +738,7 @@ class ThermalManager:
                             confidence=hv_conf,
                             classifier_used="yolo_hv",
                         ),
+                        track_id=int(trk["id"]),
                     ))
 
         # ── 6. Publish ─────────────────────────────────────────────

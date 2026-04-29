@@ -18,6 +18,25 @@ from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalF
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
+def _bbox_iou(a: dict, b: dict) -> float:
+    """Pixel-bbox IoU. Used as a fallback when per-sensor id stamping
+    misses (typical: ByteTrack id-swap creates one frame where the
+    raw det's track_id is new but fusion hasn't yet rebuilt its
+    eo_track_id link)."""
+    if not a or not b:
+        return 0.0
+    ax2 = a["x"] + a["w"]; ay2 = a["y"] + a["h"]
+    bx2 = b["x"] + b["w"]; by2 = b["y"] + b["h"]
+    ix1 = max(a["x"], b["x"]); iy1 = max(a["y"], b["y"])
+    ix2 = min(ax2, bx2);       iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1);  ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    ua = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return float(inter) / float(ua) if ua > 0 else 0.0
+
+
 def _build_fused_id_index(fused: Optional[list]) -> tuple[dict, dict, dict]:
     """Build three lookup tables: per-sensor track id → fused track id.
 
@@ -52,9 +71,31 @@ def _build_fused_id_index(fused: Optional[list]) -> tuple[dict, dict, dict]:
     return eo_map, th_map, rd_map
 
 
+def _fused_id_for_bbox(rawBBox: dict, fused_wire: Optional[list],
+                       sideKey: str, iouMin: float = 0.30) -> Optional[int]:
+    """Bbox-IoU fallback: scan fused_wire for the projected bbox that
+    overlaps `rawBBox` most. Used when the per-sensor id map missed
+    (typical: ByteTrack id-swap). Returns the fused track id or None.
+    `sideKey` is "bbox_eo" or "bbox_thermal"."""
+    if not fused_wire or not rawBBox:
+        return None
+    best_id = None
+    best_iou = iouMin
+    for t in fused_wire:
+        fb = t.get(sideKey)
+        if not fb:
+            continue
+        iou = _bbox_iou(rawBBox, fb)
+        if iou >= best_iou:
+            best_iou = iou
+            best_id = t.get("id")
+    return best_id
+
+
 def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
                     gstate: Optional[GimbalState] = None,
-                    fused_id_by_thermal: Optional[dict] = None) -> Dict[str, Any]:
+                    fused_id_by_thermal: Optional[dict] = None,
+                    fused_wire: Optional[list] = None) -> Dict[str, Any]:
     """Serialize a ThermalFrame for the WebSocket.
 
     When `tf is None` OR `tf.connected is False`, the wire frame
@@ -101,23 +142,28 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
     th_map = fused_id_by_thermal or {}
     for det in tf.detections:
         det_tid = getattr(det, "track_id", None)
+        bbox = {
+            "x": det.bbox.x, "y": det.bbox.y,
+            "w": det.bbox.w, "h": det.bbox.h,
+        }
+        # Two-stage fused id lookup: id-map first (fast, exact), then
+        # bbox-IoU against fused_wire's projected bbox_thermal as a
+        # fallback for the brief tick after a ByteTrack id-swap.
+        fused_id = (th_map.get(int(det_tid))
+                     if det_tid is not None else None)
+        if fused_id is None:
+            fused_id = _fused_id_for_bbox(bbox, fused_wire, "bbox_thermal")
         entry = {
-            "bbox": {
-                "x": det.bbox.x, "y": det.bbox.y,
-                "w": det.bbox.w, "h": det.bbox.h,
-            },
+            "bbox": bbox,
             "area_px": det.area_px,
             "contrast": round(float(det.contrast), 1),
             "classification": None,
             "synthetic": bool(getattr(det, "synthetic", False)),
             # Per-sensor heat-tracker id stamped by DetectionTracker.
             "track_id": det_tid,
-            # Fused track id, pre-resolved by the backend from the
-            # eo_track_id / thermal_heat_id / radar_tid map. None when
-            # this raw det isn't yet linked to any fused track. The
-            # GUI just renders this — no client-side matcher logic.
-            "fused_id": (th_map.get(int(det_tid))
-                          if det_tid is not None else None),
+            # Fused track id, pre-resolved by the backend. None when
+            # this raw det isn't yet linked to any fused track.
+            "fused_id": fused_id,
         }
         if det.classification is not None:
             entry["classification"] = {
@@ -383,6 +429,7 @@ def radar_to_wire(
 def eo_to_wire_split(
     ef: Optional[EOFrame], jpeg_quality: int = 80,
     fused_id_by_eo: Optional[dict] = None,
+    fused_wire: Optional[list] = None,
 ) -> tuple[Dict[str, Any], Optional[bytes]]:
     """Like eo_to_wire, but returns (header_dict, jpeg_bytes) instead of
     folding base64'd JPEG into the JSON. Used by the binary WS path —
@@ -429,14 +476,16 @@ def eo_to_wire_split(
     det_list = []
     eo_map = fused_id_by_eo or {}
     for det in ef.detections:
+        bbox = {"x": det.bbox.x, "y": det.bbox.y,
+                "w": det.bbox.w, "h": det.bbox.h}
+        fid = (eo_map.get(int(det.track_id))
+                if det.track_id is not None else None)
+        if fid is None:
+            fid = _fused_id_for_bbox(bbox, fused_wire, "bbox_eo")
         det_list.append({
-            "bbox": {
-                "x": det.bbox.x, "y": det.bbox.y,
-                "w": det.bbox.w, "h": det.bbox.h,
-            },
+            "bbox": bbox,
             "track_id": det.track_id,
-            "fused_id": (eo_map.get(int(det.track_id))
-                          if det.track_id is not None else None),
+            "fused_id": fid,
             "classification": {
                 "target_class": det.target_class.value,
                 "confidence": round(float(det.confidence), 3),
@@ -461,7 +510,8 @@ def eo_to_wire_split(
 
 
 def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
-               fused_id_by_eo: Optional[dict] = None) -> Dict[str, Any]:
+               fused_id_by_eo: Optional[dict] = None,
+               fused_wire: Optional[list] = None) -> Dict[str, Any]:
     """Serialize an EOFrame for the WebSocket.
 
     Wire format matches ThermalFrame as closely as possible so the GUI
@@ -510,14 +560,16 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
     det_list = []
     eo_map = fused_id_by_eo or {}
     for det in ef.detections:
+        bbox = {"x": det.bbox.x, "y": det.bbox.y,
+                "w": det.bbox.w, "h": det.bbox.h}
+        fid = (eo_map.get(int(det.track_id))
+                if det.track_id is not None else None)
+        if fid is None:
+            fid = _fused_id_for_bbox(bbox, fused_wire, "bbox_eo")
         det_list.append({
-            "bbox": {
-                "x": det.bbox.x, "y": det.bbox.y,
-                "w": det.bbox.w, "h": det.bbox.h,
-            },
+            "bbox": bbox,
             "track_id": det.track_id,
-            "fused_id": (eo_map.get(int(det.track_id))
-                          if det.track_id is not None else None),
+            "fused_id": fid,
             "classification": {
                 "target_class": det.target_class.value,
                 "confidence": round(float(det.confidence), 3),
@@ -736,9 +788,11 @@ def build_ws_message(
         "ts": time.time(),
         "thermal": thermal_to_wire(tf, jpeg_quality=jpeg_quality,
                                    gstate=gstate,
-                                   fused_id_by_thermal=thermal_to_fused),
+                                   fused_id_by_thermal=thermal_to_fused,
+                                   fused_wire=fused_wire),
         "eo": eo_to_wire(ef, jpeg_quality=eo_q,
-                          fused_id_by_eo=eo_to_fused),
+                          fused_id_by_eo=eo_to_fused,
+                          fused_wire=fused_wire),
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
             radar_az_bias_deg=radar_az_bias_deg,
