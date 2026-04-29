@@ -196,6 +196,23 @@ export function fusedIdForDet(rawBBox, fusedTracks, sideKey, iouMin = 0.20, det 
           return t.id;
         }
       }
+      // One-shot diagnostic: EO det has a real track_id and there
+      // are fused tracks visible, but none of them carry an
+      // eo_track_id matching this det. Tells us instantly whether
+      // the chain is broken (typical cause: stale browser JS, or
+      // backend wasn't restarted after the wire schema change).
+      if (!window.__warned_eo_track_id_chain && fusedTracks.length > 0) {
+        const sample = fusedTracks
+          .filter((t) => t && t.sensors && t.sensors.includes("eo"))
+          .slice(0, 3)
+          .map((t) => ({id: t.id, eo_track_id: t.eo_track_id,
+                        sensors: t.sensors}));
+        console.warn(
+          "[fusedIdForDet] EO det.track_id=" + tid +
+          " has no matching eo_track_id on any visible fused track.",
+          "Sample fused tracks (with sensor='eo'):", sample);
+        window.__warned_eo_track_id_chain = true;
+      }
     }
   }
 
