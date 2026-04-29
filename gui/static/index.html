@@ -85,13 +85,29 @@
         </div>
         <div class="panel-subbar">
           <span class="fov-label" id="eo-fov">11° HFOV</span>
-          <!-- DISTANCE ESTIMATE: drag a bbox across a target, release,
-               we compute distance from known size + HFOV. Single
-               assumption: target is ~1.8 m wide (typical car/person
-               shoulder width). Edit `width_m` in main.js if you need a
-               different default. -->
-          <button class="draw-target-btn" id="eo-measure-btn"
+          <!-- DISTANCE ESTIMATE: drag a bbox across a target's WIDTH,
+               release, we compute distance from the assumed real-world
+               width + HFOV via the pinhole formula. The class selector
+               picks which width to assume:
+                 vehicle ≈ 1.8 m  (shoulder width / car broadside)
+                 person  ≈ 0.45 m (adult shoulder width)
+                 custom  → user-typed metres
+               Pick BEFORE clicking DISTANCE ESTIMATE. -->
+          <select id="eo-measure-class"
+                  class="select-compact"
                   style="margin-left:auto;"
+                  title="What's the target? Sets the assumed real-world width.">
+            <option value="vehicle" data-width="1.8" selected>vehicle (1.8 m)</option>
+            <option value="person"  data-width="0.45">person (0.45 m)</option>
+            <option value="custom"  data-width="">custom…</option>
+          </select>
+          <input type="number" id="eo-measure-custom-m"
+                 class="num-compact"
+                 min="0.05" max="50" step="0.05"
+                 placeholder="m"
+                 title="Custom real-world width in metres"
+                 style="display:none;width:64px;">
+          <button class="draw-target-btn" id="eo-measure-btn"
                   title="Drag a bbox across the target's WIDTH — release for distance">
             DISTANCE ESTIMATE
           </button>

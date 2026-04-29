@@ -1261,26 +1261,25 @@ function connect() {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────
-// EO distance estimate — operator drags a bbox across a target's width,
-// we compute distance from known size + HFOV.
+// EO distance estimate — operator picks a target class (or custom),
+// drags a bbox across the target's width, we compute distance from
+// the assumed real-world width + HFOV via the pinhole formula:
 //
 //   D  =  S · W_img  /  ( p_px · 2 · tan(HFOV/2) )
 //
+// Class selector replaces the previous single hardcoded 1.8 m default
+// (operator reported humans drawn at shoulder width were reported
+// ~3.6× too far because shoulder ≈ 0.45 m, not 1.8 m).
 // Pure client-side; no server roundtrip. Persists the box as a sticky
-// magenta overlay (with a `≈ XX m` label) until CLEAR. Stand-in for
-// radar range until the radar half of the rig comes online.
-//
-// Single hardcoded assumption: target is ~1.8 m wide (typical car /
-// adult shoulder width). Adjust REAL_WIDTH_M below if you're measuring
-// something else.
+// magenta overlay (with a `≈ XX m` label) until CLEAR.
 // ─────────────────────────────────────────────────────────────────────────
 (() => {
-  const btn      = document.getElementById("eo-measure-btn");
-  const clearBtn = document.getElementById("eo-measure-clear");
-  const statusEl = document.getElementById("eo-measure-status");
+  const btn       = document.getElementById("eo-measure-btn");
+  const clearBtn  = document.getElementById("eo-measure-clear");
+  const statusEl  = document.getElementById("eo-measure-status");
+  const classSel  = document.getElementById("eo-measure-class");
+  const customIn  = document.getElementById("eo-measure-custom-m");
   if (!btn || !clearBtn) return;
-
-  const REAL_WIDTH_M = 1.8;  // assumed target width; tweak if needed
 
   const setStatus = (text, color) => {
     if (!statusEl) return;
@@ -1288,31 +1287,72 @@ function connect() {
     statusEl.style.color = color || "var(--text-3)";
   };
 
+  // Read the currently-assumed real-world width (m). Pulls from the
+  // selected option's data-width, or the custom input when "custom" is
+  // chosen. Returns null if custom is selected but the field is empty
+  // or invalid — the caller surfaces a friendly status message.
+  function getAssumedWidthM() {
+    if (!classSel) return 1.8;
+    const opt = classSel.options[classSel.selectedIndex];
+    if (!opt) return 1.8;
+    if (opt.value === "custom") {
+      const v = parseFloat(customIn ? customIn.value : "");
+      return (isFinite(v) && v > 0) ? v : null;
+    }
+    const w = parseFloat(opt.dataset.width || "");
+    return (isFinite(w) && w > 0) ? w : 1.8;
+  }
+
+  function classLabel() {
+    if (!classSel) return "vehicle";
+    const opt = classSel.options[classSel.selectedIndex];
+    return opt ? opt.value : "vehicle";
+  }
+
+  // Toggle the custom-metres input visibility based on the current
+  // class selection. Hidden until "custom" is picked so the bar stays
+  // tight in the common case.
+  function syncCustomVisibility() {
+    if (!customIn || !classSel) return;
+    customIn.style.display = (classSel.value === "custom") ? "" : "none";
+  }
+  if (classSel) classSel.addEventListener("change", syncCustomVisibility);
+  syncCustomVisibility();
+
   function fmtMeters(D) {
     if (!isFinite(D) || D <= 0) return "—";
     if (D < 100) return D.toFixed(1) + " m";
     return D.toFixed(0) + " m";
   }
 
-  function computeDistance(bbox) {
+  function computeDistance(bbox, widthM) {
     const fw = window.eoView ? window.eoView.getFrameWidth()  : 0;
     const hfovDeg = window.eoView ? window.eoView.getHfovDeg() : 11.05;
     if (!fw || !hfovDeg || bbox.w < 1) return null;
     const tanHalf = Math.tan(hfovDeg * Math.PI / 360);  // tan(HFOV/2)
-    return REAL_WIDTH_M * fw / (bbox.w * 2 * tanHalf);
+    return widthM * fw / (bbox.w * 2 * tanHalf);
   }
 
   const setActive = (on) => {
     btn.classList.toggle("active", !!on);
     if (window.eoView) {
       window.eoView.setMeasureMode(!!on, (bbox) => {
-        const D = computeDistance(bbox);
+        const widthM = getAssumedWidthM();
+        if (widthM == null) {
+          setStatus("custom width missing — type metres in the box",
+                    "var(--warn, #f08a3a)");
+          btn.classList.remove("active");
+          window.eoView.setMeasureMode(false);
+          return;
+        }
+        const D = computeDistance(bbox, widthM);
         if (D == null) {
-          setStatus("measure failed (no frame intrinsics)", "var(--warn, #f08a3a)");
+          setStatus("measure failed (no frame intrinsics)",
+                    "var(--warn, #f08a3a)");
         } else {
           const lbl = `≈ ${fmtMeters(D)}`;
           window.eoView.setMeasurement({ bbox, label: lbl });
-          setStatus(`${lbl} (assuming ${REAL_WIDTH_M} m wide)`,
+          setStatus(`${lbl} (${classLabel()}, ${widthM} m wide)`,
                     "var(--fused-green, #58e07b)");
         }
         btn.classList.remove("active");
@@ -1323,9 +1363,22 @@ function connect() {
 
   btn.addEventListener("click", () => {
     if (!window.eoView) return;
+    // If custom is selected with no value, refuse to enter measure
+    // mode rather than letting the user draw and then fail silently.
+    if (classSel && classSel.value === "custom") {
+      const w = parseFloat(customIn ? customIn.value : "");
+      if (!(isFinite(w) && w > 0)) {
+        setStatus("type a custom width (m) before drawing",
+                  "var(--warn, #f08a3a)");
+        if (customIn) customIn.focus();
+        return;
+      }
+    }
     setActive(!window.eoView.isMeasureMode());
     if (window.eoView.isMeasureMode()) {
-      setStatus("drag a bbox across the target's WIDTH — ESC to cancel",
+      const widthM = getAssumedWidthM();
+      setStatus(`drag a bbox across the target's WIDTH ` +
+                `(${classLabel()}, ${widthM} m) — ESC to cancel`,
                 "var(--text-2)");
     }
   });

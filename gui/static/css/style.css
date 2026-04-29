@@ -290,6 +290,38 @@ body {
   margin-left: 6px;
   transition: background 80ms, color 80ms, border-color 80ms;
 }
+
+/* Compact <select> + numeric input that sit alongside the subbar
+   buttons (DISTANCE ESTIMATE class picker). Match the button styling
+   so the bar stays cohesive — same height, same border, same hover. */
+.select-compact, .num-compact {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+  background: transparent;
+  border-radius: 4px;
+  margin-left: 6px;
+  outline: none;
+  cursor: pointer;
+}
+.select-compact:hover, .num-compact:hover,
+.select-compact:focus, .num-compact:focus {
+  background: var(--bg-card-2);
+  color: var(--text);
+  border-color: var(--accent, var(--border-2));
+}
+.num-compact {
+  cursor: text;
+  -moz-appearance: textfield;
+}
+.num-compact::-webkit-outer-spin-button,
+.num-compact::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
 .draw-target-btn:hover, .clear-target-btn:hover {
   background: var(--bg-card-2);
   color: var(--text);
