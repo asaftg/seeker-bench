@@ -761,6 +761,348 @@ if (areaSlider) {
     paint();  // sync initial label
   }
 
+  // RADAR MODE picker (Phase 3). Mode SELECTS WHICH RADAR PIPELINE RUNS
+  // and WHICH DSP CONTROLS ARE EXPOSED in the panel. Stock keeps the
+  // existing detection-tuning sliders and DOES NOT touch them. A/G
+  // reveals long-range raw-ADC controls (integrate-chirps, CFAR algo,
+  // CFAR threshold, Capon BF). A/A reveals PMM controls (blade-rate
+  // band, threshold, slow-time window, staggered PRF). Stock NEVER
+  // overwrites your saved sliders — selecting it just hides the
+  // mode-specific extras.
+  //
+  // The mode and any extra-control changes are pushed via dedicated
+  // WS commands; the backend wires them to the relevant pipeline once
+  // ported. For now the picker is the GUI surface the plan promised.
+  function _showModeExtras(mode) {
+    const sections = document.querySelectorAll(".radar-mode-extra");
+    sections.forEach(sec => {
+      const m = sec.getAttribute("data-mode");
+      const show = (m === mode);
+      if (show) {
+        sec.removeAttribute("hidden");
+        sec.style.display = "";
+      } else {
+        sec.setAttribute("hidden", "");
+        sec.style.display = "none";
+      }
+    });
+  }
+
+  // Per-mode state model (Phase 3 multi-mode picker)
+  // ─────────────────────────────────────────────────
+  // Two layers, intentionally separate:
+  //
+  //   _MODE_LIVE[mode]      = live in-memory state for each mode.
+  //                           Updated on EVERY slider change while
+  //                           that mode is active. Swapped on mode
+  //                           change so unsaved edits survive a
+  //                           Stock→A/G→Stock round-trip without
+  //                           hitting disk. Also seeded from
+  //                           _MODE_SNAPSHOTS at hydrate time.
+  //   _MODE_SNAPSHOTS[mode] = last-saved-to-disk snapshot. Hydrated
+  //                           ONCE from the server's first WS
+  //                           message via __hydrateRadarModes().
+  //                           Updated by SAVE CONFIG. Used as the
+  //                           fallback if _MODE_LIVE is empty for a
+  //                           mode (e.g. user has never visited it
+  //                           this session yet).
+  //
+  // Why two layers? The user complained that SAVE-per-mode "doesn't
+  // work" — root cause was that the original implementation had ONLY
+  // _MODE_SNAPSHOTS and never updated it after SAVE. So clicking
+  // SAVE wrote the file, but in-memory state still had `null` for
+  // that mode, and switching modes silently kept the current
+  // sliders. We now keep _MODE_LIVE fresh and refresh _MODE_SNAPSHOTS
+  // on save, so a Stock→A/G→Stock round-trip restores Stock's
+  // values instantly with no page reload.
+  let _MODE_LIVE      = { stock: null, ag: null, aa: null };
+  let _MODE_SNAPSHOTS = { stock: null, ag: null, aa: null };
+  let _CURRENT_MODE   = "stock";  // mirrors the radio group; outgoing mode on switch
+
+  window.__hydrateRadarModes = (saved) => {
+    if (!saved || typeof saved !== "object") return;
+    for (const m of ["stock", "ag", "aa"]) {
+      if (saved[m] && typeof saved[m] === "object") {
+        _MODE_SNAPSHOTS[m] = { ...saved[m] };
+        // Seed _MODE_LIVE too so the very first switch into this
+        // mode gets the saved values without a full page round-trip.
+        _MODE_LIVE[m] = { ...saved[m] };
+      }
+    }
+  };
+
+  // Shared (visible-in-every-mode) slider IDs. The value is per-mode
+  // — switching modes swaps these in-place.
+  const _SLIDER_IDS = {
+    snr_min_db:          "radar-snr",
+    az_half_deg:         "radar-az",
+    speed_min_mps:       "radar-speed",
+    range_min_m:         "radar-range-min",
+    cluster_eps_pos_m:   "radar-eps",
+    cluster_min_samples: "radar-minpts",
+  };
+  // A/G-only DSP knobs (revealed when mode=ag). Each entry is the
+  // payload key + DOM id + how to read its value.
+  const _AG_CTRLS = {
+    integrate_chirps:  { id: "ag-chirps",      type: "num"  },
+    cfar_algo:         { id: "ag-cfar-algo",   type: "str"  },
+    cfar_threshold_db: { id: "ag-cfar-thresh", type: "num"  },
+    capon_bf:          { id: "ag-capon",       type: "bool" },
+  };
+  // A/A-only PMM-classifier knobs (revealed when mode=aa).
+  const _AA_CTRLS = {
+    pmm_band_low_hz:   { id: "aa-pmm-low",      type: "num"  },
+    pmm_band_high_hz:  { id: "aa-pmm-high",     type: "num"  },
+    pmm_threshold_db:  { id: "aa-pmm-thresh",   type: "num"  },
+    pmm_slow_time_win: { id: "aa-pmm-win",      type: "num"  },
+    staggered_prf:     { id: "aa-staggered-prf",type: "bool" },
+  };
+  function _readCtrl(spec) {
+    const el = document.getElementById(spec.id);
+    if (!el) return null;
+    if (spec.type === "bool") return !!el.checked;
+    if (spec.type === "str")  return String(el.value);
+    return Number(el.value);
+  }
+  function _writeCtrl(spec, v) {
+    const el = document.getElementById(spec.id);
+    if (!el || v == null) return;
+    if (spec.type === "bool") el.checked = !!v;
+    else                       el.value   = String(v);
+  }
+  // Read EVERY relevant control for `mode` from the DOM. Used to
+  // snapshot the outgoing mode before a mode switch and by SAVE.
+  function _snapshotCurrentSliders(mode) {
+    const out = {};
+    for (const [key, id] of Object.entries(_SLIDER_IDS)) {
+      const el = $(id); if (!el) continue;
+      out[key] = Number(el.value);
+    }
+    if (mode === "ag") {
+      for (const [k, spec] of Object.entries(_AG_CTRLS)) {
+        const v = _readCtrl(spec); if (v !== null) out[k] = v;
+      }
+    } else if (mode === "aa") {
+      for (const [k, spec] of Object.entries(_AA_CTRLS)) {
+        const v = _readCtrl(spec); if (v !== null) out[k] = v;
+      }
+    }
+    return out;
+  }
+  function _applySnapshotToSliders(snap) {
+    if (!snap) return;
+    for (const [key, id] of Object.entries(_SLIDER_IDS)) {
+      const v = snap[key];
+      if (v == null) continue;
+      const el = $(id); const lbl = $(id + "-val");
+      if (!el) continue;
+      el.value = String(v);
+      const row = rows.find(r => r.id === id);
+      if (lbl && row) lbl.textContent = row.fmt(row.int ? Math.round(v) : v);
+    }
+    // Mode-specific knobs (A/G or A/A); harmless when the section is
+    // hidden — the value just sits there until the user reveals it.
+    for (const [k, spec] of Object.entries(_AG_CTRLS)) _writeCtrl(spec, snap[k]);
+    for (const [k, spec] of Object.entries(_AA_CTRLS)) _writeCtrl(spec, snap[k]);
+  }
+  function _applyMode(newMode) {
+    // 1. Snapshot the OUTGOING mode's live slider state so the user
+    //    can come back to it without losing in-progress edits.
+    if (_CURRENT_MODE && _CURRENT_MODE !== newMode) {
+      _MODE_LIVE[_CURRENT_MODE] = _snapshotCurrentSliders(_CURRENT_MODE);
+    }
+    _CURRENT_MODE = newMode;
+    _showModeExtras(newMode);
+    // 2. Tell backend which mode is active.
+    wsSend({ command: "set_radar_mode", mode: newMode });
+    // 3. Load incoming mode's slider values: prefer in-memory live
+    //    state (most recent), fall back to saved-on-disk snapshot.
+    //    If neither exists (mode never visited, never saved), leave
+    //    sliders alone — same "do not trample" rule as before.
+    const snap = _MODE_LIVE[newMode] || _MODE_SNAPSHOTS[newMode];
+    if (snap) {
+      _applySnapshotToSliders(snap);
+      // 4. Push shared filter values to the radar backend so the
+      //    live filter follows the picker. A/G and A/A specific
+      //    knobs are handled below — but the writeCtrl above only
+      //    fills the inputs; we still need to push them to backend.
+      const tunePayload = { command: "radar_tune" };
+      for (const k of Object.keys(_SLIDER_IDS)) {
+        if (snap[k] != null) tunePayload[k] = snap[k];
+      }
+      wsSend(tunePayload);
+      if (newMode === "ag") {
+        const ag = { command: "ag_tune" };
+        for (const k of Object.keys(_AG_CTRLS)) if (snap[k] != null) ag[k] = snap[k];
+        if (Object.keys(ag).length > 1) wsSend(ag);
+      } else if (newMode === "aa") {
+        const aa = { command: "aa_tune" };
+        for (const k of Object.keys(_AA_CTRLS)) if (snap[k] != null) aa[k] = snap[k];
+        if (Object.keys(aa).length > 1) wsSend(aa);
+      }
+    }
+    const status = document.getElementById("radar-backend-status");
+    if (status) {
+      status.textContent = newMode === "stock" ? "STOCK" : (newMode === "ag" ? "A/G" : "A/A");
+      status.style.color = "var(--cyan)";
+    }
+  }
+  for (const mode of ["stock", "ag", "aa"]) {
+    const el = document.getElementById("radar-backend-" + mode);
+    if (el) el.addEventListener("change", () => { if (el.checked) _applyMode(mode); });
+  }
+  // Initial state: Stock is checked in HTML, so make sure the extras
+  // are hidden at page load.
+  _showModeExtras("stock");
+
+  // Keep _MODE_LIVE for the active mode in sync as the user drags
+  // sliders. Without this, switching A/G→Stock→A/G would lose all
+  // unsaved A/G edits. The shared sliders fire "input"; we listen
+  // and stash into _MODE_LIVE[_CURRENT_MODE].
+  function _stashShared(key, val) {
+    if (!_MODE_LIVE[_CURRENT_MODE]) _MODE_LIVE[_CURRENT_MODE] = {};
+    _MODE_LIVE[_CURRENT_MODE][key] = val;
+  }
+  for (const row of rows) {
+    const sl = $(row.id);
+    if (!sl) continue;
+    sl.addEventListener("input", () => {
+      const raw = parseFloat(sl.value);
+      const v = row.int ? row.round(raw) : raw;
+      _stashShared(row.key, v);
+    });
+  }
+  // Mode-specific stash hooks (A/G + A/A). Wired in addition to the
+  // _wireModeControl listeners below — those push to backend; this
+  // captures the value into _MODE_LIVE so a mode-switch + return
+  // doesn't lose it. We gate on _CURRENT_MODE so a stray event
+  // dispatch from the OTHER mode's hidden inputs can't pollute the
+  // active mode's snapshot.
+  function _wireModeStash(modeOwner, key, spec) {
+    const el = document.getElementById(spec.id);
+    if (!el) return;
+    const onChange = () => {
+      if (_CURRENT_MODE !== modeOwner) return;
+      const v = _readCtrl(spec); if (v === null) return;
+      if (!_MODE_LIVE[modeOwner]) _MODE_LIVE[modeOwner] = {};
+      _MODE_LIVE[modeOwner][key] = v;
+    };
+    el.addEventListener("input",  onChange);
+    el.addEventListener("change", onChange);
+  }
+  for (const [k, spec] of Object.entries(_AG_CTRLS)) _wireModeStash("ag", k, spec);
+  for (const [k, spec] of Object.entries(_AA_CTRLS)) _wireModeStash("aa", k, spec);
+
+  // ───── A/G mode controls — paint label only at init; push to
+  // backend ONLY on user interaction (no WS spam at page load). ──────
+  function _wireModeControl(id, command, key, fmtFn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const lbl = document.getElementById(id + "-val");
+    function readVal() {
+      if (el.type === "checkbox") return el.checked;
+      if (el.tagName === "SELECT") return el.value;
+      return Number(el.value);
+    }
+    function paintLabel() {
+      const v = readVal();
+      if (lbl && fmtFn) lbl.textContent = fmtFn(v);
+    }
+    function pushAndPaint() {
+      paintLabel();
+      try { wsSend({ command, [key]: readVal() }); } catch (_) {}
+    }
+    el.addEventListener("input",  pushAndPaint);
+    el.addEventListener("change", pushAndPaint);
+    paintLabel();  // initial label only — no WS send at page load
+  }
+  _wireModeControl("ag-chirps",      "ag_tune", "integrate_chirps",   v => v + " chirps");
+  _wireModeControl("ag-cfar-algo",   "ag_tune", "cfar_algo",          v => "");
+  _wireModeControl("ag-cfar-thresh", "ag_tune", "cfar_threshold_db",  v => v.toFixed(1) + " dB");
+  _wireModeControl("ag-capon",       "ag_tune", "capon_bf",           v => "");
+
+  // ── Dual-thumb PMM-band slider ────────────────────────────────────
+  // The two `aa-pmm-low` / `aa-pmm-high` inputs share one track. We
+  // (a) clamp so low ≤ high − step, (b) update a single combined
+  // label "XX Hz – YY Hz", (c) update the cyan fill bar between
+  // the thumbs. We attach this listener BEFORE _wireModeControl
+  // below so the clamp runs first; the WS-send listener then reads
+  // the already-clamped value and pushes it to the backend.
+  (function setupDualPmm() {
+    const lo = document.getElementById("aa-pmm-low");
+    const hi = document.getElementById("aa-pmm-high");
+    const fill = document.getElementById("aa-pmm-fill");
+    const lbl = document.getElementById("aa-pmm-band-val");
+    if (!lo || !hi || !fill) return;
+    const min = Number(lo.min), max = Number(lo.max), step = Number(lo.step) || 1;
+    function pct(v) { return ((v - min) / (max - min)) * 100; }
+    function repaint() {
+      const a = Number(lo.value), b = Number(hi.value);
+      const left = pct(a), right = pct(b);
+      fill.style.left  = left + "%";
+      fill.style.width = Math.max(0, right - left) + "%";
+      if (lbl) lbl.textContent = a.toFixed(0) + " – " + b.toFixed(0) + " Hz";
+    }
+    function clampLow() {
+      // If user dragged low past high, push it back below high by step.
+      if (Number(lo.value) > Number(hi.value) - step) {
+        lo.value = String(Math.max(min, Number(hi.value) - step));
+      }
+      repaint();
+    }
+    function clampHigh() {
+      if (Number(hi.value) < Number(lo.value) + step) {
+        hi.value = String(Math.min(max, Number(lo.value) + step));
+      }
+      repaint();
+    }
+    lo.addEventListener("input", clampLow);
+    hi.addEventListener("input", clampHigh);
+    repaint();  // initial paint of fill bar + combined label
+  })();
+
+  _wireModeControl("aa-pmm-low",     "aa_tune", "pmm_band_low_hz",    v => v.toFixed(0) + " Hz");
+  _wireModeControl("aa-pmm-high",    "aa_tune", "pmm_band_high_hz",   v => v.toFixed(0) + " Hz");
+  _wireModeControl("aa-pmm-thresh",  "aa_tune", "pmm_threshold_db",   v => v.toFixed(1) + " dB");
+  _wireModeControl("aa-pmm-win",     "aa_tune", "pmm_slow_time_win",  v => v + " chirps");
+  _wireModeControl("aa-staggered-prf","aa_tune","staggered_prf",      v => "");
+
+  // ───── SAVE CONFIG button — persist current slider values for the
+  //       ACTIVE mode to disk. Each mode (Stock / A/G / A/A) has its
+  //       own snapshot so switching modes restores the values you
+  //       saved for that mode.
+  const _SAVE_BTN = document.getElementById("radar-save-mode-config");
+  if (_SAVE_BTN) {
+    _SAVE_BTN.addEventListener("click", (ev) => {
+      // Don't let the click also flip the radio behind the button.
+      ev.preventDefault(); ev.stopPropagation();
+      const checked = document.querySelector("input[name='radar-backend']:checked");
+      const mode = checked ? checked.value : _CURRENT_MODE;
+      // Collect EVERY relevant control for this mode in one place.
+      // _snapshotCurrentSliders is the same routine the mode-switch
+      // path uses for the outgoing-mode snapshot, so SAVE captures
+      // exactly what the user sees on screen.
+      const snap = _snapshotCurrentSliders(mode);
+      const payload = { command: "save_radar_mode_config", mode, ...snap };
+      try {
+        wsSend(payload);
+        // Refresh BOTH the live state and the on-disk snapshot
+        // mirror so a subsequent Stock→A/G→Stock round-trip restores
+        // the values we just saved without waiting for a page
+        // reload. Without this, the in-memory state stayed `null`
+        // and the picker silently ignored the saved file (the
+        // exact bug the user kept hitting before this fix).
+        _MODE_LIVE[mode]      = { ...snap };
+        _MODE_SNAPSHOTS[mode] = { ...snap };
+        const orig = _SAVE_BTN.textContent;
+        _SAVE_BTN.textContent = "SAVED ✓";
+        setTimeout(() => { _SAVE_BTN.textContent = orig; }, 1500);
+      } catch (e) {
+        console.warn("save_radar_mode_config failed:", e);
+      }
+    });
+  }
+
   // Adopt server-side values on first message so manual edits in YAML
   // don't fight with the slider defaults hard-coded in HTML.
   let _hydrated = false;
@@ -1123,6 +1465,9 @@ function connect() {
 
     // Hydrate DEV-tab radar sliders from the server-reported tuning on
     // first tick so they reflect YAML defaults, not HTML-hard-coded ones.
+    if (msg.radar_modes_saved && typeof window.__hydrateRadarModes === "function") {
+      window.__hydrateRadarModes(msg.radar_modes_saved);
+    }
     if (msg.radar_tuning && typeof window.__hydrateRadarTuning === "function") {
       window.__hydrateRadarTuning(msg.radar_tuning);
     }

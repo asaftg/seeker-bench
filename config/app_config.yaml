@@ -408,7 +408,19 @@ radar:
   data_port: COM10              # data UART (3_125_000), TLV stream comes in here
   cli_baud: 115200
   data_baud: 3125000            # verified by brute-forcing bauds until magic word aligned
-  cfg_path: "C:/ti/mmwave_mcuplus_sdk_04_07_02_01/ti/demo/awr2x44P/mmw_ddm/profiles/awr2944P/profile_3d_3Azim_1ElevTx_DDMA_awr2944P_highRange.cfg"
+  # Phase 3 (validated 2026-04-29): unified cfg pushed once at boot.
+  # Identical to TI's highRange profile + ``lvdsStreamCfg -1 0 1 0`` so
+  # the chip emits BOTH TLV (existing path, drives Stock + A/G) AND raw
+  # ADC over LVDS to the DCA1000 (drives A/A PMM). Mode dispatch is
+  # purely host-side; no chip cfg change between modes.
+  cfg_path: "radar/cfg/awr2944P_unified.cfg"
+  # Phase 3 — DCA1000 networking (only used when A/A pipeline runs).
+  dca:
+    enabled: true
+    host_ip: "192.168.33.30"
+    dca_ip: "192.168.33.180"
+    config_port: 4096
+    data_udp_port: 4098
   profile_name: awr2944p_ddm
   snr_min_db: 6.0               # lower = more returns. Sparse-vehicle clouds were being gated out at 12 dB.
   # Project objective is long-range detection. The highRange .cfg's

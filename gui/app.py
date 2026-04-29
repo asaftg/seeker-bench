@@ -470,6 +470,22 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                             payload["radar_tuning"] = rm.get_tuning()
                         except Exception:
                             pass
+                    # Phase 3: send the per-mode saved configs ONCE on
+                    # the first WS message so the GUI can hydrate per
+                    # mode and switch between them without losing values.
+                    if not state.get("_radar_modes_sent"):
+                        try:
+                            from pathlib import Path as _Path
+                            import json as _json
+                            _modes_path = _Path("config/radar_modes.json")
+                            if _modes_path.exists():
+                                payload["radar_modes_saved"] = _json.loads(
+                                    _modes_path.read_text("utf-8"))
+                            else:
+                                payload["radar_modes_saved"] = {}
+                            state["_radar_modes_sent"] = True
+                        except Exception:
+                            pass
                     # Extrinsic calibration (software bias vs. EO) — feed
                     # the DEV-tab sliders so they hydrate with current
                     # values on the first frame.
@@ -730,6 +746,96 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     mode = str(cmd.get("mode", "auto")).lower()
                     if mode in ("auto", "on", "off"):
                         state["nir_mode"] = mode
+
+                elif command == "set_radar_mode":
+                    # Phase 3 mode select (stock | ag | aa). The composite
+                    # backend changes which host pipeline output is the
+                    # primary radar source. Switching modes does not push
+                    # a new chip cfg and does not power-cycle.
+                    mode = str(cmd.get("mode", "")).lower()
+                    if mode in ("stock", "ag", "aa"):
+                        state["radar_mode"] = mode
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "set_mode"):
+                            try:
+                                rm.set_mode(mode)
+                            except Exception:
+                                log.exception("composite.set_mode failed")
+                        try:
+                            emit_event("set_radar_mode", {"mode": mode})
+                        except Exception:
+                            log.exception("emit_event set_radar_mode")
+                    else:
+                        log.warning("set_radar_mode: unknown mode %r", mode)
+
+                elif command == "ag_tune":
+                    # A/G (mmHawkeye long-range) DSP knobs: integrate_chirps,
+                    # cfar_algo, cfar_threshold_db, capon_bf. Pushes into
+                    # the composite if available; the AG host-side processor
+                    # consumes them at frame time.
+                    try:
+                        params = {k: v for k, v in cmd.items()
+                                  if k != "command" and v is not None}
+                        state.setdefault("ag_tuning", {}).update(params)
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "update_ag_params"):
+                            try:
+                                rm.update_ag_params(**params)
+                            except Exception:
+                                log.exception("composite.update_ag_params failed")
+                        emit_event("ag_tune", params)
+                    except Exception:
+                        log.exception("ag_tune")
+
+                elif command == "aa_tune":
+                    # A/A (PMM drone) DSP knobs: pmm_band_low_hz, pmm_band_high_hz,
+                    # pmm_threshold_db, pmm_slow_time_win, staggered_prf.
+                    # Pushed live into the DCAPipeline's PMM detector.
+                    try:
+                        params = {k: v for k, v in cmd.items()
+                                  if k != "command" and v is not None}
+                        state.setdefault("aa_tuning", {}).update(params)
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "update_aa_params"):
+                            try:
+                                rm.update_aa_params(**params)
+                            except Exception:
+                                log.exception("composite.update_aa_params failed")
+                        emit_event("aa_tune", params)
+                    except Exception:
+                        log.exception("aa_tune")
+
+                elif command == "save_radar_mode_config":
+                    # Persist the current per-mode slider values to disk
+                    # so they survive restarts. Three independent
+                    # snapshots: stock / ag / aa.
+                    target_mode = str(cmd.get("mode", "")).lower()
+                    if target_mode in ("stock", "ag", "aa"):
+                        try:
+                            from common.config import load_config
+                            import json as _json
+                            from pathlib import Path as _Path
+                            calib_dir = _Path("config")
+                            calib_dir.mkdir(exist_ok=True)
+                            store_path = calib_dir / "radar_modes.json"
+                            try:
+                                store = _json.loads(store_path.read_text("utf-8"))
+                            except Exception:
+                                store = {}
+                            store[target_mode] = {
+                                k: v for k, v in cmd.items()
+                                if k not in ("command", "mode") and v is not None
+                            }
+                            store_path.write_text(_json.dumps(store, indent=2), "utf-8")
+                            log.info("Saved radar mode %s config to %s", target_mode, store_path)
+                            emit_event("save_radar_mode_config",
+                                       {"mode": target_mode, "saved": True})
+                        except Exception as e:
+                            log.exception("save_radar_mode_config")
+                            emit_event("save_radar_mode_config",
+                                       {"mode": target_mode, "saved": False, "error": str(e)})
+                    else:
+                        log.warning("save_radar_mode_config: unknown mode %r", target_mode)
 
                 elif command == "radar_tune":
                     # Live-update radar filter + cluster knobs from the

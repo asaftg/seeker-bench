@@ -205,6 +205,29 @@
       Nothing here affects headless operation.
     </div>
 
+    <!-- Top row of live previews — Thermal | EO | Radar (matches MAIN tab order).
+         Sits at the top so the operator sees the sensor outputs FIRST,
+         then scrolls into the per-sensor controls below. -->
+    <div class="row-dev-previews">
+      <div class="ctrl-card dev-preview-card">
+        <div class="mini-preview-label">LIVE · thermal</div>
+        <canvas id="thermal-mini-canvas"></canvas>
+      </div>
+      <div class="ctrl-card dev-preview-card">
+        <div class="mini-preview-label">LIVE · EO (calibration reference)</div>
+        <canvas id="eo-mini-canvas"></canvas>
+      </div>
+      <div class="ctrl-card dev-preview-card">
+        <div class="mini-preview-label">LIVE · radar</div>
+        <canvas id="radar-mini-canvas"></canvas>
+      </div>
+    </div>
+
+    <!-- Scrollable controls area — previews row above stays fixed in
+         view so the operator always sees the live displays while
+         scrolling through controls. -->
+    <div class="dev-scroll-area">
+
     <!-- Globals row: cross-sensor knobs + the shared SAVE for extrinsic
          biases. Slim, ~50 px, sits above the per-sensor cards. -->
     <div class="row-ctrl-globals">
@@ -305,10 +328,6 @@
                sits here at the same size as the thermal/radar minis so
                the operator sees fused/projected bboxes shifting on the
                same canvas while dragging the bias sliders elsewhere. -->
-          <div class="sensor-preview">
-            <div class="mini-preview-label">LIVE · EO (calibration reference)</div>
-            <canvas id="eo-mini-canvas"></canvas>
-          </div>
         </div>
       </div>
 
@@ -343,20 +362,16 @@
             <div class="section-label">EXTRINSIC vs EO</div>
             <div class="slider-row">
               <label class="slider-label" title="+ shifts thermal fused box right on EO">AZ</label>
-              <input id="ext-thermal-az" type="range" min="-10" max="10" step="0.1" value="0">
+              <input id="ext-thermal-az" type="range" min="-2" max="2" step="0.05" value="0">
               <span class="slider-val" id="ext-thermal-az-val">— °</span>
             </div>
             <div class="slider-row">
               <label class="slider-label" title="+ shifts thermal fused box up on EO">EL</label>
-              <input id="ext-thermal-el" type="range" min="-10" max="10" step="0.1" value="0">
+              <input id="ext-thermal-el" type="range" min="-2" max="2" step="0.05" value="0">
               <span class="slider-val" id="ext-thermal-el-val">— °</span>
             </div>
           </div>
 
-          <div class="sensor-preview">
-            <div class="mini-preview-label">LIVE · thermal</div>
-            <canvas id="thermal-mini-canvas"></canvas>
-          </div>
         </div>
       </div>
 
@@ -364,8 +379,40 @@
       <div class="ctrl-card sensor-card" id="dev-radar">
         <div class="ctrl-head">
           <span class="ctrl-title">RADAR · AWR2944P</span>
+          <span id="radar-backend-status" class="ctrl-substatus mono"
+                style="margin-left:auto;color:var(--text-3);font-size:10px;">
+            …
+          </span>
         </div>
         <div class="sensor-body">
+          <!-- RADAR MODE picker. Each mode reveals its own DSP controls
+               below the stock detection-tuning sliders. -->
+          <div class="sensor-section">
+            <div class="section-label" title="Selects which radar pipeline runs and which mode-specific DSP knobs are exposed below. Switching modes does not push a new chirp cfg to the chip and does not power-cycle.">MODE
+              <button id="radar-save-mode-config" class="save-mode-btn"
+                      title="Save the current slider values for THIS mode to disk (config/radar_modes.json). Restored on next Seeker startup. Each mode has its own snapshot."
+                      style="margin-left:auto;float:right;font-size:10px;padding:2px 8px;border-radius:4px;background:transparent;border:1px solid var(--cyan);color:var(--cyan);cursor:pointer;letter-spacing:1px;">SAVE CONFIG</button>
+            </div>
+            <div class="fusion-sub">
+              <label class="fusion-toggle" title="Stock: TLV point cloud over UART → DBSCAN → Kalman tracker. Identical to today's Seeker behaviour. Uses the existing detection-tuning sliders below.">
+                <input type="radio" name="radar-backend" id="radar-backend-stock" value="stock" checked>
+                <span>Stock</span>
+              </label>
+              <label class="fusion-toggle" title="A/G (Air-to-Ground): mmHawkeye-style raw-ADC pipeline with long coherent integration (+27 dB at 512 chirps), OS-CFAR for non-Gaussian foliage clutter, Capon beamformer over the virtual array (+8–10 dB spatial gain). Goal: extend detection range on dynamic vehicles and humans (~1.4× stock).">
+                <input type="radio" name="radar-backend" id="radar-backend-ag" value="ag">
+                <span>A/G</span>
+              </label>
+              <label class="fusion-toggle" title="A/A (Air-to-Air): raw-ADC slow-time + propeller micro-motion (PMM) drone classifier. Looks for symmetric sideband pair around the body Doppler at the blade-pass frequency. Output: drone class label + confidence overlaid on the standard point cloud.">
+                <input type="radio" name="radar-backend" id="radar-backend-aa" value="aa">
+                <span>A/A</span>
+              </label>
+            </div>
+            <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
+              STOCK = TLV + DBSCAN (today's chain).
+              A/G = mmHawkeye-style raw-ADC long-integration (+27 dB) + OS-CFAR + Capon BF for dynamic vehicles/humans.
+              A/A = raw-ADC slow-time + propeller-sideband (PMM) drone classifier.
+            </div>
+          </div>
           <div class="sensor-section">
             <div class="section-label">DETECTION TUNING · live</div>
             <div class="slider-row">
@@ -400,6 +447,86 @@
             </div>
           </div>
 
+          <!-- A/G-only controls — mmHawkeye long-range raw-ADC pipeline.
+               Visible only when MODE = A/G. Drives radar_dca/long_range
+               processing once that's wired; for now the WS command is
+               recorded so the parameters round-trip on /events. -->
+          <div class="sensor-section radar-mode-extra" data-mode="ag" hidden>
+            <div class="section-label">A/G · raw-ADC · long range</div>
+            <div class="slider-row">
+              <label class="slider-label" title="Coherent integration length. +10·log₁₀(N) dB SNR gain. 512 chirps = +27 dB vs stock 128. Frame rate drops accordingly.">INTEGRATE CHIRPS</label>
+              <input id="ag-chirps" type="range" min="128" max="512" step="128" value="512">
+              <span class="slider-val" id="ag-chirps-val">— chirps</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="CFAR algorithm. CA = Cell-Averaging (stock). OS = Ordered-Statistic (handles non-Gaussian foliage clutter). GO = Greatest-Of.">CFAR ALGO</label>
+              <select id="ag-cfar-algo" class="slider-select">
+                <option value="ca">CA (cell-avg)</option>
+                <option value="os" selected>OS (ordered-statistic)</option>
+                <option value="go">GO (greatest-of)</option>
+              </select>
+              <span class="slider-val">—</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="CFAR detection threshold (dB above noise floor). Lower = more detections, more false alarms.">CFAR THRESH</label>
+              <input id="ag-cfar-thresh" type="range" min="6" max="20" step="0.5" value="12">
+              <span class="slider-val" id="ag-cfar-thresh-val">— dB</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Capon beamformer over the AWR2944P virtual array (~12 elements with DDM-MIMO). +8–10 dB spatial gain on dynamic targets.">CAPON BF</label>
+              <label class="fusion-toggle" style="margin:0;">
+                <input type="checkbox" id="ag-capon" checked>
+                <span>on</span>
+              </label>
+              <span class="slider-val">—</span>
+            </div>
+          </div>
+
+          <!-- A/A-only controls — PMM (propeller micro-motion) drone classifier
+               on raw-ADC slow-time. Visible only when MODE = A/A. -->
+          <div class="sensor-section radar-mode-extra" data-mode="aa" hidden>
+            <div class="section-label">A/A · raw-ADC · PMM drone</div>
+            <!-- Dual-thumb range slider for the PMM blade-pass band.
+                 Two <input type=range> overlaid on the same track, both
+                 spanning the full 20–3000 Hz range; JS clamps so low
+                 stays at least one step below high. The two existing
+                 IDs (aa-pmm-low / aa-pmm-high) are preserved so the
+                 backend WS contract (pmm_band_low_hz / pmm_band_high_hz)
+                 doesn't change.
+
+                 References: DJI Mavic blade-pass ≈ 217 Hz, FPV racers
+                 land aliased near 2.5 kHz with our PRF — covering both
+                 in one band needs the full 20–3000 sweep. -->
+            <div class="slider-row">
+              <label class="slider-label" title="Propeller blade-pass-frequency band the PMM detector scans. Drag both ends. DJI-class ≈ 200–600 Hz, FPV racers alias near 2 kHz.">PMM BAND</label>
+              <div class="dual-range" data-dual="aa-pmm">
+                <div class="dual-range-track"></div>
+                <div class="dual-range-fill" id="aa-pmm-fill"></div>
+                <input id="aa-pmm-low"  type="range" min="20" max="3000" step="10" value="50"  class="dual-range-thumb">
+                <input id="aa-pmm-high" type="range" min="20" max="3000" step="10" value="500" class="dual-range-thumb">
+              </div>
+              <span class="slider-val" id="aa-pmm-band-val">— Hz</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="PMM detection threshold. Sideband-pair power above noise floor required to declare drone.">PMM THRESH</label>
+              <input id="aa-pmm-thresh" type="range" min="3" max="20" step="0.5" value="6">
+              <span class="slider-val" id="aa-pmm-thresh-val">— dB</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Slow-time window length (chirps) used for PMM FFT. Longer = better blade-rate resolution, slower update.">SLOW-TIME WIN</label>
+              <input id="aa-pmm-win" type="range" min="64" max="512" step="64" value="256">
+              <span class="slider-val" id="aa-pmm-win-val">— chirps</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Staggered-PRF Doppler unfolding. Alternates two PRFs frame-by-frame, CRT-unfolds true Doppler. Required for FPV (5+ kHz blade rate) when chip PRF can't resolve directly.">STAGGERED PRF</label>
+              <label class="fusion-toggle" style="margin:0;">
+                <input type="checkbox" id="aa-staggered-prf">
+                <span>on</span>
+              </label>
+              <span class="slider-val">—</span>
+            </div>
+          </div>
+
           <div class="sensor-section">
             <div class="section-label">EXTRINSIC vs EO</div>
             <div class="slider-row">
@@ -414,14 +541,12 @@
             </div>
           </div>
 
-          <div class="sensor-preview">
-            <div class="mini-preview-label">LIVE · radar</div>
-            <canvas id="radar-mini-canvas"></canvas>
-          </div>
         </div>
       </div>
 
     </div><!-- /.row-ctrl-sensors -->
+
+    </div><!-- /.dev-scroll-area -->
 
   </section><!-- /.tab-content[dev] -->
 

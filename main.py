@@ -30,6 +30,10 @@ from gimbal.gimbal_manager import GimbalManager
 from gui.app import create_app
 from radar.clustering import ClusterParams
 from radar.radar_manager import RadarManager
+from radar.composite_manager import CompositeRadarBackend
+from radar_dca.data_port import DataPortListener
+from radar_dca.dca_control import DCAControl
+from radar_dca.dca_pipeline import DCAPipeline, dims_from_cfg
 from recording.jsonl_recorder import JSONLRecorder
 from thermal.thermal_manager import ThermalManager
 
@@ -222,6 +226,97 @@ def main() -> int:
                 el_bias_deg=float(_ext.get("el_bias_deg", 0.0)),
             )
             radar.start()
+            # Phase 3: build the composite that wraps RadarManager + the
+            # DCA1000 raw-ADC pipeline. The composite owns mode dispatch
+            # (Stock / A/G / A/A) and the raw-ADC consumer. RadarManager
+            # is already started; composite.start() is idempotent and
+            # adds the DCA control plane + UDP listener + PMM pipeline
+            # alongside.
+            try:
+                _dca = (radar_cfg.get("dca") or {})
+                _dca_control = None
+                _dca_listener = None
+                _dca_pipeline = None
+                if bool(_dca.get("enabled", True)):
+                    _host_ip = str(_dca.get("host_ip", "192.168.33.30"))
+                    _dca_ip = str(_dca.get("dca_ip", "192.168.33.180"))
+                    _cfg_port = int(_dca.get("config_port", 4096))
+                    _udp_port = int(_dca.get("data_udp_port", 4098))
+                    _dca_control = DCAControl(
+                        host_ip=_host_ip, dca_ip=_dca_ip,
+                        config_port=_cfg_port, data_port=_udp_port,
+                    )
+                    _dca_listener = DataPortListener(
+                        host_ip=_host_ip, data_port=_udp_port,
+                    )
+                    _dca_pipeline = DCAPipeline(
+                        listener=_dca_listener,
+                        dims=dims_from_cfg(
+                            n_chirps=768, n_rx=4, n_samples=384,
+                            chirp_period_s=27.81e-6,
+                            range_resolution_m=0.81,
+                        ),
+                        pmm_band_low_hz=50.0,
+                        pmm_band_high_hz=500.0,
+                        pmm_threshold_db=6.0,
+                        profile_name="awr2944p_unified",
+                        max_range_m=float(radar_cfg.get("max_range_m", 250.0)),
+                        az_half_deg=float(radar_cfg.get("az_half_deg", 60.0)),
+                    )
+                # Build composite. start() is idempotent; the inner
+                # RadarManager.start() above is also called inside, but
+                # is a no-op since the threads already exist.
+                composite = CompositeRadarBackend(
+                    radar=radar,
+                    dca_control=_dca_control,
+                    dca_listener=_dca_listener,
+                    dca_pipeline=_dca_pipeline,
+                    initial_mode="stock",
+                )
+                composite.start()
+                # Use composite as THE radar reference everywhere — it
+                # exposes the same set_tuning/set_extrinsic/diagnostics
+                # surface as RadarManager and additionally drives mode.
+                radar = composite
+                # Restore any per-mode saved sliders so the operator's
+                # last save survives the restart. Each mode is an
+                # independent snapshot in config/radar_modes.json.
+                try:
+                    import json as _json
+                    from pathlib import Path as _Path
+                    _saved_path = _Path("config/radar_modes.json")
+                    if _saved_path.exists():
+                        _saved = _json.loads(_saved_path.read_text("utf-8"))
+                        # Apply Stock first as the baseline if present.
+                        if "stock" in _saved:
+                            stock_p = _saved["stock"]
+                            radar.set_tuning(
+                                snr_min_db=stock_p.get("snr_min_db"),
+                                az_half_deg=stock_p.get("az_half_deg"),
+                                speed_min_mps=stock_p.get("speed_min_mps"),
+                                range_min_m=stock_p.get("range_min_m"),
+                                cluster_eps_pos_m=stock_p.get("cluster_eps_pos_m"),
+                                cluster_min_samples=stock_p.get("cluster_min_samples"),
+                            )
+                        if "ag" in _saved:
+                            radar.update_ag_params(**{
+                                k: _saved["ag"][k] for k in
+                                ("integrate_chirps","cfar_algo","cfar_threshold_db","capon_bf")
+                                if k in _saved["ag"]
+                            })
+                        if "aa" in _saved:
+                            radar.update_aa_params(**{
+                                k: _saved["aa"][k] for k in
+                                ("pmm_band_low_hz","pmm_band_high_hz","pmm_threshold_db",
+                                 "pmm_slow_time_win","staggered_prf")
+                                if k in _saved["aa"]
+                            })
+                        log.info("Restored saved per-mode radar config from %s", _saved_path)
+                except Exception as e:
+                    log.warning("Could not restore radar_modes.json: %s — using YAML defaults", e)
+                log.info("Composite radar backend up (TLV + raw-ADC, mode=stock)")
+            except Exception as e:
+                log.warning("Composite/DCA wiring failed (%s) — falling back to RadarManager only; A/A unavailable", e)
         except KeyError as e:
             log.warning("Radar config missing key %s — disabling radar", e)
             radar = None

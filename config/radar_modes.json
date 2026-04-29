@@ -1,0 +1,35 @@
+{
+  "stock": {
+    "snr_min_db": 25,
+    "az_half_deg": 50,
+    "speed_min_mps": 0.4,
+    "range_min_m": 5,
+    "cluster_eps_pos_m": 8,
+    "cluster_min_samples": 2
+  },
+  "aa": {
+    "snr_min_db": 8.5,
+    "az_half_deg": 60,
+    "speed_min_mps": 0.5,
+    "range_min_m": 0,
+    "cluster_eps_pos_m": 8,
+    "cluster_min_samples": 4,
+    "pmm_band_low_hz": 50,
+    "pmm_band_high_hz": 500,
+    "pmm_threshold_db": 6,
+    "pmm_slow_time_win": 256,
+    "staggered_prf": false
+  },
+  "ag": {
+    "snr_min_db": 0,
+    "az_half_deg": 50,
+    "speed_min_mps": 0.4,
+    "range_min_m": 4.5,
+    "cluster_eps_pos_m": 8,
+    "cluster_min_samples": 4,
+    "integrate_chirps": 512,
+    "cfar_algo": "os",
+    "cfar_threshold_db": 20,
+    "capon_bf": true
+  }
+}

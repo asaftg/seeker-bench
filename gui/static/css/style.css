@@ -702,6 +702,12 @@ body {
   flex: 1 1 auto;
   min-height: 0;             /* allow children to shrink to fit viewport */
 }
+/* DEV-tab panel order: match the MAIN-tab — Thermal | EO | Radar (left
+   to right). The HTML happens to be EO | Thermal | Radar for legacy
+   reasons; CSS `order` reshuffles without touching markup. */
+.tab-content[data-tab="dev"] #dev-thermal { order: 1; }
+.tab-content[data-tab="dev"] #dev-eo      { order: 2; }
+.tab-content[data-tab="dev"] #dev-radar   { order: 3; }
 
 /* Per-sensor card: stacks sections vertically, with the live preview
    pinned at the bottom. min-height:0 + the .sensor-preview canvas
@@ -1028,7 +1034,202 @@ select {
   height: calc(100vh - 100px);
   overflow: hidden;
 }
+/* DEV tab layout:
+     [previews row]   ← stays at top, never scrolls
+     [scroll area  ]  ← only this scrolls (globals + per-sensor controls)
+   So the operator always sees the 3 live displays while scrolling
+   through controls below. */
+.tab-content[data-tab="dev"] {
+  overflow: hidden;     /* outer container does NOT scroll */
+}
+.tab-content[data-tab="dev"] .sensor-card {
+  overflow: visible;    /* cards grow to fit content (no clipping) */
+}
+.dev-scroll-area {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Top-of-DEV-tab row of live previews — Thermal | EO | Radar.
+   Fixed at the top of the dev tab; controls scroll behind.
+
+   Canvas-sizing strategy: the row gets a FIXED height budget
+   (--dev-preview-h) so the controls below always have room to
+   scroll into. Each canvas fills that height and lets WIDTH
+   auto-derive from its intrinsic pixel ratio (canvas.width ×
+   canvas.height set by the JS draw code). That way the CSS
+   display box exactly matches the drawing buffer aspect, so any
+   text the JS renders at canvas-internal coordinates (range
+   tics, FPS counters, sensor labels) is guaranteed to land
+   inside the visible region at every zoom level.
+
+   Earlier attempts forced aspect-ratio: 4/3 + object-fit:contain
+   on the canvas. That broke at zoom because (a) object-fit has
+   no effect on <canvas> — canvas pixels stretch to whatever CSS
+   box you give them, and (b) the EO buffer is 16:9 and radar is
+   approximately square, so a 4:3 box clipped/stretched both. */
+/* The row uses flexbox (NOT grid) on purpose: with grid the row
+   track height defaults to `auto` (content-sized) regardless of
+   the container height, so children with `height:100%` collapse
+   to 0 because their parent has no resolved height. Flexbox with
+   align-items: stretch + an explicit container height gives the
+   children a real height to fill. The earlier grid-based version
+   silently zeroed this entire row — the dev tab looked like the
+   previews row was missing.
+
+   Each preview card claims 1/3 of the row width and stretches to
+   the full row height. Inside, the canvas is sized in PIXELS by
+   the JS (canvas.width/canvas.height match the source frame); CSS
+   then displays it at width:100% and a max-height that exactly
+   matches the available card height. NO aspect-ratio rule and NO
+   object-fit — both fight the canvas's intrinsic ratio and shove
+   labels outside the visible area at non-100% zoom. */
+.row-dev-previews {
+  display: flex;
+  flex-direction: row;
+  gap: 10px;
+  flex: 0 0 auto;
+  align-items: stretch;
+  /* Fixed height budget. clamp keeps it sane across zoom levels:
+     - min 220px so the previews are still readable on tall narrow
+       windows / high-zoom (fewer effective px per vh).
+     - 38vh on a typical 900–1100 px tall window gives ~340–420px
+       of preview, which is plenty.
+     - max 460px so the previews never eat ALL the vertical room
+       on huge monitors and starve the controls area below. */
+  height: clamp(220px, 38vh, 460px);
+}
+.dev-preview-card {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  overflow: hidden;     /* belt: clip if the canvas tries to exceed */
+  /* Override the .ctrl-card max-height inherited rule that would
+     cap us shorter than the row's clamp budget. */
+  max-height: 100%;
+}
+.dev-preview-card .mini-preview-label {
+  font-size: 10px;
+  color: var(--text-3);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  flex: 0 0 auto;
+}
+.dev-preview-card canvas {
+  /* The canvas fills the remaining card height (after the label
+     row). `min-height: 0` is needed so flex doesn't refuse to
+     shrink below the canvas's intrinsic 150px default height when
+     zoom narrows the viewport. width: 100% lets it span the
+     column; the JS-set canvas.width/canvas.height (e.g. 640×512
+     for thermal, 1920×1080 for EO) determine the drawing-buffer
+     aspect, which CSS stretches to the displayed CSS box.
+     We deliberately let the CSS box differ from the buffer
+     aspect and let the JS draw code letterbox INSIDE the canvas
+     (thermalView/eoView/radarView already handle this). That
+     way there's only ONE source of truth for "text inside" — the
+     drawing code — and CSS never clips. */
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: block;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
 .tab-content.hidden { display: none; }
+
+/* ─────── Dual-thumb range slider (used for PMM band low/high) ──────
+   Two native <input type="range"> elements stacked on the same track.
+   Both inputs span the FULL min/max so the user can drag either
+   thumb past the other; JS clamps so they keep at least one step of
+   gap. We hide each input's track via transparent backgrounds and
+   show our own track + a colored fill bar between the two thumbs.
+
+   The pointer-events: none on the inputs themselves (with auto on
+   the thumb pseudo-elements) is the trick that makes BOTH thumbs
+   independently grabbable — without it, whichever input is "on top"
+   in the stacking order eats every click and the other thumb is
+   un-grabbable. */
+.dual-range {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 140px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+}
+.dual-range-track {
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  pointer-events: none;
+}
+.dual-range-fill {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 4px;
+  background: var(--cyan);
+  border-radius: 2px;
+  pointer-events: none;
+  /* JS sets left/width inline based on the two thumb values. */
+}
+.dual-range-thumb {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: none;
+}
+.dual-range-thumb:focus { outline: none; }
+.dual-range-thumb::-webkit-slider-runnable-track {
+  background: transparent;
+  height: 4px;
+  border: none;
+}
+.dual-range-thumb::-moz-range-track {
+  background: transparent;
+  height: 4px;
+  border: none;
+}
+.dual-range-thumb::-webkit-slider-thumb {
+  pointer-events: auto;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--cyan);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 1px var(--border-2);
+  cursor: pointer;
+  margin-top: -5px; /* center on the 4px track */
+}
+.dual-range-thumb::-moz-range-thumb {
+  pointer-events: auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--cyan);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 1px var(--border-2);
+  cursor: pointer;
+}
 
 /* DEV banner above the dev controls */
 .dev-banner {
