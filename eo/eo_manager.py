@@ -418,6 +418,35 @@ class EOManager:
         # classifier ticks so overlays don't flicker.
         self._last_dets: list[dict] = []
 
+        # Optical-pose-feedback state. Used to detect when the published
+        # gimbal pose advances WITHOUT the camera physically moving (lazy
+        # servo deadband ate the PWM, or a stuck servo). Phase correlation
+        # between consecutive downsampled grayscale EO frames measures
+        # the actual image translation. When BUS-reported pose changed
+        # by Δp_bus but the image only shifted Δp_optical, and the two
+        # disagree by more than a small threshold, we trust the optics
+        # and suppress the BUS update for the stamped pose-at-capture.
+        # That keeps fusion's world-frame conversion stable through
+        # phantom dpad clicks even when the maestro driver thinks it
+        # successfully wrote a step.
+        self._prev_frame_small: Optional[np.ndarray] = None
+        self._prev_bus_pan: Optional[float] = None
+        self._prev_bus_tilt: Optional[float] = None
+        # Trusted pose: anchored to BUS but updated only when image
+        # motion confirms the change. None until the first frame with
+        # a valid GIMBAL bus message; falls back to BUS until anchored.
+        self._trusted_pan: Optional[float] = None
+        self._trusted_tilt: Optional[float] = None
+        # Width of the downsampled phase-correlation window. Small for
+        # speed; sub-pixel precision via Hanning window keeps it sensitive.
+        self._of_target_w: int = 256
+        # Thresholds for "BUS reported motion not confirmed by optics".
+        # If BUS says we moved >= 0.3° in either axis but optics say <0.1°,
+        # we trust optics. 0.3° is the smallest BUS step under the gate
+        # bump (~1.0°), with margin.
+        self._bus_motion_min_deg: float = 0.3
+        self._optical_confirm_deg: float = 0.1
+
         # Hand-off from capture to process thread (same pattern as thermal)
         self._latest_cond = threading.Condition()
         self._latest_frame: Optional[np.ndarray] = None
@@ -429,9 +458,9 @@ class EOManager:
         # one), worker runs YOLO + ByteTrack and posts results back.
         # Decouples ~35 ms of YOLO inference from the publish path so
         # an occasional inference spike can't stall the EO frame rate.
-        # ByteTrack ``persist=True`` is robust to skipped frames via
-        # its Kalman predictor — verified by the previous synchronous
-        # classify_every=2 path which already fed it every other frame.
+        # ByteTrack `persist=True` is robust to skipped frames via its
+        # Kalman predictor — verified by today's classify_every=2 path
+        # which already feeds it every other frame.
         self._cls_in_lock = threading.Lock()
         self._cls_in_cond = threading.Condition(self._cls_in_lock)
         self._cls_in_pending: Optional[tuple[int, np.ndarray]] = None
@@ -1162,11 +1191,20 @@ class EOManager:
         # az/el using the actual pose at capture, not at fusion-tick time.
         gs_for_capture = BUS.get_latest(Topic.GIMBAL)
         if isinstance(gs_for_capture, GimbalState):
-            gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
-            gimbal_tilt_at_capture = float(gs_for_capture.tilt_deg)
+            bus_pan = float(gs_for_capture.pan_deg)
+            bus_tilt = float(gs_for_capture.tilt_deg)
         else:
-            gimbal_pan_at_capture = None
-            gimbal_tilt_at_capture = None
+            bus_pan = None
+            bus_tilt = None
+        # Optical-feedback override: if BUS says we moved but the EO
+        # pixels say we didn't, suppress the BUS update. See _trusted_pan
+        # docstring on __init__ for rationale.
+        # (Computation of phase correlation deferred until after we have
+        # `frame` downsampled to grayscale — see below; we inject the
+        # optical override into gimbal_pan_at_capture / gimbal_tilt_at_capture
+        # before publishing the EOFrame.)
+        gimbal_pan_at_capture = bus_pan
+        gimbal_tilt_at_capture = bus_tilt
 
         # 0. IMX568 pipeline: downscale → AGC → profile switching.
         #
@@ -1377,6 +1415,79 @@ class EOManager:
         # now. If/when the INITIALIZING scrim is reintroduced, restore the
         # field on EOFrame and re-add the kwarg here.
         del is_initializing  # silences "unused" lint
+
+        # ── Optical-pose feedback ────────────────────────────────
+        # Compare consecutive grayscale frames via phase correlation.
+        # When the BUS-reported pose moved by Δp_bus but the image only
+        # shifted by Δp_optical, and the two disagree by more than a
+        # threshold, trust the optics and suppress the BUS update for
+        # the stamped pose-at-capture. Reason: lazy-servo deadband can
+        # eat PWM commands so the maestro driver thinks it stepped (and
+        # advances its _last_us, which feeds gimbal_state.pan/tilt) but
+        # the camera physically didn't move. Without this override the
+        # SAME static target gets a new fused-track ID every gated step
+        # because fusion's world conversion uses the lying pose.
+        # ('still not working.jsonl' showed 0→1.5° pan published with
+        # zero pixel motion in the EO image content.)
+        if frame is not None and frame.size > 0:
+            try:
+                # Downsample to a small grayscale for cheap phaseCorrelate.
+                hh, ww = frame.shape[:2]
+                target_w = self._of_target_w
+                if ww > target_w:
+                    scale = target_w / float(ww)
+                    nw, nh = target_w, max(1, int(round(hh * scale)))
+                    small = cv2.resize(frame, (nw, nh),
+                                        interpolation=cv2.INTER_AREA)
+                else:
+                    small = frame
+                if small.ndim == 3:
+                    small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                else:
+                    small_gray = small
+                small_gray = small_gray.astype(np.float32)
+
+                if (self._prev_frame_small is not None
+                        and self._prev_frame_small.shape == small_gray.shape
+                        and bus_pan is not None and bus_tilt is not None
+                        and self._prev_bus_pan is not None
+                        and self._prev_bus_tilt is not None):
+                    # phaseCorrelate returns (dx, dy) of CURR relative
+                    # to PREV (positive dx = image moved right).
+                    # Camera motion is opposite the image content motion.
+                    sh = cv2.phaseCorrelate(self._prev_frame_small,
+                                             small_gray)
+                    dx_px, dy_px = sh[0]
+                    nh, nw = small_gray.shape
+                    # Downsampled FOV → deg/px on the small image.
+                    deg_per_px_h = self._hfov / float(nw)
+                    deg_per_px_v = self._vfov / float(nh)
+                    # Camera pan-right shifts content left, so dpan = -dx*deg/px.
+                    # Camera tilt-up shifts content down, so dtilt = +dy*deg/px.
+                    dpan_optical = -float(dx_px) * deg_per_px_h
+                    dtilt_optical = float(dy_px) * deg_per_px_v
+                    bus_dpan = bus_pan - self._prev_bus_pan
+                    bus_dtilt = bus_tilt - self._prev_bus_tilt
+                    # Reject BUS updates that aren't backed by optics.
+                    if (abs(bus_dpan) > self._bus_motion_min_deg
+                            and abs(dpan_optical) < self._optical_confirm_deg):
+                        gimbal_pan_at_capture = self._prev_bus_pan
+                    if (abs(bus_dtilt) > self._bus_motion_min_deg
+                            and abs(dtilt_optical) < self._optical_confirm_deg):
+                        gimbal_tilt_at_capture = self._prev_bus_tilt
+
+                self._prev_frame_small = small_gray
+                # Remember what we ACCEPTED as the bus pose so the next
+                # comparison is against the override (not the raw BUS).
+                self._prev_bus_pan = (gimbal_pan_at_capture
+                                       if gimbal_pan_at_capture is not None
+                                       else bus_pan)
+                self._prev_bus_tilt = (gimbal_tilt_at_capture
+                                        if gimbal_tilt_at_capture is not None
+                                        else bus_tilt)
+            except Exception as _opt_e:
+                log.debug("EO optical pose feedback skipped: %r", _opt_e)
+
         # Encode the JPEG once, here, on the EO process thread. Removes
         # the dominant per-tick cost from the asyncio WS sender — see
         # gui/sensor_bridge.py:eo_to_wire and gui/app.py:_sender for the

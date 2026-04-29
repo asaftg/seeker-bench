@@ -566,6 +566,16 @@ class FusionManager:
                 trk["el"]    = a * trk["el"]    + (1 - a) * c["el"]
                 trk["ang_w"] = a * trk["ang_w"] + (1 - a) * c["ang_w"]
                 trk["ang_h"] = a * trk["ang_h"] + (1 - a) * c["ang_h"]
+                # Latest stamped pose for this track. _publish uses this
+                # instead of self._cur_gimbal_pose so the cam-frame
+                # output reflects the same pose used to compute the
+                # stored world coords. With optical-feedback in place,
+                # this is the optically-confirmed pose, not the (lying)
+                # BUS pose.
+                if c.get("_pose_pan") is not None:
+                    trk["last_obs_pose_pan"] = float(c["_pose_pan"])
+                if c.get("_pose_tilt") is not None:
+                    trk["last_obs_pose_tilt"] = float(c["_pose_tilt"])
                 # Class promotion: a radar-born track stays RADAR_TARGET
                 # until an EO/thermal observation joins, at which point
                 # we lock in the real class. Once locked, never overwrite
@@ -606,6 +616,12 @@ class FusionManager:
                     "primary": c["primary"],
                     "conf": c["conf"],
                     "hits": 1, "misses": 0,
+                    "last_obs_pose_pan": (float(c["_pose_pan"])
+                                           if c.get("_pose_pan") is not None
+                                           else None),
+                    "last_obs_pose_tilt": (float(c["_pose_tilt"])
+                                            if c.get("_pose_tilt") is not None
+                                            else None),
                 })
                 try:
                     from common.events import emit as _emit
@@ -844,10 +860,21 @@ class FusionManager:
             except ValueError:
                 tc = TargetClass.UNKNOWN
             # Convert track-stored world az/el back to camera frame for
-            # the published FusedTrack. When _world_frame is False the
-            # track az/el is already camera frame and we subtract zero.
-            pub_az = float(trk["az"]) - cur_pan
-            pub_el = float(trk["el"]) - cur_tilt
+            # the published FusedTrack. Prefer the per-track last-
+            # observed stamped pose (optically-confirmed; doesn't lie
+            # when servo deadband eats commands) over self._cur_gimbal_pose
+            # (which mirrors the published gimbal/state — affected by the
+            # same lazy-servo lie). For tracks that have NOT had a fresh
+            # observation in this tick, this is the pose at THEIR last
+            # observation — which corresponds to the actual pixel
+            # position the bbox was last seen at; better than recomputing
+            # against a possibly-lying current pose.
+            tpan = trk.get("last_obs_pose_pan")
+            ttilt = trk.get("last_obs_pose_tilt")
+            if tpan is None: tpan = cur_pan
+            if ttilt is None: ttilt = cur_tilt
+            pub_az = float(trk["az"]) - tpan
+            pub_el = float(trk["el"]) - ttilt
             # Also publish world-frame az/el directly. Consumers needing
             # world coords (gimbal_manager's predictor) read these to
             # avoid the (cur_pan + cam_az) round-trip, which leaks the

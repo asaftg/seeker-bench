@@ -255,6 +255,54 @@ def test_merge_overlapping_tracks_centroid_fallback(fm):
     assert fm._tracks[0]["id"] == 1
 
 
+def test_publish_uses_per_track_stamped_pose_not_bus(fm):
+    """The published cam-frame az/el should be derived from each track's
+    LAST OBSERVED stamped pose (optically-confirmed), not
+    self._cur_gimbal_pose (which mirrors the lying BUS gimbal pose
+    when the servo's deadband eats commands).
+    Without this, even after the optical-feedback override drops a
+    BUS update, the publish still uses BUS for cam-frame conversion
+    and the bbox visibly moves on the GUI when the camera physically
+    didn't move ('still not working.jsonl' bug)."""
+    fm._world_frame = True
+    fm._cur_gimbal_pose = (0.0, 0.0)
+    cands = [{
+        "sensors": ["eo"], "primary": "eo", "class": "vehicle",
+        "az": 2.0, "el": 0.0, "ang_w": 1.0, "ang_h": 1.0,
+        "conf": 0.9,
+        "_pose_pan": 0.0, "_pose_tilt": 0.0,
+    }]
+    # World convert (using stamped pose 0,0)
+    cands[0]["az"] += 0.0
+    cands[0]["el"] += 0.0
+    fm._update_tracks(cands)
+    assert len(fm._tracks) == 1
+
+    # Now BUS lies that the gimbal moved 5° to the right, but no fresh
+    # observation arrives (servo didn't actually move).
+    fm._cur_gimbal_pose = (5.0, 0.0)
+    out: list = []  # capture publish output
+    import common.frame_bus as fb
+    orig_pub = fb.BUS.publish
+    captured = []
+    def _cap(topic, payload):
+        captured.append((topic, payload))
+    fb.BUS.publish = _cap
+    try:
+        fm._publish()
+    finally:
+        fb.BUS.publish = orig_pub
+
+    assert captured, "fusion should still publish"
+    tracks = captured[-1][1]
+    assert len(tracks) == 1
+    # Track was stored at world_az=2.0 with stamped pose 0.
+    # If publish used self._cur_gimbal_pose (5.0), pub_az = 2-5 = -3.
+    # If publish used the track's last_obs_pose_pan (0.0), pub_az = 2-0 = 2.
+    assert tracks[0].az_deg == pytest.approx(2.0, abs=0.01), (
+        "pub_az should follow last_obs_pose_pan (=0), not BUS pose (=5)")
+
+
 def test_legacy_unstamped_falls_back_to_fusion_tick_pose(fm):
     """When _pose_pan/_pose_tilt are missing (e.g. older recording or
     a sensor that hasn't stamped its frames yet), the fusion-tick pose
