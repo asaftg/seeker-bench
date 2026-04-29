@@ -26,6 +26,17 @@ export class EOView {
     this.overlay = disconnectOverlayId ? document.getElementById(disconnectOverlayId) : null;
     this.ctx = this.canvas ? this.canvas.getContext("2d") : null;
     this.img = new Image();
+    // Offscreen canvas holds the LAST FULLY-DECODED image. _draw blits
+    // from this canvas, never directly from `this.img`. This decouples
+    // canvas redraws from image-load state: when a new blob URL is
+    // mid-decode, the offscreen still has the previous decoded frame,
+    // so a _draw() triggered by the shared sensors path (between
+    // binary frames) still gets a real picture to paint instead of
+    // flashing the cleared background. Once img.onload fires, we
+    // copy the new image into the offscreen and trigger a redraw.
+    this._offscreen = document.createElement("canvas");
+    this._offscreenCtx = this._offscreen.getContext("2d");
+    this._haveImage = false;
     this._lastFrameW = 0;
     this._lastFrameH = 0;
     this._lastDetections = [];
@@ -43,9 +54,39 @@ export class EOView {
     this._onCommit = null;      // (imageBbox) => void on successful drag
     this._measurement = null;   // {bbox:{x,y,w,h}, label:"≈ 73 m · CAR"}
 
-    if (this.img) {
-      this.img.onload = () => this._draw();
-    }
+    // On image load: copy the decoded image into the offscreen
+    // backbuffer ATOMICALLY (single drawImage = full bitmap or
+    // nothing — the IMG is `complete` by the time onload fires),
+    // then trigger _draw to blit from the offscreen onto the visible
+    // canvas. After the offscreen has the new bitmap we can safely
+    // revoke the previous blob URL — the bitmap is independent of
+    // the URL once it's in the canvas.
+    this.img.onload = () => {
+      const w = this.img.naturalWidth;
+      const h = this.img.naturalHeight;
+      if (w > 0 && h > 0) {
+        if (this._offscreen.width !== w || this._offscreen.height !== h) {
+          this._offscreen.width = w;
+          this._offscreen.height = h;
+        }
+        this._offscreenCtx.drawImage(this.img, 0, 0);
+        this._haveImage = true;
+      }
+      this._draw();
+      if (this._urlToRevoke) {
+        try { URL.revokeObjectURL(this._urlToRevoke); } catch (_) {}
+        this._urlToRevoke = null;
+      }
+    };
+    // If a JPEG fails to decode, leave the offscreen alone (last
+    // good frame stays visible) and revoke the bad URL.
+    this.img.onerror = () => {
+      if (this._urlToRevoke) {
+        try { URL.revokeObjectURL(this._urlToRevoke); } catch (_) {}
+        this._urlToRevoke = null;
+      }
+    };
+    this._urlToRevoke = null;
     window.addEventListener("resize", () => this._fitCanvas());
     this._fitCanvas();
 
@@ -218,18 +259,25 @@ export class EOView {
     if (eo.hfov_deg != null) this._lastHfovDeg = Number(eo.hfov_deg);
 
     if (eo._blobUrl) {
-      // Binary WS path (preferred): main.js wraps the raw JPEG bytes
-      // in a Blob and hands us the object URL. Revoke the previous
-      // URL once we set the new one — without this, every frame
-      // leaks a ~464 KB Blob and memory climbs unboundedly within
-      // a few minutes.
-      const old = this._lastBlobUrl;
+      // Binary WS path. Set img.src to the new blob URL; once it
+      // decodes the constructor-bound onload paints it into the
+      // offscreen backbuffer and revokes the previous URL. Until
+      // then, _draw() called from any other path keeps blitting the
+      // PREVIOUS frame from offscreen — no flicker.
+      // If a previous URL is still pending revocation (e.g. the new
+      // frame arrived before the old image even finished decoding),
+      // revoke it now so we don't leak its blob.
+      if (this._urlToRevoke) {
+        try { URL.revokeObjectURL(this._urlToRevoke); } catch (_) {}
+      }
+      this._urlToRevoke = this._lastBlobUrl || null;
       this._lastBlobUrl = eo._blobUrl;
       this.img.src = eo._blobUrl;
-      if (old) {
-        try { URL.revokeObjectURL(old); } catch (_) {}
-      }
     } else if (eo.jpeg_b64) {
+      // Legacy / replay path. Data URLs decode synchronously so the
+      // race that motivated the offscreen backbuffer doesn't apply,
+      // but the code still flows through onload → offscreen → _draw
+      // for uniformity.
       this.img.src = "data:image/jpeg;base64," + eo.jpeg_b64;
     } else {
       this._draw();
@@ -253,8 +301,17 @@ export class EOView {
     const ch = this.canvas.height;
     this.ctx.clearRect(0, 0, cw, ch);
 
-    const fw = this._lastFrameW || this.img.naturalWidth;
-    const fh = this._lastFrameH || this.img.naturalHeight;
+    // Use the offscreen backbuffer's dimensions when available — that
+    // tracks the most recently DECODED frame. Falls back to img
+    // naturalWidth/height for the very first frame before the
+    // offscreen has been populated, and to _lastFrameW/H if the wire
+    // payload was metadata-only.
+    const fw = (this._haveImage ? this._offscreen.width : 0)
+               || this._lastFrameW
+               || this.img.naturalWidth;
+    const fh = (this._haveImage ? this._offscreen.height : 0)
+               || this._lastFrameH
+               || this.img.naturalHeight;
     if (!fw || !fh) return;
 
     const scale = Math.min(cw / fw, ch / fh);
@@ -263,7 +320,13 @@ export class EOView {
     const dx = (cw - dw) / 2;
     const dy = (ch - dh) / 2;
 
-    if (this.img.complete && this.img.naturalWidth > 0) {
+    // Blit from the offscreen backbuffer — guaranteed to be a fully
+    // decoded image even if `this.img` is mid-load on the next blob
+    // URL (the only path that touches img.src is onload, which paints
+    // to offscreen ATOMICALLY before any _draw can race).
+    if (this._haveImage) {
+      this.ctx.drawImage(this._offscreen, dx, dy, dw, dh);
+    } else if (this.img.complete && this.img.naturalWidth > 0) {
       this.ctx.drawImage(this.img, dx, dy, dw, dh);
     }
 
