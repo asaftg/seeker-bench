@@ -377,6 +377,11 @@ class Topic:
     THERMAL = "thermal"
     EO      = "eo"
     RADAR   = "radar"
+    # Phase 3 raw-ADC path: PMM detector hits + A/G CFAR detections
+    # from the host-side DCA1000 pipeline. Separate topic so stock
+    # mode (pure TLV) and A/A overlay can both be read by the GUI
+    # without the pipelines stepping on each other.
+    RADAR_AA = "radar_aa"
     FUSED   = "fused"
     GIMBAL  = "gimbal"
     # Discrete event stream — user actions, system transitions, algo

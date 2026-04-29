@@ -1040,10 +1040,45 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 log.info("Recording → ON: %s", path)
                                 emit_event("recording_started",
                                            {"path": str(path)})
+                                # Also start the DCA raw-ADC .bin
+                                # recording alongside the JSONL — it
+                                # lives in the SAME folder with the
+                                # same stem so replay tooling can
+                                # pair them. If radar isn't a
+                                # composite (no listener), this is a
+                                # no-op. The .bin can be parsed
+                                # offline by radar_dca.bin_parser
+                                # for post-flight A/G / A/A
+                                # algorithm tuning.
+                                try:
+                                    rm = app.state.radar_manager
+                                    listener = getattr(rm, "_dca_listener", None)
+                                    if listener is not None and hasattr(listener, "recording_start"):
+                                        bin_path = (str(path).rsplit(".", 1)[0]
+                                                    + "_radar.bin")
+                                        listener.recording_start(bin_path)
+                                        emit_event("dca_bin_recording_started",
+                                                   {"path": bin_path})
+                                except Exception:
+                                    log.exception("dca bin record start failed (non-fatal)")
                             elif (not on) and rec.is_recording:
                                 # Emit the stopped event BEFORE closing the
                                 # file so it gets written.
                                 emit_event("recording_stopped", {})
+                                # Stop the .bin recording first so its
+                                # last-write flush happens before the
+                                # JSONL closes (helps offline tools
+                                # find both files in their final form).
+                                try:
+                                    rm = app.state.radar_manager
+                                    listener = getattr(rm, "_dca_listener", None)
+                                    if listener is not None and hasattr(listener, "recording_stop"):
+                                        bin_path = listener.recording_stop()
+                                        if bin_path:
+                                            emit_event("dca_bin_recording_stopped",
+                                                       {"path": bin_path})
+                                except Exception:
+                                    log.exception("dca bin record stop failed (non-fatal)")
                                 path = rec.stop()
                                 state["recording"] = False
                                 log.info("Recording → OFF: %s", path)

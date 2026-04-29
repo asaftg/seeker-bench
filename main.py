@@ -33,7 +33,7 @@ from radar.radar_manager import RadarManager
 from radar.composite_manager import CompositeRadarBackend
 from radar_dca.data_port import DataPortListener
 from radar_dca.dca_control import DCAControl
-from radar_dca.dca_pipeline import DCAPipeline, dims_from_cfg
+from radar_dca.dca_pipeline import DCAPipeline, dims_from_cfg, dims_from_cfg_file
 from recording.jsonl_recorder import JSONLRecorder
 from thermal.thermal_manager import ThermalManager
 
@@ -249,13 +249,30 @@ def main() -> int:
                     _dca_listener = DataPortListener(
                         host_ip=_host_ip, data_port=_udp_port,
                     )
+                    # Parse the actual chip cfg so the wire-byte layout
+                    # (n_chirps, n_samples, n_rx, chirp_period) matches
+                    # what mmw_demoDDM is emitting. Falls back to
+                    # hard-coded defaults only if the cfg can't be
+                    # parsed — in which case A/A will likely refuse to
+                    # reshape frames and we'll see frames_dropped > 0.
+                    try:
+                        _dims = dims_from_cfg_file(str(radar_cfg["cfg_path"]))
+                        log.info(
+                            "DCA dims from cfg: %d chirps × %d RX × %d samples, "
+                            "PRF %.0f Hz, range res %.2f m → %.1f MB/frame",
+                            _dims.n_chirps, _dims.n_rx, _dims.n_samples,
+                            _dims.prf_hz, _dims.range_resolution_m,
+                            _dims.bytes_per_frame / 1e6,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "Could not parse cfg for DCA dims (%s); "
+                            "falling back to hard-coded defaults", e,
+                        )
+                        _dims = dims_from_cfg()
                     _dca_pipeline = DCAPipeline(
                         listener=_dca_listener,
-                        dims=dims_from_cfg(
-                            n_chirps=768, n_rx=4, n_samples=384,
-                            chirp_period_s=27.81e-6,
-                            range_resolution_m=0.81,
-                        ),
+                        dims=_dims,
                         pmm_band_low_hz=50.0,
                         pmm_band_high_hz=500.0,
                         pmm_threshold_db=6.0,
