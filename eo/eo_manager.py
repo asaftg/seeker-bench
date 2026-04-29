@@ -410,6 +410,7 @@ class EOManager:
 
         self._capture_thread: Optional[threading.Thread] = None
         self._process_thread: Optional[threading.Thread] = None
+        self._cls_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._source: Optional[_CaptureLike] = None
         self._frame_id = 0
@@ -421,6 +422,22 @@ class EOManager:
         self._latest_cond = threading.Condition()
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_seq: int = 0
+
+        # Async classify hand-off. Process thread submits the latest
+        # frame to the classifier worker thread (single-slot — newer
+        # overwrites older if the worker is still busy on the previous
+        # one), worker runs YOLO + ByteTrack and posts results back.
+        # Decouples ~35 ms of YOLO inference from the publish path so
+        # an occasional inference spike can't stall the EO frame rate.
+        # ByteTrack ``persist=True`` is robust to skipped frames via
+        # its Kalman predictor — verified by the previous synchronous
+        # classify_every=2 path which already fed it every other frame.
+        self._cls_in_lock = threading.Lock()
+        self._cls_in_cond = threading.Condition(self._cls_in_lock)
+        self._cls_in_pending: Optional[tuple[int, np.ndarray]] = None
+        self._cls_out_lock = threading.Lock()
+        self._cls_out_dets: list[dict] = []
+        self._cls_out_fid: int = -1
 
         # Source lifecycle lock. Held during set_device / set_exposure_ext
         # so the capture thread can't reopen mid-switch and spawn a
@@ -887,6 +904,15 @@ class EOManager:
         )
         self._capture_thread.start()
         self._process_thread.start()
+        # Async classify worker — only spun up if a classifier is
+        # actually loaded. Without it, the publish path just always
+        # sees an empty _cls_out_dets and the EO panel renders
+        # without boxes (legitimate config: enable_classifier=False).
+        if self._classifier is not None:
+            self._cls_thread = threading.Thread(
+                target=self._classifier_loop, name="EOClassify", daemon=True
+            )
+            self._cls_thread.start()
         # AE thread only runs when AE is enabled in config — saves a
         # daemon thread when someone explicitly disables software AE
         # (e.g. for debugging the bridge AE directly).
@@ -900,11 +926,15 @@ class EOManager:
         self._stop.set()
         with self._latest_cond:
             self._latest_cond.notify_all()
-        for t in (self._process_thread, self._capture_thread, self._ae_thread):
+        with self._cls_in_cond:
+            self._cls_in_cond.notify_all()
+        for t in (self._process_thread, self._capture_thread,
+                  self._cls_thread, self._ae_thread):
             if t is not None:
                 t.join(timeout=3.0)
         self._capture_thread = None
         self._process_thread = None
+        self._cls_thread = None
         self._ae_thread = None
         if self._source is not None:
             try:
@@ -1082,6 +1112,46 @@ class EOManager:
                     log.exception("EO process loop error: %s", e)
         log.info("EOManager process thread stopped")
 
+    def _classifier_loop(self) -> None:
+        """Async YOLO + ByteTrack worker.
+
+        Pulls the latest frame submitted by the process thread (single-
+        slot — older frames are discarded if a newer one arrives before
+        we're done), runs the classifier, posts results to
+        ``_cls_out_dets`` for the publish path to read.
+
+        Frames may be skipped under load (the process thread always
+        overwrites the pending slot with the freshest frame). ByteTrack
+        ``persist=True`` handles missed frames via its Kalman predictor,
+        same as the previous synchronous classify_every=2 path.
+        """
+        while not self._stop.is_set():
+            with self._cls_in_cond:
+                while self._cls_in_pending is None and not self._stop.is_set():
+                    self._cls_in_cond.wait(timeout=0.5)
+                if self._stop.is_set():
+                    break
+                fid, frame = self._cls_in_pending
+                self._cls_in_pending = None
+            if self._classifier is None:
+                continue
+            try:
+                raw = self._classifier.track(frame)
+            except Exception as e:
+                log.warning("EO async inference failed (fid=%d): %s", fid, e)
+                continue
+            # Same size gate + per-class NMS as the previous synchronous
+            # path. Runs on the worker thread, off the publish critical
+            # path, so a 50-100 ms inference spike no longer stalls the
+            # EO frame rate visible to the operator.
+            dets = [d for d in raw
+                    if (d["bbox"][2] * d["bbox"][3]) >= self._min_bbox_px]
+            dets = _nms_same_class(dets, iou_thresh=0.45)
+            with self._cls_out_lock:
+                self._cls_out_dets = dets
+                self._cls_out_fid = fid
+        log.info("EOManager classify thread stopped")
+
     # ───────────────────────── pipeline ──────────────────────────────
     def _process_and_publish(self, frame: np.ndarray) -> None:
         self._frame_id += 1
@@ -1206,24 +1276,29 @@ class EOManager:
         # Tracks coast between YOLO ticks using the last-known ByteTrack
         # state (we just republish the last detection list until the
         # next classifier frame), so bboxes don't flicker off.
+        # Async classify: hand the latest frame to the worker thread
+        # if classifier is enabled and we're on a classify_every tick.
+        # The worker runs YOLO + ByteTrack and posts results back to
+        # _cls_out_dets; we read those below regardless of whether we
+        # just submitted (results may be from a frame or two ago —
+        # 50-100 ms detection lag, imperceptible to operators, and
+        # the gimbal track predictor's Kalman smooths it out).
         run_classifier = (
             self._classifier is not None
             and (self._frame_id % self._classify_every == 0)
         )
         if run_classifier:
-            try:
-                raw = self._classifier.track(frame)
-            except Exception as e:
-                log.warning("EO inference failed: %s", e)
-                raw = []
-            # Size gate drops tiny boxes (usually reflections / clutter).
-            dets = [d for d in raw
-                    if (d["bbox"][2] * d["bbox"][3]) >= self._min_bbox_px]
-            # NMS within class — YOLO sometimes fires 2-3 overlapping
-            # boxes on one vehicle. ByteTrack would also assign those
-            # different IDs, so dedup BEFORE publishing.
-            dets = _nms_same_class(dets, iou_thresh=0.45)
-            self._last_dets = dets
+            with self._cls_in_cond:
+                # Single-slot: if a frame is still pending, drop it.
+                # The newer one is fresher and ByteTrack persist=True
+                # handles the gap. Notify wakes the worker.
+                self._cls_in_pending = (self._frame_id, frame)
+                self._cls_in_cond.notify()
+        # Publish the worker's latest result (or empty list before any
+        # result has come back). Coasting between worker updates is
+        # the same coasting behaviour the synchronous path used to do.
+        with self._cls_out_lock:
+            self._last_dets = list(self._cls_out_dets)
 
         # 2. Republish last detection list every frame so overlays hold
         #    steady between YOLO ticks. ByteTrack's internal Kalman
