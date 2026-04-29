@@ -340,7 +340,7 @@ export class EOView {
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);
-      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain, fusedId);
+      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain, fusedId, "E");
     }
 
     // Fused overlay rules — mirror of thermal_view.

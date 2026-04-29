@@ -629,8 +629,15 @@ class DetectionTracker:
         #    rendered by the GUI from the detections list regardless of
         #    whether OF matched this tick, and their bbox is carried
         #    forward on Kalman coast.
+        # Stamp the heat-track id onto the emitted ThermalDetection so
+        # fusion + GUI can link by id rather than by bbox IoU. Mutates
+        # trk.det in place (it's a non-frozen dataclass we own here).
         out: List[ThermalDetection] = []
         for trk in self._tracks:
+            try:
+                trk.det.track_id = int(trk.id)
+            except Exception:
+                pass
             if trk.synthetic:
                 out.append(trk.det)
             elif trk.hits >= self.cfg.min_hits and trk.misses == 0:

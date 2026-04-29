@@ -19,6 +19,8 @@
 // small margin. When the scene empties out it shrinks back to the default
 // — with a short hysteresis so a lone flicker doesn't yank the scale.
 
+import { fusedIdForRadarTarget } from "./overlays.js";
+
 const TARGET_COLORS = [
   "#ff4d6d", "#40c4ff", "#ffd54f", "#81c784",
   "#ba68c8", "#ff8a65", "#4dd0e1", "#dce775",
@@ -336,15 +338,20 @@ export class RadarView {
       ctx.lineTo(tpx - hlen * Math.cos(ang + 0.4), tpy - hlen * Math.sin(ang + 0.4));
       ctx.stroke();
 
-      // Label: #tid · speed · range. Class is always "radar_detection"
+      // Label: id · speed · range. Class is always "radar_detection"
       // per the Ticket 5a design (classification lives in fusion, not
       // here) so we omit it from the label. Range is the distance from
       // the sensor to the target centroid — useful when the view has
       // breathed out to 250 m and a single box could be anywhere.
+      // ID prefix follows the global namespace convention:
+      //   #N  — fused track id when fusion has linked this radar tid
+      //   R#N — raw radar Kalman id (per-sensor, transient)
+      const fusedId = fusedIdForRadarTarget(t.tid, this._lastFused);
+      const idPrefix = (fusedId != null) ? `#${fusedId}` : `R#${t.tid}`;
       const speed = Math.hypot(t.vx, t.vy);
       const range = Math.hypot(t.x, t.y);
       const suffix = coasting ? " · coast" : "";
-      const label = `#${t.tid}  ${speed.toFixed(1)} m/s · ${range.toFixed(0)} m${suffix}`;
+      const label = `${idPrefix}  ${speed.toFixed(1)} m/s · ${range.toFixed(0)} m${suffix}`;
       ctx.fillStyle = colour;
       ctx.fillText(label, px - wpx / 2 + 2 * dpr, py - hpx / 2 - 2 * dpr);
       ctx.globalAlpha = 1.0;
@@ -531,8 +538,12 @@ export class RadarView {
     return { ...e, x: p.x, y: p.y, vx, vy };
   }
 
-  update(radar, gimbalPanDeg = 0) {
+  update(radar, gimbalPanDeg = 0, fusedTracks = null) {
     if (!this.ctx) return;
+    // Stash the fused-track list so _drawTargets can look up the
+    // fused id for each radar target (Phase B2 — symmetric with the
+    // EO/thermal panels' raw-det → fused-id matching).
+    this._lastFused = fusedTracks || [];
     // Defensive re-fit: if the view was constructed before CSS layout
     // settled, the constructor's _fit() sized the canvas to 1×1. Check
     // on each update and re-fit if the bounding rect has grown.

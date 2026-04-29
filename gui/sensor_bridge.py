@@ -73,6 +73,10 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
             "contrast": round(float(det.contrast), 1),
             "classification": None,
             "synthetic": bool(getattr(det, "synthetic", False)),
+            # Heat-tracker id stamped by DetectionTracker. Lets the GUI
+            # match the raw thermal det to its fused track by id (same
+            # mechanism EO uses with track_id, Phase B1).
+            "track_id": getattr(det, "track_id", None),
         }
         if det.classification is not None:
             entry["classification"] = {
@@ -568,10 +572,14 @@ def fused_to_wire(
             "hits": trk.hits,
             "bbox_thermal": bt,
             "bbox_eo": be,
-            # Pass-through EO ByteTrack id so the EO panel's raw-det
-            # labeller can match by id instead of bbox-IoU (more robust
-            # under EMA smoothing of the fused track's stored angles).
-            "eo_track_id": getattr(trk, "eo_track_id", None),
+            # Pass-through per-sensor tracker IDs so each panel can
+            # label raw dets with the matching fused id by direct
+            # equality instead of bbox-IoU. Symmetric across all three
+            # sensors (Phase B1 + B2). All three are Optional[int] —
+            # None means "this sensor hasn't contributed an obs yet."
+            "eo_track_id":     getattr(trk, "eo_track_id",     None),
+            "thermal_heat_id": getattr(trk, "thermal_heat_id", None),
+            "radar_tid":       getattr(trk, "radar_tid",       None),
         })
     return out
 

@@ -19,9 +19,15 @@ export const COLORS = {
 };
 
 // ---------------------------------------------------------------------------
-// Classify-aware box: picks color by class, allows main-target override
+// Classify-aware box: picks color by class, allows main-target override.
+// `sourceTag` is the per-sensor namespace prefix used when no fused id
+// is known yet — "E" (EO ByteTrack), "T" (thermal heat tracker), "R"
+// (radar Kalman tracker). Defaults to "E" for backwards compat with
+// callers that haven't been updated yet.
 // ---------------------------------------------------------------------------
-export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false, fusedId = null) {
+export function drawDetectionBox(ctx, det, scale, dx, dy,
+                                 isMainTarget = false, fusedId = null,
+                                 sourceTag = "E") {
   const b = det.bbox;
   const x = dx + b.x * scale;
   const y = dy + b.y * scale;
@@ -52,22 +58,16 @@ export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false, 
     lineWidth = 2;
   }
 
-  // Prefix with the most-authoritative ID we have. Order:
-  //   1. fused track id  (from cross-sensor fusion: stable, lock-target)
-  //   2. EO ByteTrack id (from eo_classifier: per-sensor, transient)
-  //   3. no prefix       (single-frame detection, no tracker)
-  //
-  // Operator-reported 2026-04-27: raw EO detections previously showed
-  // up unlabelled until the fused track was born — but by that point
-  // the same detection projected onto thermal already carried the
-  // fused id. Now the EO panel always shows SOME id so the operator
-  // can correlate visually before fusion locks. The `E#` prefix
-  // distinguishes a per-sensor tracker id from a fused id (`#`).
+  // Prefix with the most-authoritative id we have. Order:
+  //   1. fused track id  — `#N` (cross-sensor, lock target)
+  //   2. per-sensor id   — `<sourceTag>#N` (transient, sensor-local)
+  //   3. no prefix       — single-frame detection, no tracker
+  // sourceTag is "E"/"T"/"R" picked by the calling panel.
   let idPrefix = "";
   if (fusedId != null) {
     idPrefix = `#${fusedId} `;
   } else if (det.track_id != null) {
-    idPrefix = `E#${det.track_id} `;
+    idPrefix = `${sourceTag}#${det.track_id} `;
   }
   if (conf != null && cls && cls !== "unknown") {
     const clsLabel = cls === "person" ? "HUMAN" : cls.toUpperCase();
@@ -168,50 +168,43 @@ export function isSubsumedByFused(rawBBox, fusedTracks, sideKey, iouMin = 0.15) 
   return false;
 }
 
+// Per-sensor tracker-id field on a FusedTrack, keyed by sideKey.
+// Single source of truth for the link map; adding a new sensor =
+// one entry here.
+const _LINK_FIELD_BY_SIDE = {
+  "bbox_eo":      "eo_track_id",
+  "bbox_thermal": "thermal_heat_id",
+  // Radar isn't a per-bbox panel (polar plot), so it's matched
+  // separately via fusedIdForRadarTarget below.
+};
+
 // Best fused ID for a raw detection on a given side, or null. Used to
 // stamp raw detection labels with the same fusion ID shown in the
-// targets list and on the cross-sensor projection.
+// targets list and the cross-sensor projection.
 //
 // Two-stage match:
-//   1. Direct ID (sideKey="bbox_eo" → match `det.track_id` against
-//      fused track's `eo_track_id`). Robust under EMA smoothing
-//      where the fused track's stored angles drift slightly off the
-//      raw EO bbox and IoU drops below threshold despite being the
-//      same physical target. This is the path that fixes the
-//      operator-reported "E#15 on EO panel, #30 on thermal" desync.
-//   2. Greedy IoU fallback on the projected bbox — for thermal raw
-//      dets (no track_id), or when the fused track was just born
-//      and hasn't recorded its source eo_track_id yet.
+//   1. Direct id (det.track_id ↔ FusedTrack[link_field]). Robust
+//      under EMA smoothing of the fused track's stored angles
+//      where bbox-IoU would drift below threshold despite being
+//      the same physical target. Same code path for EO and thermal
+//      via _LINK_FIELD_BY_SIDE — adding a sensor is one line.
+//   2. Greedy IoU fallback on the projected bbox — for raw dets
+//      that don't carry a per-sensor track_id, or for fused tracks
+//      that haven't recorded a link yet (e.g. just-born tracks).
 export function fusedIdForDet(rawBBox, fusedTracks, sideKey, iouMin = 0.20, det = null) {
   if (!fusedTracks || !fusedTracks.length) return null;
 
-  // Stage 1: direct ID match (EO side only — only EO carries
-  // per-detection track_id on the wire).
-  if (sideKey === "bbox_eo" && det && det.track_id != null) {
+  // Stage 1: direct id match.
+  const linkField = _LINK_FIELD_BY_SIDE[sideKey];
+  if (linkField && det && det.track_id != null) {
     const tid = Number(det.track_id);
     if (tid >= 0) {
       for (const t of fusedTracks) {
         if (!t) continue;
-        if (t.eo_track_id != null && Number(t.eo_track_id) === tid) {
+        const trkLinkId = t[linkField];
+        if (trkLinkId != null && Number(trkLinkId) === tid) {
           return t.id;
         }
-      }
-      // One-shot diagnostic: EO det has a real track_id and there
-      // are fused tracks visible, but none of them carry an
-      // eo_track_id matching this det. Tells us instantly whether
-      // the chain is broken (typical cause: stale browser JS, or
-      // backend wasn't restarted after the wire schema change).
-      if (!window.__warned_eo_track_id_chain && fusedTracks.length > 0) {
-        const sample = fusedTracks
-          .filter((t) => t && t.sensors && t.sensors.includes("eo"))
-          .slice(0, 3)
-          .map((t) => ({id: t.id, eo_track_id: t.eo_track_id,
-                        sensors: t.sensors}));
-        console.warn(
-          "[fusedIdForDet] EO det.track_id=" + tid +
-          " has no matching eo_track_id on any visible fused track.",
-          "Sample fused tracks (with sensor='eo'):", sample);
-        window.__warned_eo_track_id_chain = true;
       }
     }
   }
@@ -231,6 +224,21 @@ export function fusedIdForDet(rawBBox, fusedTracks, sideKey, iouMin = 0.20, det 
     }
   }
   return bestId;
+}
+
+// Radar-specific lookup: given a RadarTarget.tid, find the fused id
+// that includes it (or null). Used by radar_view.js to label radar
+// boxes with the fused id when fusion has promoted the target.
+export function fusedIdForRadarTarget(radarTid, fusedTracks) {
+  if (radarTid == null || !fusedTracks || !fusedTracks.length) return null;
+  const want = Number(radarTid);
+  for (const t of fusedTracks) {
+    if (!t) continue;
+    if (t.radar_tid != null && Number(t.radar_tid) === want) {
+      return t.id;
+    }
+  }
+  return null;
 }
 
 function _iou(a, b) {

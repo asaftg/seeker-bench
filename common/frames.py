@@ -76,6 +76,12 @@ class ThermalDetection:
     # "USER TARGET" box in the GUI. Debug/demo handle for objects that
     # aren't hot (parked cars, trees, etc.).
     synthetic: bool = False
+    # Heat-track id from ``DetectionTracker`` (the per-sensor classical
+    # CV tracker). Stamped onto the ThermalDetection at emit time so
+    # downstream consumers — fusion, the GUI panel — can link a raw
+    # det back to its persistent track id without bbox-IoU matching.
+    # None on first-frame dets that haven't reached confirmation yet.
+    track_id: Optional[int] = None
 
 
 @dataclass
@@ -249,13 +255,16 @@ class FusedTrack:
     # the round-trip.
     world_az_deg: Optional[float] = None
     world_el_deg: Optional[float] = None
-    # Latest EO ByteTrack id contributing to this fused track. Used by
-    # the GUI to label raw EO detections with the same fused id (was
-    # falling back to bbox-IoU which fails after a few ticks of EMA
-    # smoothing — operator saw `E#15` on the EO panel while the same
-    # target's projection on thermal showed `#30`). None if no EO
-    # observation has updated this track recently.
-    eo_track_id: Optional[int] = None
+    # Per-sensor tracker IDs that contributed to this fused track.
+    # Lets the GUI label raw per-sensor detections with the same
+    # fused id by direct id match (robust under EMA smoothing of the
+    # fused track's stored angles, which IoU matching is not).
+    # All three are stamped at observation-time and overwritten on
+    # every fresh observation from that sensor; None when that sensor
+    # has not contributed to this track recently.
+    eo_track_id:      Optional[int] = None
+    thermal_heat_id:  Optional[int] = None  # DetectionTracker heat-track id
+    radar_tid:        Optional[int] = None  # RadarClusterer Kalman tid
 
 
 # ───────────────────────────────────────────────────────────────

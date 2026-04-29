@@ -248,11 +248,14 @@ export class ThermalView {
         continue;
       }
       if (isSubsumedByFused(det.bbox, this._lastFused, "bbox_thermal")) continue;
-      const fusedId = fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal");
+      // Pass the raw det through so fusedIdForDet can match by
+      // det.track_id ↔ FusedTrack.thermal_heat_id (Phase B1, mirror
+      // of the EO panel's eo_track_id link).
+      const fusedId = fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal", 0.20, det);
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);
-      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain, fusedId);
+      drawDetectionBox(this.ctx, det, scale, dx, dy, isMain, fusedId, "T");
     }
 
     // Fused overlay rules:

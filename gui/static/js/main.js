@@ -1118,7 +1118,7 @@ function connect() {
     // 2026-04-26 "I can't even understand what's going on".
     const gimbalPanForRadar = (msg.gimbal && msg.gimbal.pan != null)
       ? Number(msg.gimbal.pan) : 0;
-    radarView.update(radar, gimbalPanForRadar);
+    radarView.update(radar, gimbalPanForRadar, fusedAll);
     if (radarMini) radarMini.update(radar, gimbalPanForRadar);
 
     // Hydrate DEV-tab radar sliders from the server-reported tuning on

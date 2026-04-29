@@ -74,6 +74,7 @@ def encode_thermal(tf: Optional[ThermalFrame], jpeg_quality: int = 92) -> Option
                 "area_px": int(d.area_px),
                 "contrast": round(float(d.contrast), 1),
                 "synthetic": bool(getattr(d, "synthetic", False)),
+                "track_id": getattr(d, "track_id", None),
                 "classification": (
                     None if d.classification is None else {
                         "target_class": d.classification.target_class.value,

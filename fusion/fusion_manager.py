@@ -276,7 +276,8 @@ class FusionManager:
                     "az":      e["az"],   "el":    e["el"],
                     "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
                     "conf":    max(e["conf"], t["conf"]),
-                    "eo_track_id": e.get("eo_track_id"),
+                    "eo_track_id":     e.get("eo_track_id"),
+                    "thermal_heat_id": t.get("thermal_heat_id"),
                     # Primary's pose-at-capture wins (az/el also from EO).
                     "_pose_pan":  e.get("_pose_pan"),
                     "_pose_tilt": e.get("_pose_tilt"),
@@ -303,6 +304,7 @@ class FusionManager:
                 "az":      t["az"],   "el":    t["el"],
                 "ang_w":   t["ang_w"],"ang_h": t["ang_h"],
                 "conf":    t["conf"],
+                "thermal_heat_id": t.get("thermal_heat_id"),
                 "_pose_pan":  t.get("_pose_pan"),
                 "_pose_tilt": t.get("_pose_tilt"),
             })
@@ -345,6 +347,10 @@ class FusionManager:
                 # max confidence so the row score (sensors+conf) ranks
                 # correctly.
                 c["conf"] = max(c["conf"], r["conf"])
+                # Stamp radar Kalman id on the joined candidate for
+                # symmetric link metadata (Phase B2).
+                if r.get("radar_tid") is not None:
+                    c["radar_tid"] = int(r["radar_tid"])
             else:
                 # Standalone radar candidate. Class is the sentinel —
                 # the persistence tracker will keep it as RADAR_TARGET
@@ -357,6 +363,9 @@ class FusionManager:
                     "az":      r["az"],   "el":    r["el"],
                     "ang_w":   r["ang_w"],"ang_h": r["ang_h"],
                     "conf":    r["conf"],
+                    "radar_tid": (int(r["radar_tid"])
+                                   if r.get("radar_tid") is not None
+                                   else None),
                     "_pose_pan":  r.get("_pose_pan"),
                     "_pose_tilt": r.get("_pose_tilt"),
                 })
@@ -430,10 +439,17 @@ class FusionManager:
             with self._ext_lock:
                 az += self.thermal_az_bias_deg
                 el += self.thermal_el_bias_deg
+            # Pass-through the thermal heat-track id (DetectionTracker)
+            # so the fused track can be cross-referenced from the
+            # thermal panel by id (Phase B1 — symmetric with EO's
+            # eo_track_id pass-through).
+            heat_id = getattr(d, "track_id", None)
             out.append({
                 "az": az, "el": el, "ang_w": aw, "ang_h": ah,
                 "class": cls.value,
                 "conf": float(d.classification.confidence),
+                "thermal_heat_id": (int(heat_id)
+                                    if heat_id is not None else None),
                 "_pose_pan": pose_pan,
                 "_pose_tilt": pose_tilt,
             })
@@ -487,6 +503,9 @@ class FusionManager:
                 "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
                 "class": TargetClass.RADAR_TARGET.value,
                 "conf": float(t.confidence),
+                # Radar Kalman tracker id from RadarClusterer — Phase
+                # B2 link, mirror of eo_track_id and thermal_heat_id.
+                "radar_tid": int(t.tid),
                 "_pose_pan": pose_pan,
                 "_pose_tilt": pose_tilt,
             })
@@ -585,14 +604,19 @@ class FusionManager:
                     trk["last_obs_pose_pan"] = float(c["_pose_pan"])
                 if c.get("_pose_tilt") is not None:
                     trk["last_obs_pose_tilt"] = float(c["_pose_tilt"])
-                # Latest EO ByteTrack id contributing to this track,
-                # so the GUI can label raw EO detections with the same
-                # fused id (was using bbox IoU which drifts with EMA
-                # smoothing → label fell back to E#N even when fusion
-                # had a track for it). None if this update was thermal-
-                # or radar-only.
+                # Latest per-sensor tracker IDs contributing to this
+                # fused track. Used by the GUI to label raw per-sensor
+                # detections with the same fused id by direct id match
+                # instead of bbox-IoU (which drifts under EMA smoothing).
+                # Each id is overwritten when its sensor contributes
+                # this tick; sensors absent from this update keep their
+                # previous value rather than going stale.
                 if c.get("eo_track_id") is not None:
                     trk["eo_track_id"] = int(c["eo_track_id"])
+                if c.get("thermal_heat_id") is not None:
+                    trk["thermal_heat_id"] = int(c["thermal_heat_id"])
+                if c.get("radar_tid") is not None:
+                    trk["radar_tid"] = int(c["radar_tid"])
                 # Class promotion: a radar-born track stays RADAR_TARGET
                 # until an EO/thermal observation joins, at which point
                 # we lock in the real class. Once locked, never overwrite
@@ -642,6 +666,12 @@ class FusionManager:
                     "eo_track_id": (int(c["eo_track_id"])
                                      if c.get("eo_track_id") is not None
                                      else None),
+                    "thermal_heat_id": (int(c["thermal_heat_id"])
+                                         if c.get("thermal_heat_id") is not None
+                                         else None),
+                    "radar_tid": (int(c["radar_tid"])
+                                   if c.get("radar_tid") is not None
+                                   else None),
                 })
                 try:
                     from common.events import emit as _emit
@@ -916,5 +946,7 @@ class FusionManager:
                 world_az_deg=world_az,
                 world_el_deg=world_el,
                 eo_track_id=trk.get("eo_track_id"),
+                thermal_heat_id=trk.get("thermal_heat_id"),
+                radar_tid=trk.get("radar_tid"),
             ))
         BUS.publish(Topic.FUSED, out)

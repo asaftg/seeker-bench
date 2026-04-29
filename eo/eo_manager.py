@@ -1350,16 +1350,19 @@ class EOManager:
                 tc = TargetClass(d["class"])
             except ValueError:
                 tc = TargetClass.UNKNOWN
-            tid = int(d.get("track_id", -1))
-            if tid < 0:
-                # ByteTrack hasn't confirmed this detection yet
-                # (first frame after spawn). Skip to avoid flicker.
+            # ByteTrack id sentinel cleanup (Phase A2): use None for
+            # "no confirmed id yet" rather than the magic value -1.
+            # Matches every other Optional[int] id field in the system
+            # (FusedTrack.eo_track_id, etc.). Skip unconfirmed dets so
+            # they don't flicker on the panel.
+            raw_tid = d.get("track_id")
+            if raw_tid is None or int(raw_tid) < 0:
                 continue
             out_dets.append(EODetection(
                 bbox=BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
                 confidence=float(d["conf"]),
                 target_class=tc,
-                track_id=tid,
+                track_id=int(raw_tid),
             ))
 
         dev_idx = getattr(self._source, "device_index", None) if self._source else None
