@@ -37,7 +37,7 @@ thermal:
   agc:
     low_percentile: 2
     high_percentile: 98
-    colormap: INFERNO
+    colormap: WHITE_HOT          # operator's actual chat-start view was grayscale, not INFERNO
 
   # Digital zoom presets (emulated narrow FOV)
   digital_zoom:
