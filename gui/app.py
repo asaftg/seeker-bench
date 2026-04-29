@@ -83,14 +83,41 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
         response = await call_next(request)
         if request.url.path.startswith("/static"):
             response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         return response
+
+    # Server-start version stamp — appended to JS/CSS URLs when serving
+    # index.html. Any backend restart bumps this, so the browser is
+    # FORCED to fetch fresh JS/CSS even if it ignored Cache-Control.
+    # No more "did the new code reach the browser?" guessing.
+    import time as _time
+    _build_stamp = str(int(_time.time()))
 
     @app.get("/")
     def root():
         index = static_dir / "index.html"
         if not index.exists():
             return {"status": "ok", "message": "GUI static files not found", "path": str(index)}
-        return FileResponse(str(index), headers={"Cache-Control": "no-store"})
+        try:
+            html = index.read_text(encoding="utf-8")
+            # Inject ?v=<stamp> on local /static/ JS+CSS URLs. Cheap
+            # one-pass regex; idempotent (a URL that already has a
+            # ?v= gets it overwritten on the next page load, which is
+            # exactly what we want).
+            import re
+            def _stamp(m):
+                url = m.group(2)
+                # Strip any pre-existing ?v=... so we don't accumulate.
+                bare = url.split("?v=")[0]
+                return f'{m.group(1)}{bare}?v={_build_stamp}{m.group(3)}'
+            html = re.sub(
+                r'(<(?:script|link)[^>]*\s(?:src|href)=")(/static/[^"]+?\.(?:js|css))("[^>]*>)',
+                _stamp, html, flags=re.IGNORECASE)
+            return Response(content=html, media_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+        except Exception:
+            return FileResponse(str(index), headers={"Cache-Control": "no-store"})
 
     @app.get("/health")
     def health():
