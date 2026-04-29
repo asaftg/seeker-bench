@@ -123,6 +123,55 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
     def health():
         return {"status": "ok"}
 
+    @app.get("/api/radar/aa_diagnostics")
+    def get_aa_diagnostics():
+        """Surface the full A/A chain status as JSON so the operator
+        can debug "no PMM hits" without attaching a debugger.
+
+        Implementation note: the diagnostics dict can contain numpy
+        scalars, NaN, and Inf — none of which are valid JSON. We
+        round-trip through ``json.dumps(..., default=str, allow_nan=True)``
+        and return a plain ``Response`` so the browser sees a 200 with
+        the error text inline if anything goes wrong, instead of an
+        opaque 500 from FastAPI's default encoder."""
+        import json as _json, traceback as _tb
+        rm = app.state.radar_manager
+        if rm is None or not hasattr(rm, "diagnostics"):
+            return Response(
+                content=_json.dumps({"available": False, "reason": "no radar manager"}),
+                media_type="application/json",
+            )
+        try:
+            d = rm.diagnostics()
+        except Exception as e:
+            log.exception("aa_diagnostics: rm.diagnostics() raised")
+            return Response(
+                content=_json.dumps({
+                    "error": "rm.diagnostics() raised",
+                    "exception": repr(e),
+                    "traceback": _tb.format_exc().splitlines(),
+                }, indent=2),
+                media_type="application/json",
+                status_code=200,
+            )
+        try:
+            # default=str catches numpy scalars / Path / etc;
+            # allow_nan=True keeps NaN/Inf as JS literals (which most
+            # browsers tolerate even though strict JSON doesn't).
+            body = _json.dumps(d, default=str, allow_nan=True, indent=2)
+        except Exception as e:
+            log.exception("aa_diagnostics: json.dumps failed")
+            return Response(
+                content=_json.dumps({
+                    "error": "json.dumps failed",
+                    "exception": repr(e),
+                    "raw_keys": list(d.keys()) if isinstance(d, dict) else "not a dict",
+                }, indent=2),
+                media_type="application/json",
+                status_code=200,
+            )
+        return Response(content=body, media_type="application/json")
+
     @app.get("/api/config/heat_detector")
     def get_heat_detector_config():
         tm = app.state.thermal_manager

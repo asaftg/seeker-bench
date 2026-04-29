@@ -269,43 +269,40 @@ class RadarManager:
     def _push_profile(self) -> bool:
         """Open CLI UART, bring sensor to STARTED, close. True on success.
 
-        The TI ``mmw_demo`` CLI only accepts a reconfig + fresh ``sensorStart``
-        when the chip is in state INIT (first boot). Any subsequent start
-        must be ``sensorStart 0`` from state STOPPED — the firmware will
-        reject a plain ``sensorStart`` with "Invalid Sensor Start". So:
+        Always pushes the full ``self.cfg_path`` from line 1. The cfg
+        starts with ``sensorStop`` + ``flushCfg``, which is the exact
+        sequence TI's ``mmw_demoDDM`` requires to safely re-load from
+        any state — INIT (post-power-cycle), STARTED (already running),
+        or STOPPED (sensor halted but profile still resident).
 
-          - state INIT  → push full .cfg (which ends in sensorStart)
-          - state STOPPED or STARTED → sensorStop, then sensorStart 0,
-            reusing whatever profile was previously configured
+        This used to be split into two branches: full cfg push for
+        state==INIT, ``sensorStart 0`` resumption for any other state.
+        That "smart" path silently broke Phase 3 — when the user
+        edited the .cfg to add ``lvdsStreamCfg -1 0 1 0`` for raw-ADC
+        streaming, restarting Seeker re-used the OLD profile (no
+        LVDS) because the chip wasn't in INIT and we didn't push.
+        Symptom: TLV worked (chip kept emitting on UART) but the DCA
+        received zero packets because the chip wasn't clocking LVDS.
 
-        If the user edits the .cfg and wants it applied, they must power-cycle
-        the EVM so the chip comes back up in state INIT.
+        Cost of always pushing: ~2 s of UART round-trips per Seeker
+        restart vs ~0.3 s for the lazy path. Worth it for correctness.
         """
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
                 state = self._query_sensor_state(ser)
-                log.info("Radar CLI reports sensor state=%s", state)
-
-                if state == 0:
-                    # Fresh boot — push full profile. .cfg ends in sensorStart.
-                    responses = send_cfg(ser, self.cfg_path)
-                    tail = responses[-1] if responses else ""
-                    if "Error" in tail or "error" in tail:
-                        log.warning("Profile push failed on last line: %r", tail)
-                        return False
-                    return True
-
-                # Non-INIT: stop → restart without reconfig. The chip keeps
-                # whatever .cfg it was loaded with last. Warn loudly if the
-                # path we were asked to send doesn't match what's on-chip
-                # — only a power cycle can recover that.
-                log.info("Sensor not in INIT; using sensorStart 0 "
-                         "(previously-loaded profile, not %s)", self.cfg_path)
-                self._cli_send(ser, "sensorStop", wait_s=1.0)
-                time.sleep(0.1)
-                resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
-                if "Done" not in resp:
-                    log.warning("sensorStart 0 did not ack: %r", resp.strip())
+                log.info("Radar CLI reports sensor state=%s; pushing full cfg %s",
+                         state, self.cfg_path)
+                # The cfg's first line is `sensorStop`; if the chip
+                # was in STARTED state that line cleanly halts it.
+                # `flushCfg` (line 2) drops any previously-loaded
+                # profile so the rest of the file lands on a clean
+                # slate. Every subsequent command applies in order.
+                # Final line is `sensorStart`, leaving the chip in
+                # STARTED state with the new profile resident.
+                responses = send_cfg(ser, self.cfg_path)
+                tail = responses[-1] if responses else ""
+                if "Error" in tail or "error" in tail:
+                    log.warning("Profile push failed on last line: %r", tail)
                     return False
                 return True
         except serial.SerialException as e:

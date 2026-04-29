@@ -277,22 +277,92 @@ class CompositeRadarBackend:
 
     # ─────────────────────── diagnostics ────────────────────────────────
     def diagnostics(self) -> Dict[str, Any]:
-        """Return a single dict with both subsystems' diagnostics, for
-        the GUI debug panel and unit tests."""
+        """Return one dict covering both data planes so the GUI debug
+        panel and the /api/radar/aa_diagnostics endpoint can show
+        WHERE in the chain the A/A path is stuck. The chain is:
+
+            chip LVDS  →  DCA FPGA UDP  →  DataPortListener (host)
+                                   │
+                                   ▼
+                           DCAPipeline frame assembly
+                                   │
+                                   ▼
+                              PMM detector
+                                   │
+                                   ▼
+                            Topic.RADAR_AA  →  GUI
+
+        Reading the dict from top to bottom:
+          udp.packets_total == 0          → DCA isn't reaching the host
+                                            (cable, IP route, firewall,
+                                            FPGA forward not started).
+          udp.packets_total > 0 but       → DCA is sending but our frame
+            aa.frames_assembled == 0       parser can't reassemble frames
+                                            (chirp/sample dims wrong, or
+                                            seq drops too high).
+          frames_assembled > 0 but        → Frames flow but the PMM
+            drone_detections == 0          detector never matches the
+                                            symmetric sideband test —
+                                            band wrong, threshold too
+                                            high, or no real prop signal.
+        """
         d: Dict[str, Any] = {"mode": self._mode}
+        # RadarManager doesn't expose diagnostics() — synthesize a
+        # small dict from its public attributes so this branch is
+        # informative instead of an opaque AttributeError.
         try:
-            d["tlv"] = self._radar.diagnostics()
+            r = self._radar
+            d["tlv"] = {
+                "snr_min_db": getattr(r, "snr_min_db", None),
+                "az_half_deg": getattr(r, "az_half_deg", None),
+                "speed_min_mps": getattr(r, "speed_min_mps", None),
+                "range_min_m": getattr(r, "range_min_m", None),
+                "max_range_m": getattr(r, "max_range_m", None),
+                "frame_id": getattr(r, "_frame_id", None),
+                "profile_name": getattr(r, "profile_name", None),
+            }
         except Exception as e:
             d["tlv"] = {"error": str(e)}
+
+        # UDP listener — the most upstream point in the A/A chain.
+        if self._dca_listener is not None:
+            try:
+                ds = self._dca_listener.stats()
+                d["udp"] = {
+                    "listening": ds.listening,
+                    "bound_addr": ds.bound_addr,
+                    "packets_total": ds.packets_total,
+                    "bytes_total": ds.bytes_total,
+                    "packets_per_s": round(ds.packets_per_s, 1),
+                    "bytes_per_s": round(ds.bytes_per_s, 1),
+                    "seq_drops_total": ds.seq_drops_total,
+                    "last_packet_age_s": (
+                        round(ds.last_packet_age_s, 2)
+                        if ds.last_packet_age_s != float("inf") else None
+                    ),
+                }
+            except Exception as e:
+                d["udp"] = {"error": str(e)}
+        else:
+            d["udp"] = {"available": False}
+
+        # Pipeline + PMM detector counters.
         if self._dca_pipeline is not None:
             try:
                 stats = self._dca_pipeline.stats()
                 d["aa"] = {
+                    "publish_enabled": getattr(self._dca_pipeline, "_publish_enabled", None),
                     "frames_assembled": stats.frames_assembled,
                     "frames_dropped": stats.frames_dropped,
                     "drone_detections": stats.drone_detections,
                     "last_drone_range_m": stats.last_drone_range_m,
                     "last_drone_blade_freq_hz": stats.last_drone_blade_freq_hz,
+                    # Echo the live PMM tuning so we can see what
+                    # threshold the detector is actually using.
+                    "pmm_band_low_hz": getattr(self._dca_pipeline, "_pmm_band_low", None),
+                    "pmm_band_high_hz": getattr(self._dca_pipeline, "_pmm_band_high", None),
+                    "pmm_threshold_db": getattr(self._dca_pipeline, "_pmm_threshold", None),
+                    "pmm_slow_time_win": getattr(self._dca_pipeline, "_pmm_slow_time_win", None),
                 }
             except Exception as e:
                 d["aa"] = {"error": str(e)}
