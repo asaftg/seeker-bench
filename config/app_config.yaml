@@ -27,37 +27,17 @@ thermal:
 
   # AGC
   #
-  # 2026-04-27: full revert to the pre-2026-04-27 baseline at operator
-  # request. Multiple tuning passes (CLAHE, gamma, bilateral, unsharp,
-  # WHITE_HOT, lanczos4) all looked WORSE on the live bench scene than
-  # the original 2/98 + INFERNO + bilinear. The new processing
-  # primitives remain in thermal/thermal_processor.py and are
-  # YAML-reachable via an `enhance:` block + `agc.clahe:` + `agc.colormap`
-  # + `digital_zoom.interpolation` if a future operator wants them, but
-  # NONE are on by default — defaults reproduce the legacy pipeline
-  # bit-for-bit. The Y16 negotiation-order fix in boson_capture.py is
-  # kept (it's a real bug, unrelated to image processing).
+  # Reverted to chat-start state 2026-04-28 after side-by-side at 37°
+  # outdoor showed the CLAHE-Y16 win was marginal vs the camera's
+  # onboard AGC8 and came at the cost of slight processing artifacts.
+  # The advanced primitives (roi, gates, clahe_y16, dead-pixel median,
+  # gamma, bilateral, unsharp) remain in thermal/thermal_processor.py
+  # and are YAML-reachable via `mode:` + sub-blocks; defaults below
+  # produce legacy behaviour bit-for-bit.
   agc:
-    # AGC mode dispatch — see thermal/thermal_processor.py::apply_agc_mode.
-    #   global    — percentile over whole frame (legacy)
-    #   roi       — percentile over the bottom (1 - roi.top_frac) of the frame
-    #   gates     — fixed cold/hot raw u16 thresholds (no histogram)
-    #   clahe_y16 — CLAHE on raw 16-bit before bit reduction (DEFAULT,
-    #               2026-04-27). Closest software equivalent of the
-    #               Boson's onboard DDE/AGC; gave the highest sharpness
-    #               in 4-up tests against the AGC8 fallback baseline.
-    mode: clahe_y16
-    low_percentile: 2           # used by mode: global / roi
+    low_percentile: 2
     high_percentile: 98
-    roi:
-      top_frac: 0.4             # mode: roi — percentile over bottom 60%
-    gates:
-      cold_count: 19000         # mode: gates — clip below this to 0 (black)
-      hot_count: 22500          # mode: gates — clip above this to 255 (white)
-    clahe_y16:
-      clip_limit: 2.0           # mode: clahe_y16 — CLAHE clip limit on raw u16
-      tile_grid: 12             # 2026-04-28 outdoor sweep winner: tile_12 composite 78.6 vs tile_8 75.3
-    colormap: WHITE_HOT         # INFERNO | IRONBOW | WHITE_HOT | JET | MAGMA — operator preference 2026-04-27
+    colormap: INFERNO
 
   # Digital zoom presets (emulated narrow FOV)
   digital_zoom:

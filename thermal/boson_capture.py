@@ -80,24 +80,23 @@ class BosonCapture:
 
             # Request Y16 first for raw 16-bit thermal.
             #
-            # Property-set ORDER MATTERS on this laptop's DSHOW (verified
-            # 2026-04-27 by direct probe). FOURCC-before-WIDTH/HEIGHT
-            # silently drops Y16 and downconverts to 8-bit BGR; setting
-            # WIDTH/HEIGHT then CONVERT_RGB=0 then FOURCC negotiates Y16
-            # correctly and returns a uint16 single-channel array.
-            #
-            # 2026-04-27 re-enable: paired with thermal.agc.mode=clahe_y16
-            # in YAML so the wider dynamic range gets put to use through
-            # CLAHE on the raw 16-bit data (closest software equivalent
-            # of the camera's onboard DDE/AGC). Heat detector
-            # threshold_k slider extended to max 100 in the GUI for
-            # operator suppression headroom.
+            # Reverted to legacy property-set order 2026-04-28 at
+            # operator request. The reordered (WIDTH/HEIGHT before
+            # FOURCC) variant correctly negotiates Y16 on this
+            # laptop's DSHOW, but the marginal image-quality win of
+            # the Y16 + clahe_y16 software path didn't justify the
+            # added complexity vs the camera's onboard AGC8. With the
+            # legacy order, DSHOW silently downconverts to 8-bit BGR
+            # and seeker runs the AGC8 fallback path — which IS the
+            # chat-start baseline the operator validated. To re-enable
+            # Y16: swap to WIDTH/HEIGHT -> CONVERT_RGB -> FOURCC AND
+            # flip thermal.agc.mode to clahe_y16/roi/gates in YAML.
             raw16_ok = False
             if self.prefer_raw16:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("Y", "1", "6", " "))
+                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("Y", "1", "6", " "))
                 ok, test = cap.read()
                 # OpenCV silently ignores Y16 on some laptops and still
                 # returns a BGR frame — the only reliable signal that we
