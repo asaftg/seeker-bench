@@ -52,11 +52,23 @@ export function drawDetectionBox(ctx, det, scale, dx, dy, isMainTarget = false, 
     lineWidth = 2;
   }
 
-  // Prefix with fusion ID when this raw det has been matched to a
-  // fused track, so the label lines up with the IDs in the targets
-  // list. No prefix if not fused yet — avoids lying about a lock that
-  // hasn't happened.
-  const idPrefix = (fusedId != null) ? `#${fusedId} ` : "";
+  // Prefix with the most-authoritative ID we have. Order:
+  //   1. fused track id  (from cross-sensor fusion: stable, lock-target)
+  //   2. EO ByteTrack id (from eo_classifier: per-sensor, transient)
+  //   3. no prefix       (single-frame detection, no tracker)
+  //
+  // Operator-reported 2026-04-27: raw EO detections previously showed
+  // up unlabelled until the fused track was born — but by that point
+  // the same detection projected onto thermal already carried the
+  // fused id. Now the EO panel always shows SOME id so the operator
+  // can correlate visually before fusion locks. The `E#` prefix
+  // distinguishes a per-sensor tracker id from a fused id (`#`).
+  let idPrefix = "";
+  if (fusedId != null) {
+    idPrefix = `#${fusedId} `;
+  } else if (det.track_id != null) {
+    idPrefix = `E#${det.track_id} `;
+  }
   if (conf != null && cls && cls !== "unknown") {
     const clsLabel = cls === "person" ? "HUMAN" : cls.toUpperCase();
     label = `${idPrefix}${clsLabel} ${(conf * 100) | 0}%`;
