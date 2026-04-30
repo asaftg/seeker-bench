@@ -173,7 +173,7 @@ def main(argv=None) -> int:
     print(f"  # other heat_detector knobs: unchanged")
     print("=" * 64)
     print()
-    print("Then apply Patch 2 (Y16 enable in boson_capture.py — see PROPOSED_CHANGES.md).")
+    print("Then apply Patch 2 (Y16 enable in boson_capture.py — see docs/handoffs/2026-04-27_proposed_y16_roi_changes.md).")
     return 0
 
 

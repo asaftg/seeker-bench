@@ -6,7 +6,7 @@ The morning of 2026-04-27 a per-track gimbal-pose camera-frame
 compensation was added to fusion_manager._update_tracks (to fix YOLO
 id-swap during fast slews) and was reverted the same afternoon after
 recordings/gimbal_not_tracking_static.jsonl exposed it merging two
-distinct vehicles into one fused id. SESSION_SUMMARY.md explicitly
+distinct vehicles into one fused id. docs/handoffs/2026-04-27_session_summary_recorder.md explicitly
 calls out the right next step: "Fusion in world frame (structural)
 — track world_az = cam_az + gimbal_pan instead of camera-frame az.
 Solves both the YOLO id-swap case AND the multi-vehicle merge case.
