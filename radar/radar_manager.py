@@ -261,6 +261,27 @@ class RadarManager:
                 time.sleep(0.005)
         return buf.decode("ascii", errors="replace")
 
+    @staticmethod
+    def _drain_for_ack(ser: serial.Serial, wait_s: float) -> str:
+        """Keep reading bytes until we see a known ack token or time out.
+        Used after send_cfg when the chip's final `sensorStart` is still
+        running calibration past the per-line ack timeout."""
+        deadline = time.monotonic() + wait_s
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            n = ser.in_waiting
+            if n:
+                buf.extend(ser.read(n))
+                text = buf.decode("ascii", errors="replace")
+                if ("Done" in text
+                        or "Init Calibration Status" in text
+                        or "Calibration Status = 0x" in text
+                        or "Error" in text):
+                    return text
+            else:
+                time.sleep(0.02)
+        return buf.decode("ascii", errors="replace")
+
     def _query_sensor_state(self, ser: serial.Serial) -> Optional[int]:
         """Return integer sensor state (0=INIT, 2=STARTED, 3=STOPPED) or None."""
         resp = self._cli_send(ser, "queryDemoStatus", wait_s=1.0)
@@ -323,13 +344,28 @@ class RadarManager:
                     # Start" because the chip is already STARTED, and
                     # was the bug that produced the 3 s reconnect
                     # cycle in the field run on 2026-04-30.
-                    responses = send_cfg(ser, self.cfg_path)
+                    #
+                    # Use ack_timeout=5 s — the final `sensorStart`
+                    # triggers RF / antenna calibration which prints
+                    # "Init Calibration Status = 0x..." 3-5 s after
+                    # the command. Default 2 s leaves tail empty.
+                    responses = send_cfg(ser, self.cfg_path, ack_timeout_s=5.0)
                     tail = responses[-1] if responses else ""
                     if _ok(tail):
                         return True
+                    # Empty / partial tail → calibration still in flight.
+                    # Drain the buffer for up to 5 more seconds; the chip
+                    # eventually emits "Init Calibration Status = 0x..."
+                    # or "Done" once cal completes.
+                    if not tail.strip():
+                        late = self._drain_for_ack(ser, wait_s=5.0)
+                        if _ok(late):
+                            return True
+                        log.warning("Profile push: late ack also empty: %r",
+                                    late.strip())
                     if "Invalid Sensor Start" in tail or "Invalid sensor start" in tail:
                         log.info("cfg sensorStart rejected; trying sensorStart 0")
-                        resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
+                        resp = self._cli_send(ser, "sensorStart 0", wait_s=3.0)
                         if _ok(resp):
                             return True
                         log.warning("sensorStart 0 did not ack: %r", resp.strip())
