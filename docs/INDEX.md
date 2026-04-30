@@ -3,6 +3,12 @@
 Living documentation for the Seeker-01 bench. Living roadmap is
 `NEXT.md`; everything else is historical or design-stage.
 
+## Releases
+
+| Tag | Notes |
+|---|---|
+| `v1.0.0` (2026-04-29) | [`RELEASE_NOTES_v1.0.0.md`](RELEASE_NOTES_v1.0.0.md) — first field-deployable cut, Jetson port baseline. |
+
 ## Living docs (read these)
 
 | File | Purpose |
