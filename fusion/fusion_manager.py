@@ -42,7 +42,7 @@ from common.frames import (
     Topic,
 )
 from common.logging_setup import get_logger
-from fusion.angular import angular_iou, bbox_to_angular
+from fusion.angular import angular_iou, bbox_to_angular, pixel_to_angle_K
 
 log = get_logger(__name__)
 
@@ -120,6 +120,15 @@ class FusionManager:
         self.radar_az_bias_deg = float(rex.get("az_bias_deg", 0.0))
         self.radar_el_bias_deg = float(rex.get("el_bias_deg", 0.0))
         self._ext_lock = threading.Lock()
+
+        # v2 calibration — populated by set_calibrated_cameras() when
+        # calibration.json contains full K/dist/R/t for both EO and
+        # thermal. While these are None, every observation builder
+        # takes the legacy v1 (FOV + scalar bias) path, byte-identical
+        # to the pre-v2 behavior. This is the toggle the replay
+        # regression guard depends on.
+        self._eo_cam = None       # type: Optional["Camera"]
+        self._thermal_cam = None  # type: Optional["Camera"]
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -206,6 +215,29 @@ class FusionManager:
                 "radar_az_bias_deg":   self.radar_az_bias_deg,
                 "radar_el_bias_deg":   self.radar_el_bias_deg,
             }
+
+    def set_calibrated_cameras(self, *, eo, thermal) -> None:
+        """Switch this manager to the v2 calibrated-projection path.
+
+        Once both cameras are set, ``_observations_from_thermal`` will
+        unproject thermal pixels into rays in EO frame, project them
+        back through EO's calibrated K + distortion, then derive
+        angular form via ``pixel_to_angle_K``. Slider biases compose
+        on top of the calibrated thermal pose as a small residual
+        rotation (see fusion.projection.residual_rotation).
+
+        Pass either eo=None or thermal=None to disable the v2 path
+        and revert to v1 (legacy FOV + scalar bias). This is the
+        knob the replay regression guard relies on.
+        """
+        with self._ext_lock:
+            self._eo_cam = eo
+            self._thermal_cam = thermal
+        log.info(
+            "Fusion v2 cameras set: eo=%s thermal=%s",
+            "yes" if eo is not None else "no",
+            "yes" if thermal is not None else "no",
+        )
 
     # ───────────────────────── main loop ─────────────────────────
     def _loop(self) -> None:
@@ -413,6 +445,59 @@ class FusionManager:
         self._merge_overlapping_tracks()
         self._publish()
 
+    # ───────────────────────── v2 helper ─────────────────────────
+    def _thermal_bbox_to_eo_angular(
+        self,
+        x: float, y: float, w: float, h: float,
+        thr_cam, eo_cam,
+    ) -> Tuple[float, float, float, float]:
+        """Map a thermal-pixel bbox to (az, el, ang_w, ang_h) in EO frame.
+
+        v2-only. Unprojects each corner of the thermal bbox to a ray in
+        EO frame (using thermal K + dist + R + t), projects each ray
+        onto EO at the far-field limit, takes the axis-aligned EO-pixel
+        bounding box of the four corners, and converts that bbox to
+        angular form via EO's K.
+
+        Far-field is used because no depth is known at thermal-
+        observation time — the cross-sensor association layer doesn't
+        run until after this. At long range translation has near-zero
+        leverage so far-field is correct; at short range there is
+        residual parallax that v2 doesn't yet remove (refinement
+        deferred per the calibration plan).
+        """
+        from fusion.projection import far_field_eo_pixel_from_ray
+        corners = (
+            (x,     y),
+            (x + w, y),
+            (x,     y + h),
+            (x + w, y + h),
+        )
+        us = []
+        vs = []
+        for (u_t, v_t) in corners:
+            origin, direction = thr_cam.unproject_pixel_to_eo_ray(u_t, v_t)
+            u_e, v_e = far_field_eo_pixel_from_ray(eo_cam, origin, direction)
+            us.append(u_e)
+            vs.append(v_e)
+        u_min, u_max = min(us), max(us)
+        v_min, v_max = min(vs), max(vs)
+        u_ctr = 0.5 * (u_min + u_max)
+        v_ctr = 0.5 * (v_min + v_max)
+        az_ctr, el_ctr = pixel_to_angle_K(
+            u_ctr, v_ctr, eo_cam.fx, eo_cam.fy, eo_cam.cx, eo_cam.cy)
+        az_right, _ = pixel_to_angle_K(
+            u_max, v_ctr, eo_cam.fx, eo_cam.fy, eo_cam.cx, eo_cam.cy)
+        az_left, _ = pixel_to_angle_K(
+            u_min, v_ctr, eo_cam.fx, eo_cam.fy, eo_cam.cx, eo_cam.cy)
+        _, el_top = pixel_to_angle_K(
+            u_ctr, v_min, eo_cam.fx, eo_cam.fy, eo_cam.cx, eo_cam.cy)
+        _, el_bot = pixel_to_angle_K(
+            u_ctr, v_max, eo_cam.fx, eo_cam.fy, eo_cam.cx, eo_cam.cy)
+        ang_w = abs(az_right - az_left)
+        ang_h = abs(el_top - el_bot)
+        return az_ctr, el_ctr, ang_w, ang_h
+
     # ───────────────────────── observation builders ──────────────
     def _observations_from_thermal(self, tf: Optional[ThermalFrame]) -> list[dict]:
         if tf is None or not tf.connected or tf.agc8 is None:
@@ -422,6 +507,23 @@ class FusionManager:
         # back to None to signal "use fusion-tick pose".
         pose_pan = getattr(tf, "gimbal_pan_at_capture", None)
         pose_tilt = getattr(tf, "gimbal_tilt_at_capture", None)
+
+        # Snapshot bias + v2 cameras under the lock once. Sliders applied
+        # below as either scalar bias (v1) or residual rotation (v2);
+        # never both. Reading both in the same lock acquire avoids the
+        # tear bug from the legacy path.
+        with self._ext_lock:
+            az_bias = self.thermal_az_bias_deg
+            el_bias = self.thermal_el_bias_deg
+            eo_cam = self._eo_cam
+            thr_cam = self._thermal_cam
+        v2 = (eo_cam is not None) and (thr_cam is not None)
+        if v2:
+            # Apply slider residual to thermal in sensor-local frame.
+            # with_residual returns self when bias=0,0, so v2-with-zero-bias
+            # is the calibration-only case (no slider influence).
+            thr_cam_eff = thr_cam.with_residual(az_bias, el_bias)
+
         out = []
         for d in tf.detections:
             if d.classification is None:
@@ -429,16 +531,28 @@ class FusionManager:
             cls = d.classification.target_class
             if cls not in _FUSABLE_CLASSES:
                 continue
-            az, el, aw, ah = bbox_to_angular(
-                d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h,
-                w, h, tf.hfov_deg, tf.vfov_deg,
-            )
-            # Software extrinsic: bias thermal az/el to align with EO
-            # (ground truth). Read under the lock so a mid-tick GUI
-            # slider update doesn't tear the two reads.
-            with self._ext_lock:
-                az += self.thermal_az_bias_deg
-                el += self.thermal_el_bias_deg
+
+            if v2:
+                # Project the thermal bbox corners through the calibrated
+                # 6-DoF stereo + distortion → EO pixels, then derive
+                # angular form via EO's K. No depth source available at
+                # observation time; far-field (homography) limit is used.
+                # A future refinement can re-project at radar range once
+                # association assigns one — but that's outside the
+                # minimum-blast-radius v2 cut.
+                az, el, aw, ah = self._thermal_bbox_to_eo_angular(
+                    d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h,
+                    thr_cam_eff, eo_cam,
+                )
+            else:
+                az, el, aw, ah = bbox_to_angular(
+                    d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h,
+                    w, h, tf.hfov_deg, tf.vfov_deg,
+                )
+                # v1 path: scalar bias added to atan2-derived angle.
+                az += az_bias
+                el += el_bias
+
             # Pass-through the thermal heat-track id (DetectionTracker)
             # so the fused track can be cross-referenced from the
             # thermal panel by id (Phase B1 — symmetric with EO's

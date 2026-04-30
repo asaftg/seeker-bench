@@ -27,6 +27,31 @@ def pixel_to_angle(
     return az, el
 
 
+def pixel_to_angle_K(
+    cx_px: float, cy_px: float,
+    fx: float, fy: float, cx: float, cy: float,
+) -> Tuple[float, float]:
+    """Map a pixel coordinate to (az_deg, el_deg) using camera intrinsics.
+
+    Used by the v2 projection path: after we project a world point to the
+    EO image plane via cv2.projectPoints, we convert the resulting pixel
+    back to angular form so the existing angular_iou-based association
+    layer is unchanged.
+
+    Convention matches pixel_to_angle: az positive = right, el positive
+    = up. Sign on el flips because pixel y grows downward.
+
+    fx, fy in pixels; cx, cy = principal point in pixels (NOT image
+    center — use the calibrated value).
+    """
+    import math
+    if fx <= 0 or fy <= 0:
+        return 0.0, 0.0
+    az = math.degrees(math.atan2(cx_px - cx, fx))
+    el = -math.degrees(math.atan2(cy_px - cy, fy))
+    return az, el
+
+
 def bbox_to_angular(
     bx: float, by: float, bw: float, bh: float,
     frame_w: int, frame_h: int,
