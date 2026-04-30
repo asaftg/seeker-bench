@@ -27,13 +27,14 @@ FFT). For now we just count bytes so the GUI can show a meaningful
 """
 from __future__ import annotations
 
+import os
 import socket
 import struct
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, List, Optional
+from typing import Deque, List, Optional, TextIO
 
 from common.logging_setup import get_logger
 
@@ -121,6 +122,28 @@ class DataPortListener:
         # mmWave Studio. Set via constructor or recording_start().
         self._record_path: Optional[str] = record_bin_path
         self._record_fp = None  # type: ignore[var-annotated]
+        # Phase-3 ``dca_index.csv`` writer — one row per UDP packet so
+        # post-flight tooling can seek into the .bin without re-parsing
+        # 60 MB/s from the start. Columns (per
+        # docs/PHASE_3_RECORDER_FIELDS.md §"dca_index.csv"):
+        #   ts_host_ns, byte_offset, payload_len, seq_num, chunk_offset
+        # ``ts_host_ns`` is monotonic_ns at packet receive — the listener
+        # already takes wall-clock time.time() for stats, but monotonic
+        # is what the spec asks for and what's safe across NTP slews.
+        self._index_fp: Optional[TextIO] = None
+        self._index_path: Optional[str] = None
+        # Running byte offset INTO ``_record_fp`` — the CSV's
+        # ``byte_offset`` column. Reset to 0 when recording starts.
+        self._index_offset_bytes: int = 0
+        # Buffer rows in memory; flush every N rows OR every T seconds,
+        # whichever comes first. At ~30 kpps, per-row flushes would
+        # tank the listener. With N=100 rows / T=0.1 s we flush at
+        # roughly the same cadence either way and bound row-loss on
+        # crash to ~3 ms of capture.
+        self._index_buf: List[str] = []
+        self._INDEX_FLUSH_ROWS = 100
+        self._INDEX_FLUSH_INTERVAL_S = 0.1
+        self._index_last_flush_mono: float = 0.0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -142,6 +165,7 @@ class DataPortListener:
                 self._record_fp = open(self._record_path, "wb")
                 log.info("DataPortListener recording raw payloads to %s",
                          self._record_path)
+                self._open_index_for(self._record_path)
             except OSError as e:
                 log.warning("Could not open record path %s: %s",
                             self._record_path, e)
@@ -158,7 +182,11 @@ class DataPortListener:
         """Begin appending raw payload bytes to ``path``. Safe to call
         while the listener thread is running — the open() happens
         under the lock so the next packet either lands in the new file
-        or is silently buffered until the file opens."""
+        or is silently buffered until the file opens.
+
+        Also opens the sibling ``<stem>_radar.csv`` index for
+        per-packet seek records (Phase 3, see
+        docs/PHASE_3_RECORDER_FIELDS.md)."""
         with self._lock:
             if self._record_fp is not None:
                 try:
@@ -166,10 +194,12 @@ class DataPortListener:
                 except OSError:
                     pass
                 self._record_fp = None
+            self._close_index_locked()
             try:
                 self._record_fp = open(path, "wb")
                 self._record_path = path
                 log.info("DataPortListener: recording started → %s", path)
+                self._open_index_for(path)
             except OSError as e:
                 log.warning("recording_start: open(%s) failed: %s", path, e)
 
@@ -185,8 +215,88 @@ class DataPortListener:
                 pass
             self._record_fp = None
             path = self._record_path
+            self._close_index_locked()
             log.info("DataPortListener: recording stopped (was %s)", path)
             return path
+
+    # ─────────────────────── dca_index.csv plumbing ────────────────────────
+    def _open_index_for(self, bin_path: str) -> None:
+        """Open ``<stem>_radar.csv`` next to the .bin and write the
+        header row. Caller holds ``_lock``. Best-effort: a failure to
+        open the index does not affect .bin recording — we just log
+        and skip. ``<stem>_radar.csv`` mirrors the .bin's
+        ``<stem>_radar.bin`` naming so paired-file globbing works."""
+        try:
+            stem, _ext = os.path.splitext(bin_path)
+            index_path = stem + ".csv"
+            # Line-buffered text mode so an external tool tailing the
+            # CSV sees rows promptly. Buffering is layered on top in
+            # the in-memory list — the file handle's buffering is just
+            # the OS write cadence.
+            self._index_fp = open(index_path, "w", encoding="utf-8",
+                                  newline="")
+            self._index_path = index_path
+            self._index_offset_bytes = 0
+            self._index_buf = []
+            self._index_last_flush_mono = time.monotonic()
+            self._index_fp.write(
+                "ts_host_ns,byte_offset,payload_len,seq_num,chunk_offset\n"
+            )
+            self._index_fp.flush()
+            log.info("DataPortListener: index started → %s", index_path)
+        except OSError as e:
+            log.warning("could not open index file for %s: %s", bin_path, e)
+            self._index_fp = None
+            self._index_path = None
+
+    def _close_index_locked(self) -> None:
+        """Flush any buffered rows and close the index file. Caller
+        holds ``_lock``."""
+        if self._index_fp is None:
+            return
+        try:
+            if self._index_buf:
+                self._index_fp.write("".join(self._index_buf))
+                self._index_buf = []
+            self._index_fp.flush()
+            self._index_fp.close()
+        except OSError as e:
+            log.warning("index close failed: %s", e)
+        self._index_fp = None
+        self._index_path = None
+
+    def _index_record(self, ts_host_ns: int, byte_offset: int,
+                      payload_len: int, seq: int, chunk_offset: int) -> None:
+        """Buffer one CSV row and flush if the threshold is hit. Caller
+        holds ``_lock``. Hot path — the row is built with str() and
+        f-strings rather than the csv module to avoid the extra
+        attribute lookups (the format is fixed and rectangular)."""
+        if self._index_fp is None:
+            return
+        # Row format: 5 ints, comma-separated, single newline.
+        self._index_buf.append(
+            f"{ts_host_ns},{byte_offset},{payload_len},{seq},{chunk_offset}\n"
+        )
+        # Flush when either the row count or the time-since-last flush
+        # threshold is exceeded. Using monotonic() (seconds, float)
+        # rather than ns to keep the comparison cheap — we don't need
+        # ns precision for a 100 ms window.
+        now = time.monotonic()
+        if (len(self._index_buf) >= self._INDEX_FLUSH_ROWS
+                or (now - self._index_last_flush_mono)
+                >= self._INDEX_FLUSH_INTERVAL_S):
+            try:
+                self._index_fp.write("".join(self._index_buf))
+                self._index_buf = []
+                self._index_last_flush_mono = now
+            except OSError as e:
+                log.warning("index write failed: %s; closing index", e)
+                try:
+                    self._index_fp.close()
+                except OSError:
+                    pass
+                self._index_fp = None
+                self._index_path = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -207,6 +317,7 @@ class DataPortListener:
                 except OSError:
                     pass
                 self._record_fp = None
+            self._close_index_locked()
         log.info(
             "DataPortListener stopped (packets=%d bytes=%d drops_seq=%d drops_queue=%d)",
             self._packets_total, self._bytes_total,
@@ -289,8 +400,15 @@ class DataPortListener:
                 # work would be nicer for latency, but writes are tiny
                 # (~1.4 KB) and OS-buffered, so it's fine here.
                 if self._record_fp is not None:
+                    # Capture the byte_offset BEFORE writing so the
+                    # index row points at the start of this packet's
+                    # payload in the .bin (matches the spec's column
+                    # semantics: "offset where this packet's payload
+                    # begins").
+                    bin_offset = self._index_offset_bytes
                     try:
                         self._record_fp.write(payload)
+                        self._index_offset_bytes += payload_len
                     except OSError as e:
                         log.warning("record write failed: %s; closing file", e)
                         try:
@@ -298,6 +416,19 @@ class DataPortListener:
                         except OSError:
                             pass
                         self._record_fp = None
+                    else:
+                        # .bin write succeeded → emit one CSV row.
+                        # ``ts_host_ns`` per spec is monotonic_ns; the
+                        # rest of the listener uses time.time() for
+                        # wall-clock stats, but seek/scrub semantics
+                        # need a monotonic reference.
+                        self._index_record(
+                            ts_host_ns=time.monotonic_ns(),
+                            byte_offset=bin_offset,
+                            payload_len=payload_len,
+                            seq=seq,
+                            chunk_offset=byte_count,
+                        )
 
     # ─────────────────────── stats ─────────────────────────────────────────
     def stats(self) -> DataPortStats:
