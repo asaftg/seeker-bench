@@ -1,0 +1,69 @@
+V1.0.0 PyInstaller dist build — autonomous run
+===============================================
+
+Started:  2026-04-29 23:13:08 PDT
+Finished: 2026-04-29 23:17 PDT (~4 minutes)
+Exit:     0  (success)
+
+Artifact
+--------
+  dist/seeker_bench/seeker_bench.exe       49,411,107 bytes
+  dist/seeker_bench/_internal/             ~5.1 GB total
+
+Bundled (verified by ls):
+  _internal/gui/static/  index.html, css/, js/   ← GUI assets present
+  _internal/config/      app_config.yaml, calibration.json, radar_modes.json
+  _internal/models/      seeker_thermal.pt, seeker_thermal_hv.pt,
+                         seeker_eo_v2.pt, seeker_eo_v3.pt,
+                         yolov8n.pt
+  + torch, ultralytics, opencv, fastapi, pyserial, numpy, scipy,
+    pyyaml, websockets, all pinned per requirements.txt.
+
+Environment
+-----------
+  Python    3.11.9
+  PyInstaller 6.19.0
+  Spec      seeker_bench.spec (unchanged from repo)
+  Build cmd python -m PyInstaller seeker_bench.spec --noconfirm --clean
+  Logs      /tmp/v1.0.0_build.log (full PyInstaller transcript)
+
+Distribution instructions
+-------------------------
+The dist is a folder distribution. To deploy on a new Windows
+laptop:
+
+  1. Copy the entire dist/seeker_bench/ folder (~5 GB).
+  2. Double-click seeker_bench.exe.
+  3. The browser opens to http://localhost:8080.
+
+The .exe keeps a console window open by default so crashes are
+visible. Set console=False in seeker_bench.spec once stable for
+production.
+
+Models can be hot-swapped without rebuilding: drop new .pt files
+into dist/seeker_bench/_internal/models/ and restart the .exe.
+
+Jetson port note
+----------------
+This dist is Windows-x64 only. The Jetson Xavier AGX port does NOT
+use PyInstaller — it builds from source on-device per the README §
+"Edge device deployment" (venv + systemd). The v1.0.0 git tag is
+the immutable starting point for that port.
+
+Smoke check (post-build, NOT run by autonomous script)
+------------------------------------------------------
+The autonomous run did NOT execute the .exe — that would open the
+GUI on localhost:8080 and try to enumerate USB sensors, which
+risks colliding with anything else live on the bench. The
+operator should manually confirm:
+
+  cd dist\seeker_bench
+  seeker_bench.exe
+  → browser opens to http://localhost:8080
+  → THERMAL pill turns green (or red if camera not plugged)
+
+If it crashes, the console window keeps the traceback visible.
+First place to check: the Boson camera detection path
+(thermal/boson_capture.py) — it's the only module that can fail
+to even import on a clean Windows machine if DSHOW behaves
+differently.
