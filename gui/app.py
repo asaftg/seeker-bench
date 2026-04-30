@@ -1071,6 +1071,40 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 path = rec.start(config_snapshot=cfg_snap)
                                 state["recording"] = True
                                 log.info("Recording → ON: %s", path)
+                                # Compute the prospective DCA bin path so
+                                # we can hand it to the meta writer. The
+                                # listener may or may not be present —
+                                # bin_path is only USED for recording if
+                                # the listener exists, but the meta file
+                                # always references the convention.
+                                _path_str = str(path)
+                                bin_path = _path_str.rsplit(".", 1)[0] + "_radar.bin"
+                                rm = app.state.radar_manager
+                                listener = getattr(rm, "_dca_listener", None)
+                                # Phase-3: write meta.yaml as a sibling
+                                # of the JSONL BEFORE emitting the
+                                # ``recording_started`` event so any
+                                # downstream consumer that watches that
+                                # event can read the meta immediately.
+                                # Failure here must NEVER block REC.
+                                meta_dca_bin = (
+                                    bin_path if listener is not None
+                                    and hasattr(listener, "recording_start")
+                                    else None
+                                )
+                                try:
+                                    from pathlib import Path as _P
+                                    from recording.meta_writer import write_meta
+                                    write_meta(
+                                        recording_dir=_P(path).parent,
+                                        jsonl_path=_P(path),
+                                        dca_bin_path=(_P(meta_dca_bin)
+                                                      if meta_dca_bin else None),
+                                        radar_manager=rm,
+                                        config_snapshot=cfg_snap or {},
+                                    )
+                                except Exception:
+                                    log.exception("meta.yaml write failed (non-fatal)")
                                 emit_event("recording_started",
                                            {"path": str(path)})
                                 # Also start the DCA raw-ADC .bin
@@ -1084,11 +1118,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 # for post-flight A/G / A/A
                                 # algorithm tuning.
                                 try:
-                                    rm = app.state.radar_manager
-                                    listener = getattr(rm, "_dca_listener", None)
                                     if listener is not None and hasattr(listener, "recording_start"):
-                                        bin_path = (str(path).rsplit(".", 1)[0]
-                                                    + "_radar.bin")
                                         listener.recording_start(bin_path)
                                         emit_event("dca_bin_recording_started",
                                                    {"path": bin_path})
@@ -1145,6 +1175,19 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                             os.rename(path, new_path)
                                             log.info("Recording renamed -> %s",
                                                      new_path)
+                                            # Phase-3: keep the meta
+                                            # sibling paired with the
+                                            # JSONL. Same dedup logic
+                                            # as the JSONL above.
+                                            try:
+                                                from pathlib import Path as _P
+                                                from recording.meta_writer import (
+                                                    rename_meta_alongside)
+                                                rename_meta_alongside(
+                                                    _P(path), _P(new_path))
+                                            except Exception:
+                                                log.exception(
+                                                    "meta rename failed (non-fatal)")
                                             try:
                                                 await ws.send_json({
                                                     "event": "recording_renamed",
