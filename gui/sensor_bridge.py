@@ -322,6 +322,7 @@ def radar_to_wire(
     radar_az_bias_deg: float = 0.0,
     radar_el_bias_deg: float = 0.0,
     fused_id_by_radar: Optional[dict] = None,
+    radar_aa_frame: Optional[RadarFrame] = None,
 ) -> Dict[str, Any]:
     """Serialize a RadarFrame for the WebSocket.
 
@@ -336,6 +337,50 @@ def radar_to_wire(
     capped.
     """
     if rf is None or not rf.connected:
+        # Stock TLV is offline. If the Phase 3 raw-ADC pipeline is
+        # alive (LVDS still flowing even when TLV stalled), surface
+        # its targets through the same radar payload so the operator
+        # still sees A/A hits in the radar canvas. We synthesize a
+        # minimal RadarFrame-shaped wire dict here. Fields not
+        # populated by the AA pipeline (num_points, profile from Stock)
+        # fall back to safe defaults.
+        if (radar_aa_frame is not None
+                and getattr(radar_aa_frame, "connected", False)):
+            aa_targets = []
+            for t in radar_aa_frame.targets:
+                aa_targets.append({
+                    "tid": int(t.tid) + 100000,
+                    "fused_id": None,
+                    "x": round(t.pos_x_m, 3),
+                    "y": round(t.pos_y_m, 3),
+                    "z": round(t.pos_z_m, 3),
+                    "vx": round(t.vel_x_mps, 2),
+                    "vy": round(t.vel_y_mps, 2),
+                    "vz": round(t.vel_z_mps, 2),
+                    "sx": round(t.size_x_m, 2),
+                    "sy": round(t.size_y_m, 2),
+                    "sz": round(t.size_z_m, 2),
+                    "conf": round(float(t.confidence), 2),
+                    "src": t.source,
+                    "np": int(t.num_points),
+                    "coasting": bool(t.coasting),
+                    "hits": int(t.hits),
+                    "misses": int(t.misses),
+                    "class": "drone" if t.source == "pmm" else "radar_detection",
+                })
+            return {
+                "connected": True,    # raw-ADC IS connected
+                "frame_id": radar_aa_frame.frame_id,
+                "timestamp": radar_aa_frame.timestamp,
+                "profile": radar_aa_frame.profile or "awr2944p_unified",
+                "max_range_m": radar_aa_frame.max_range_m,
+                "fov_half_deg": radar_aa_frame.fov_half_deg,
+                "num_points": 0,
+                "num_targets": len(aa_targets),
+                "points": [],
+                "targets": aa_targets,
+                "detections": [],
+            }
         return {
             "connected": False,
             "frame_id": rf.frame_id if rf is not None else 0,
@@ -411,6 +456,51 @@ def radar_to_wire(
             "misses": int(t.misses),
             "class": "radar_detection",
         })
+
+    # Merge raw-ADC overlay (Phase 3 A/A and A/G output). Only present
+    # when the operator is in mode=aa AND the DCAPipeline is alive.
+    # We tag the merged targets with src="pmm" / src="ag" so the
+    # frontend can color/label them differently from Stock TLV
+    # targets (src="dbscan"). Range/angle/velocity fields are the
+    # same shape so radar_view.js renders them identically.
+    if (radar_aa_frame is not None
+            and getattr(radar_aa_frame, "connected", False)):
+        for t in radar_aa_frame.targets:
+            targets_wire.append({
+                "tid": int(t.tid) + 100000,   # offset to avoid clash with Stock tids
+                "fused_id": None,
+                "x": round(t.pos_x_m, 3),
+                "y": round(t.pos_y_m, 3),
+                "z": round(t.pos_z_m, 3),
+                "vx": round(t.vel_x_mps, 2),
+                "vy": round(t.vel_y_mps, 2),
+                "vz": round(t.vel_z_mps, 2),
+                "sx": round(t.size_x_m, 2),
+                "sy": round(t.size_y_m, 2),
+                "sz": round(t.size_z_m, 2),
+                "conf": round(float(t.confidence), 2),
+                "src": t.source,           # "pmm" for A/A, "ag" for A/G
+                "np": int(t.num_points),
+                "coasting": bool(t.coasting),
+                "hits": int(t.hits),
+                "misses": int(t.misses),
+                "class": "drone" if t.source == "pmm" else "radar_detection",
+            })
+        # A/G additionally puts CFAR detection points into .detections;
+        # surface them so the operator sees the raw range/azimuth
+        # picture, not just clustered targets.
+        for d in radar_aa_frame.detections[:max_points]:
+            points_wire.append({
+                "x": round(d.x_m, 3),
+                "y": round(d.y_m, 3),
+                "z": round(d.z_m, 3),
+                "v": round(d.doppler_mps, 2),
+                "snr": round(float(d.snr_db), 1),
+                "r": round(d.range_m, 2),
+                "az": round(d.az_deg, 1),
+                "el": round(d.el_deg, 1),
+                "tid": int(d.target_id),
+            })
 
     return {
         "connected": True,
@@ -798,6 +888,12 @@ def build_ws_message(
             radar_az_bias_deg=radar_az_bias_deg,
             radar_el_bias_deg=radar_el_bias_deg,
             fused_id_by_radar=radar_to_fused,
+            # Phase 3 raw-ADC overlay. Merges PMM (A/A) hits and
+            # A/G CFAR detections from radar_dca.DCAPipeline into
+            # the same wire payload so the existing radar canvas
+            # renders both. Pipeline only publishes when mode==aa,
+            # so in stock+ag this is None and adds nothing.
+            radar_aa_frame=BUS.get_latest(Topic.RADAR_AA),
         ),
         "fused": fused_wire,
         "tracks": [],

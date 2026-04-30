@@ -123,6 +123,39 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
     def health():
         return {"status": "ok"}
 
+    @app.post("/api/radar/kick_lvds")
+    def post_kick_lvds():
+        """Force a LVDS restart by issuing sensorStop + sensorStart 0
+        through RadarManager's CLI port. Use when /aa_diagnostics
+        shows ``udp.last_packet_age_s`` climbing despite mode=aa —
+        i.e. the chip's LVDS DMA halted but TLV is still alive.
+
+        Bypasses the reconnect watchdog (which only triggers on TLV
+        stall, not LVDS stall) so the chip's raw-ADC stream comes
+        back without waiting for the 3 s TLV timeout to fire.
+
+        Returns the CLI's response strings so the caller can see
+        whether the chip ack'd the kick."""
+        rm = app.state.radar_manager
+        # CompositeRadarBackend forwards via __getattr__; works either way.
+        if rm is None or not hasattr(rm, "kick_lvds"):
+            return Response(
+                content=json.dumps({"ok": False, "error": "no radar / no kick_lvds"}),
+                media_type="application/json",
+            )
+        try:
+            result = rm.kick_lvds()
+            return Response(
+                content=json.dumps({"ok": True, **result}),
+                media_type="application/json",
+            )
+        except Exception as e:
+            log.exception("kick_lvds failed")
+            return Response(
+                content=json.dumps({"ok": False, "error": repr(e)}),
+                media_type="application/json",
+            )
+
     @app.get("/api/radar/aa_diagnostics")
     def get_aa_diagnostics():
         """Surface the full A/A chain status as JSON so the operator

@@ -75,7 +75,7 @@ def detect_pmm(
     prf_hz: float,
     band_low_hz: float = 50.0,
     band_high_hz: float = 500.0,
-    threshold_db: float = 12.0,
+    threshold_db: float = 18.0,
 ) -> PMMResult:
     """Run PMM detection on a 1-D slow-time slice at one range bin.
 
@@ -93,12 +93,13 @@ def detect_pmm(
         when aliased into Nyquist; Shahed-class ~150–250 Hz un-aliased).
     threshold_db : float
         Peak-to-noise-floor ratio above which we declare detection.
-        Default 12 dB — pure-noise statistics of "best score over
-        ~340 candidate offsets" land around +6 dB by chance, so a
-        threshold below ~10 dB will produce ~50 % false alarm rate
-        per range bin (we saw 45 % at threshold=3 dB in the field).
-        Real propeller signatures land at +20–40 dB, so 12 dB
-        gives a wide margin without rejecting real drones.
+        Default 18 dB. Field test 2026-04-29 (live drill rig)
+        showed 12 dB still produced 40-65 false alarms per frame
+        at delta=6 (52.7 Hz Hann main-lobe leakage). After bumping
+        HANN_GUARD_BINS from 4 to 8 to suppress leakage entirely,
+        the remaining floor is the pure-noise "best of ~340 random
+        offsets" statistic which peaks around +12 dB; 18 dB gives
+        a 6 dB margin. Real propeller signatures land at +25-40 dB.
         Tunable via the GUI slider in production.
 
     Returns
@@ -141,18 +142,23 @@ def detect_pmm(
     #
     # IMPORTANT — Hann main-lobe guard. The Hann window we applied at
     # step 2 has a main lobe ~2 FFT bins wide on each side of any
-    # tone (and a first sidelobe at -31 dB ~3 bins out). A strong
-    # body-Doppler return therefore SPILLS into delta ∈ {±1..±3}
-    # via window leakage, producing what looks like a symmetric
-    # sideband pair on EVERY bright range bin — even pure body-tone
-    # returns with no propeller. We saw this in practice: a brick
-    # wall at 250 m produced "blade rate 17.5 Hz" detections on
-    # every frame because 17.5 Hz = 2 bins at our 8.78 Hz/bin
-    # resolution. Force delta_min ≥ HANN_GUARD_BINS to skip that
-    # leakage region. The cost is we can't detect blade rates
-    # below ~4 × bin_hz (35 Hz at our cfg), which is well below
-    # any real propeller anyway.
-    HANN_GUARD_BINS = 4
+    # tone, with first sidelobe at -31 dB about 3 bins out. A strong
+    # body-Doppler return SPILLS into delta ∈ {±1..±7} via main-lobe
+    # leakage, producing phantom symmetric "sideband pairs" on every
+    # bright range bin even when there's no propeller present.
+    #
+    # Field test 2026-04-29 (live drill rig): with guard=4 the
+    # detector locked onto delta=6 (52.7 Hz) on basically every
+    # range bin, regardless of whether the drill was on or off,
+    # producing ~40-65 false alarms per frame. Bumping guard to 8
+    # cuts off the leakage region completely.
+    #
+    # Cost: minimum detectable blade rate becomes 8 × bin_hz (~70 Hz
+    # at our 8.78 Hz/bin = 768-chirp slow time). DJI Mavic-class
+    # blade-pass is ~217 Hz, FPV racers ~2.5 kHz; 70 Hz floor is
+    # well below any real-drone signature. Slow rotors (windmills,
+    # ceiling fans) won't be detected — that's a feature, not a bug.
+    HANN_GUARD_BINS = 8
     delta_min = max(HANN_GUARD_BINS, int(round(band_low_hz / bin_hz)))
     delta_max = min(n_fft // 2 - 1, int(round(band_high_hz / bin_hz)))
     if delta_min >= delta_max:
@@ -210,7 +216,7 @@ def scan_range_bins(
     *,
     band_low_hz: float = 50.0,
     band_high_hz: float = 500.0,
-    threshold_db: float = 12.0,
+    threshold_db: float = 18.0,
 ) -> List[Tuple[int, PMMResult]]:
     """Run ``detect_pmm`` on every range bin of a (n_range, n_chirps)
     slow-time matrix. Returns ``[(range_bin_idx, PMMResult), ...]``

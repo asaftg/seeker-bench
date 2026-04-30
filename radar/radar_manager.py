@@ -329,6 +329,45 @@ class RadarManager:
             log.warning("Could not open CLI port %s: %s", self.cli_port, e)
             return False
 
+    # ─────────────────────── chip kick (LVDS recovery) ─────────────────
+    def kick_lvds(self) -> dict:
+        """Force the AWR to re-start streaming via sensorStop +
+        sensorStart 0 over the CLI UART. Used when LVDS halts but
+        TLV is still alive — there's no TLV-based watchdog event
+        to trigger automatic recovery, so the operator (or the
+        DCAPipeline stall watchdog) can call this directly.
+
+        Locks against the capture-loop's CLI access by closing the
+        normal CLI port for the duration. Returns the CLI's
+        responses so the caller can see whether the chip ack'd.
+        """
+        out: dict = {"sensorStop": None, "sensorStart_0": None}
+        try:
+            with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
+                # sensorStop is idempotent from any state; clears the
+                # chip's LVDS DMA and frame counters.
+                resp_stop = self._cli_send(ser, "sensorStop", wait_s=1.0)
+                out["sensorStop"] = resp_stop.strip()
+                time.sleep(0.1)
+                # sensorStart 0 resumes the previously-loaded profile
+                # (the unified.cfg we pushed at boot, including the
+                # lvdsStreamCfg line). Same call that brings the chip
+                # up cleanly at startup — see _push_profile docstring.
+                resp_start = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
+                out["sensorStart_0"] = resp_start.strip()
+                if "Done" not in resp_start:
+                    out["ok"] = False
+                    log.warning("kick_lvds: sensorStart 0 did not ack: %r",
+                                resp_start.strip())
+                    return out
+            log.info("kick_lvds: chip kicked (sensorStop + sensorStart 0)")
+            return out
+        except serial.SerialException as e:
+            log.warning("kick_lvds: could not open CLI port %s: %s",
+                        self.cli_port, e)
+            out["error"] = str(e)
+            return out
+
     def _open_data_port(self) -> bool:
         try:
             # Short read timeout so the capture loop can stay responsive

@@ -16,7 +16,7 @@
     "cluster_min_samples": 4,
     "pmm_band_low_hz": 50,
     "pmm_band_high_hz": 500,
-    "pmm_threshold_db": 12,
+    "pmm_threshold_db": 18,
     "pmm_slow_time_win": 256,
     "staggered_prf": false
   },
