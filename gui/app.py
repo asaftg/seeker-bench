@@ -1119,6 +1119,42 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 # algorithm tuning.
                                 try:
                                     if listener is not None and hasattr(listener, "recording_start"):
+                                        # Auto-kick LVDS BEFORE opening the
+                                        # .bin file. Field test 2026-04-30:
+                                        # the user pressed REC after LVDS
+                                        # had silently halted (chip was on
+                                        # TLV-only) and got a 0-byte .bin
+                                        # for a 150 s drone run — full
+                                        # session lost. Now: if the
+                                        # listener saw nothing in the last
+                                        # second, kick the chip so the
+                                        # recording captures real data.
+                                        try:
+                                            ds = listener.stats()
+                                            age = ds.last_packet_age_s
+                                            need_kick = (age == float("inf")
+                                                         or age > 1.0)
+                                        except Exception:
+                                            need_kick = True
+                                        if need_kick and rm is not None and hasattr(rm, "kick_lvds"):
+                                            log.warning(
+                                                "REC start: LVDS stalled "
+                                                "(last_packet_age=%s s); "
+                                                "auto-kicking chip before "
+                                                "opening .bin",
+                                                getattr(ds, "last_packet_age_s", "?"),
+                                            )
+                                            try:
+                                                rm.kick_lvds()
+                                                # Give the chip ~200 ms
+                                                # to start emitting before
+                                                # we open the file — so
+                                                # the first writes hit
+                                                # actual data.
+                                                import time as _t
+                                                _t.sleep(0.2)
+                                            except Exception:
+                                                log.exception("auto-kick at REC start failed (continuing anyway)")
                                         listener.recording_start(bin_path)
                                         emit_event("dca_bin_recording_started",
                                                    {"path": bin_path})

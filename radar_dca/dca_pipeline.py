@@ -262,6 +262,11 @@ class DCAPipeline:
         self.profile_name = profile_name
         self.max_range_m = float(max_range_m)
         self.az_half_deg = float(az_half_deg)
+        # Optional back-reference to the RadarManager so the LVDS
+        # stall watchdog can issue sensorStop + sensorStart 0 over
+        # the radar CLI without a callback through composite. Set
+        # by CompositeRadarBackend at construction time.
+        self._radar_manager_ref = None
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -340,13 +345,21 @@ class DCAPipeline:
         """
         bpf = self._dims.bytes_per_frame
         TICK_S = 0.020
-        # LVDS stall watchdog. If the listener has been packet-silent
-        # for this long, log ONCE per stall — chip-side problems
-        # (FPGA timeout, AWR LVDS shutdown, cable yanked) are
-        # invisible otherwise: TLV keeps working over UART so the
-        # other manager looks healthy.
+        # LVDS stall watchdog. Two-stage:
+        #   STALL_WARN_S  — log a warning once per stall.
+        #   STALL_KICK_S  — auto-issue sensorStop + sensorStart 0
+        #                   over the radar CLI to wake the chip's
+        #                   DMA. The kick is rate-limited to one
+        #                   per STALL_KICK_COOLDOWN_S so a truly
+        #                   dead chip doesn't get hammered.
+        # Field test 2026-04-30: drone fly-by run 150 s long
+        # captured 0 bytes of raw-ADC because LVDS halted between
+        # cfg push and REC button. Auto-kick prevents that.
         STALL_WARN_S = 5.0
+        STALL_KICK_S = 8.0
+        STALL_KICK_COOLDOWN_S = 12.0
         _stall_logged = False
+        _last_kick_t = 0.0
 
         while not self._stop.is_set():
             # 1. Pull all queued payloads from the listener.
@@ -369,11 +382,27 @@ class DCAPipeline:
                     if not _stall_logged:
                         log.warning(
                             "LVDS stalled: no UDP for %.1fs (chip stopped "
-                            "streaming?) — power-cycle the AWR if this "
-                            "persists. packets_total=%d seq_drops=%d",
-                            age, ds.packets_total, ds.seq_drops_total,
+                            "streaming?). Will attempt sensorStart 0 kick "
+                            "in %.0f s. packets_total=%d seq_drops=%d",
+                            age, STALL_KICK_S - STALL_WARN_S,
+                            ds.packets_total, ds.seq_drops_total,
                         )
                         _stall_logged = True
+                    # Auto-kick the chip's CLI. radar_manager exposes
+                    # kick_lvds() — that issues sensorStop + sensorStart 0
+                    # over COM11. Rate-limited so we don't spam if the
+                    # kick itself doesn't bring the chip back.
+                    now = time.monotonic()
+                    if (age > STALL_KICK_S
+                            and now - _last_kick_t > STALL_KICK_COOLDOWN_S
+                            and self._radar_manager_ref is not None
+                            and hasattr(self._radar_manager_ref, "kick_lvds")):
+                        log.info("LVDS auto-kick: issuing sensorStop+sensorStart 0")
+                        try:
+                            self._radar_manager_ref.kick_lvds()
+                            _last_kick_t = now
+                        except Exception:
+                            log.exception("LVDS auto-kick raised")
                 else:
                     if _stall_logged and age < 0.5:
                         log.info("LVDS recovered (last_packet_age=%.2fs)", age)

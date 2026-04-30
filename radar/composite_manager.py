@@ -106,6 +106,13 @@ class CompositeRadarBackend:
         if self._mode not in _MODE_FILTERS:
             self._mode = "stock"
         self._lock = threading.RLock()
+        # Hand the pipeline a back-ref to the RadarManager so its
+        # LVDS stall watchdog can call kick_lvds() directly,
+        # closing the auto-recovery loop without going through
+        # this object. Set unconditionally — pipeline checks for
+        # None before using.
+        if self._dca_pipeline is not None:
+            self._dca_pipeline._radar_manager_ref = self._radar
 
     # ─────────────────────── pass-through attributes ────────────────────
     @property
