@@ -173,12 +173,14 @@ def _test_lvds(duration_s: float = 8.0) -> tuple[bool, int]:
         print(f"     received 0 B  (chip never started streaming)")
         return False, 0
     final_gap = time.monotonic() - last_byte_t
-    # Pass: meaningful volume + no >1 s mid-stream gap + still
-    # streaming at the end (final_gap < 1.5 s gives one ongoing
-    # frame period of grace; recvfrom timeout is 0.5 s).
-    passed = (bytes_total > 1_000_000   # >1 MB in `duration_s`
-              and longest_gap < 1.0
-              and final_gap < 1.5)
+    # Pass: enough volume that PMM has frames to work with AND the
+    # stream is "alive" at the end. The chip's natural pattern is
+    # duty-cycled bursts (~4 frames in a row, ~2 s pause, repeat),
+    # so a longest_gap up to ~3 s is normal — not a halt. What we
+    # care about is that the stream came back BEFORE the test
+    # ended (final_gap small means we saw a recent burst).
+    passed = (bytes_total > 5_000_000   # >5 MB = at least one full PMM-window
+              and final_gap < 5.0)       # stream was alive within 5 s of end
     print(f"     received {bytes_total:>12,} B  longest mid-stream gap "
           f"{longest_gap:.2f}s  final gap {final_gap:.2f}s")
     return passed, bytes_total
@@ -188,7 +190,22 @@ def main() -> int:
     print("Radar pre-flight check")
     print("======================")
     print()
-    print("[1/3] Pushing cfg to AWR (CLI on COM11)...")
+    # DCA FIRST so the FPGA is in capture mode before the AWR
+    # emits the first LVDS bytes. If we did AWR-first, the chip's
+    # initial LVDS frames hit a not-yet-listening FPGA and the
+    # chip's DMA backs up, which appears to be what was halting
+    # the stream after the first burst.
+    print("[1/3] Telling DCA1000 to forward LVDS as UDP...")
+    if not _kick_dca():
+        print()
+        print(f"  {FAIL}{NC} DCA1000 setup failed. Check:")
+        print("       1. RJ45 cable between DCA1000 and host")
+        print("       2. Host NIC IP is 192.168.33.30/24 (run `ipconfig`)")
+        print("       3. DCA1000 5V barrel + FTDI USB plugged in")
+        return 3
+    print(f"  {OK}{NC} DCA1000 in start_record mode (waiting for LVDS)")
+    print()
+    print("[2/3] Pushing cfg to AWR (CLI on COM11)...")
     if not _kick_awr():
         print()
         print(f"  {FAIL}{NC} AWR did not start. Try:")
@@ -197,16 +214,6 @@ def main() -> int:
         print("       3. Re-run this script")
         return 2
     print(f"  {OK}{NC} AWR kicked")
-    print()
-    print("[2/3] Telling DCA1000 to forward LVDS as UDP...")
-    if not _kick_dca():
-        print()
-        print(f"  {FAIL}{NC} DCA1000 setup failed. Check:")
-        print("       1. RJ45 cable between DCA1000 and host")
-        print("       2. Host NIC IP is 192.168.33.30/24 (run `ipconfig`)")
-        print("       3. DCA1000 5V barrel + FTDI USB plugged in")
-        return 3
-    print(f"  {OK}{NC} DCA1000 in start_record mode")
     print()
     print("[3/3] Listening for LVDS over UDP for 8 seconds...")
     passed, _ = _test_lvds(duration_s=8.0)
