@@ -40,17 +40,38 @@ def main() -> None:
     print(f"[1/3] pushing {CFG_PATH} on {CLI_PORT}@{CLI_BAUD}…")
     with serial.Serial(CLI_PORT, CLI_BAUD, timeout=0.5) as cli:
         responses = send_cfg(cli, CFG_PATH)
-    last_resp = (responses[-1] if responses else "").strip().splitlines()[-1] \
-        if responses else ""
+    last_resp = (responses[-1] if responses else "")
     print(f"      cfg-push final response: {last_resp!r}")
-    if "Error" in last_resp and "Invalid" in last_resp:
-        print("      (chip wasn't in INIT — sending sensorStart 0 as recovery)")
+
+    # ANY error on the final line means sensorStart was rejected. Most
+    # commonly that's "Invalid Sensor Start" because the chip wasn't in
+    # INIT (it was in STOPPED from a previous run). Recover with
+    # sensorStart 0, which resumes the just-loaded profile from STOPPED.
+    # We catch this BEFORE checking the specific error string because
+    # the firmware's response is sometimes truncated mid-word over UART
+    # ("Error: Inva..." instead of "Error: Invalid Sensor Start").
+    if "Error" in last_resp or "error" in last_resp:
+        print("      sensorStart was rejected — sending `sensorStart 0` as recovery")
         with serial.Serial(CLI_PORT, CLI_BAUD, timeout=0.5) as cli:
+            cli.reset_input_buffer()
             cli.write(b"sensorStart 0\n")
             cli.flush()
-            time.sleep(0.5)
-            print("      sensorStart 0 ACK:",
-                  cli.read(cli.in_waiting or 0).decode("ascii", errors="replace").strip())
+            # Read until "Done" or "Error", up to 2 s.
+            deadline = time.monotonic() + 2.0
+            buf = bytearray()
+            while time.monotonic() < deadline:
+                n = cli.in_waiting
+                if n:
+                    buf.extend(cli.read(n))
+                    if b"Done" in buf or b"Error" in buf:
+                        break
+                else:
+                    time.sleep(0.05)
+            ack = buf.decode("ascii", errors="replace").strip()
+            print(f"      sensorStart 0 response: {ack!r}")
+            if "Done" not in ack:
+                print("      WARNING: sensorStart 0 also failed. Chip likely needs power-cycle.")
+                return
 
     print(f"[2/3] opening data port {DATA_PORT}@{DATA_BAUD}, reading "
           f"{args.duration:.0f} s…")

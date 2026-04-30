@@ -269,46 +269,30 @@ class RadarManager:
     def _push_profile(self) -> bool:
         """Open CLI UART, bring sensor to STARTED, close. True on success.
 
-        TI's ``mmw_demoDDM`` has an asymmetric state machine for the
-        ``sensorStart`` command:
+        Field test 2026-04-29 nailed down a chip-firmware quirk in
+        ``mmw_demoDDM`` (SDK 4.7.2.1): the ``sensorStart`` command
+        when issued FROM STATE INIT accepts the command and emits a
+        few TLV frames, then silently halts. The same chip emits
+        continuous data at 49 KB/s for 30 s when started with
+        ``sensorStart 0`` instead. Verified by ``scripts/radar_raw_test.py``.
 
-          - From state INIT (0)         → ``sensorStart`` is accepted.
-                                           Used after a chip power-cycle
-                                           or after we explicitly
-                                           ``flushCfg``.
-          - From state STOPPED (3)      → ``sensorStart 0`` is accepted
-                                           (resumes the previously-loaded
-                                           profile WITHOUT a re-cfg).
-                                           Plain ``sensorStart`` is
-                                           rejected with "Invalid Sensor
-                                           Start".
-          - From state STARTED (2)      → must ``sensorStop`` first.
+        So the boot sequence we use is:
 
-        Decision tree:
+          1. Read sensor state.
+          2. If state is INIT (0)  →  push full cfg. The cfg ends in
+             ``sensorStart`` which the firmware rejects with "Invalid
+             Sensor Start" because the cfg's own ``sensorStop`` +
+             ``flushCfg`` lines moved the chip out of INIT before the
+             final line ran. We CATCH that expected error and follow
+             up with ``sensorStart 0`` — same warm-restart code path
+             the test script uses, which we know works.
+          2'. If state is STARTED → ``sensorStop`` then ``sensorStart 0``.
+          2''. If state is STOPPED → ``sensorStart 0`` directly.
 
-          - ``state == 0`` (INIT) or ``state is None`` (chip booting)
-              → push the full cfg (which ends in ``sensorStart``).
-                Cost: ~1.5 s of UART. Necessary because the chip
-                lost its profile on the way to INIT.
-
-          - ``state == 2`` (STARTED)
-              → ``sensorStop`` then ``sensorStart 0``. The chip kept
-                its profile, so we don't need to re-push 24 lines.
-                Cost: ~0.4 s. THIS is the fast warm-restart path
-                that lets us recover quickly from a stream-timeout
-                without missing chip data.
-
-          - ``state == 3`` (STOPPED)
-              → ``sensorStart 0`` directly. ~0.2 s.
-
-        Field-tested 2026-04-29: this hybrid is what TI's docs
-        actually require. Always-pushing the cfg (an earlier
-        attempt) caused the chip to reset to INIT every reconnect,
-        making the 3 s watchdog cycle even worse.
-
-        If the operator edits unified.cfg they can power-cycle the
-        chip once to land in INIT — the next Seeker boot picks up
-        the change automatically.
+        Net effect: regardless of the chip's pre-boot state, we end
+        up taking the ``sensorStart 0`` path that the field test
+        proved works continuously. We never use plain ``sensorStart``
+        from INIT — that's the path that emits a few frames and dies.
         """
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
@@ -316,29 +300,24 @@ class RadarManager:
                 log.info("Radar CLI reports sensor state=%s", state)
 
                 if state in (0, None):
-                    # Fresh boot — push full profile (ends in sensorStart).
+                    # Fresh boot or unknown state — push the full
+                    # profile so the chip has our cfg loaded. The
+                    # final `sensorStart` line in the cfg WILL be
+                    # rejected (chip is no longer in INIT after the
+                    # cfg's own sensorStop+flushCfg moved it through
+                    # the state machine). That rejection is expected;
+                    # we recover with sensorStart 0 below.
                     responses = send_cfg(ser, self.cfg_path)
                     tail = responses[-1] if responses else ""
-                    if "Error" in tail or "error" in tail:
-                        # If the rejection was specifically "Invalid
-                        # Sensor Start" the chip secretly wasn't in
-                        # INIT after all (state read returned None
-                        # because the chip was mid-transition). Recover
-                        # with sensorStart 0.
-                        if "Invalid Sensor Start" in tail or "Invalid sensor start" in tail:
-                            log.info("sensorStart rejected; retrying with sensorStart 0")
-                            resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
-                            return "Done" in resp
-                        log.warning("Profile push failed on last line: %r", tail)
-                        return False
-                    return True
 
-                # Warm restart from STARTED or STOPPED. Don't re-push the
-                # 24-line cfg — it slows reconnects from ~0.3 s to ~2 s
-                # and the chip already has the same profile resident.
-                # If the operator edited unified.cfg, a power-cycle
-                # is the documented way to apply it.
-                if state == 2:  # STARTED
+                # Final step on every path: sensorStart 0. This is the
+                # ONLY sensorStart variant we trust on this firmware
+                # build. Skips the buggy INIT-time path even when
+                # state was 0 — even if the cfg's own sensorStart
+                # somehow succeeded, sensorStart 0 is a no-op-ish
+                # call (chip moves through STOPPED then back to
+                # STARTED) that lands us in the known-good state.
+                if state == 2:  # STARTED — must stop first
                     self._cli_send(ser, "sensorStop", wait_s=1.0)
                     time.sleep(0.05)
                 resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
