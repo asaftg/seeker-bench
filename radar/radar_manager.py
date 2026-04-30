@@ -103,6 +103,13 @@ class RadarManager:
         self._data_ser: Optional[serial.Serial] = None
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
+        # Mutex around CLI port (COM11) access. Without this, the
+        # capture loop's _push_profile and the DCAPipeline's auto-kick
+        # via kick_lvds() can both try to open COM11 at once →
+        # PermissionError on the loser, and worse: garbled UART writes
+        # if both opens (briefly) succeed. Held for the duration of a
+        # cfg push (~1.5 s) or a single command pair (~0.5 s).
+        self._cli_lock = threading.Lock()
 
     # ─────────────────────── live tuning ─────────────────────
     def set_tuning(
@@ -294,40 +301,56 @@ class RadarManager:
         proved works continuously. We never use plain ``sensorStart``
         from INIT — that's the path that emits a few frames and dies.
         """
+        def _ok(s: str) -> bool:
+            return ("Done" in s
+                    or "Init Calibration Status" in s
+                    or "Calibration Status = 0x" in s)
+
+        # Block the auto-kick path from grabbing COM11 mid-push.
+        if not self._cli_lock.acquire(timeout=5.0):
+            log.warning("_push_profile: could not acquire CLI lock")
+            return False
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
                 state = self._query_sensor_state(ser)
                 log.info("Radar CLI reports sensor state=%s", state)
 
                 if state in (0, None):
-                    # Fresh boot or unknown state — push the full
-                    # profile so the chip has our cfg loaded. The
-                    # final `sensorStart` line in the cfg WILL be
-                    # rejected (chip is no longer in INIT after the
-                    # cfg's own sensorStop+flushCfg moved it through
-                    # the state machine). That rejection is expected;
-                    # we recover with sensorStart 0 below.
+                    # Fresh boot — push the full profile; the cfg's
+                    # final `sensorStart` from INIT is what starts
+                    # the chip. We do NOT issue another sensorStart 0
+                    # afterwards — that fails with "Invalid Sensor
+                    # Start" because the chip is already STARTED, and
+                    # was the bug that produced the 3 s reconnect
+                    # cycle in the field run on 2026-04-30.
                     responses = send_cfg(ser, self.cfg_path)
                     tail = responses[-1] if responses else ""
+                    if _ok(tail):
+                        return True
+                    if "Invalid Sensor Start" in tail or "Invalid sensor start" in tail:
+                        log.info("cfg sensorStart rejected; trying sensorStart 0")
+                        resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
+                        if _ok(resp):
+                            return True
+                        log.warning("sensorStart 0 did not ack: %r", resp.strip())
+                        return False
+                    log.warning("Profile push failed on last line: %r", tail)
+                    return False
 
-                # Final step on every path: sensorStart 0. This is the
-                # ONLY sensorStart variant we trust on this firmware
-                # build. Skips the buggy INIT-time path even when
-                # state was 0 — even if the cfg's own sensorStart
-                # somehow succeeded, sensorStart 0 is a no-op-ish
-                # call (chip moves through STOPPED then back to
-                # STARTED) that lands us in the known-good state.
+                # Warm restart: chip already configured, just toggle.
                 if state == 2:  # STARTED — must stop first
                     self._cli_send(ser, "sensorStop", wait_s=1.0)
                     time.sleep(0.05)
                 resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
-                if "Done" not in resp:
-                    log.warning("sensorStart 0 did not ack: %r", resp.strip())
-                    return False
-                return True
+                if _ok(resp):
+                    return True
+                log.warning("sensorStart 0 did not ack: %r", resp.strip())
+                return False
         except serial.SerialException as e:
             log.warning("Could not open CLI port %s: %s", self.cli_port, e)
             return False
+        finally:
+            self._cli_lock.release()
 
     # ─────────────────────── chip kick (LVDS recovery) ─────────────────
     def kick_lvds(self) -> dict:
@@ -342,6 +365,12 @@ class RadarManager:
         responses so the caller can see whether the chip ack'd.
         """
         out: dict = {"sensorStop": None, "sensorStart_0": None}
+        # Yield if _push_profile is busy. Don't block forever — if
+        # reconnect is busy and we're firing kicks, just skip this
+        # tick. The pipeline's stall watchdog will retry.
+        if not self._cli_lock.acquire(timeout=1.0):
+            out["error"] = "CLI busy (reconnect in progress)"
+            return out
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
                 # sensorStop is idempotent from any state; clears the
@@ -349,10 +378,7 @@ class RadarManager:
                 resp_stop = self._cli_send(ser, "sensorStop", wait_s=1.0)
                 out["sensorStop"] = resp_stop.strip()
                 time.sleep(0.1)
-                # sensorStart 0 resumes the previously-loaded profile
-                # (the unified.cfg we pushed at boot, including the
-                # lvdsStreamCfg line). Same call that brings the chip
-                # up cleanly at startup — see _push_profile docstring.
+                # sensorStart 0 resumes the previously-loaded profile.
                 resp_start = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
                 out["sensorStart_0"] = resp_start.strip()
                 if "Done" not in resp_start:
@@ -367,6 +393,8 @@ class RadarManager:
                         self.cli_port, e)
             out["error"] = str(e)
             return out
+        finally:
+            self._cli_lock.release()
 
     def _open_data_port(self) -> bool:
         try:
