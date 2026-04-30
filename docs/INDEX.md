@@ -9,6 +9,9 @@ Living documentation for the Seeker-01 bench. Living roadmap is
 |---|---|
 | [`NEXT.md`](NEXT.md) | Living roadmap. P0/P1 priorities + parked items. |
 | [`PHASE_3_DCA1000_PLAN.md`](PHASE_3_DCA1000_PLAN.md) | DCA1000 hardware, firmware, profile catalog, milestones. |
+| [`PHASE_3_AA_PROFILES.md`](PHASE_3_AA_PROFILES.md) | A/A radar profile catalog (AA-1..AA-5) + decision tree. |
+| [`PHASE_3_RECORDER_FIELDS.md`](PHASE_3_RECORDER_FIELDS.md) | Field-recording schema: meta.yaml + dca_index.csv + bus_*.jsonl. |
+| [`MORNING_HANDOFF.md`](MORNING_HANDOFF.md) | 2026-04-29 morning checkpoint — A/A architecture validated, PMM tuning open. |
 | [`PHASE_B_RESULTS.md`](PHASE_B_RESULTS.md) | Thermal H/V + drone classifier corpora, perf, open issues. |
 | [`EDGE_OPTIMIZATION_GAP.md`](EDGE_OPTIMIZATION_GAP.md) | Per-stage CPU cost map + lever order for the Jetson port. |
 | [`ID_NAMING_AUDIT.md`](ID_NAMING_AUDIT.md) | ID namespaces + phased fix plan (A→E). |
