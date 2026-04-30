@@ -302,7 +302,13 @@ export class RadarView {
     ctx.textBaseline = "bottom";
 
     for (const t of targets) {
-      const colour = TARGET_COLORS[((t.tid % TARGET_COLORS.length) + TARGET_COLORS.length) % TARGET_COLORS.length];
+      // PMM (A/A) targets get a fixed bright red so the operator can
+      // pick a drone out of a busy Stock TLV scene at a glance.
+      // Stock TLV targets stay color-cycled by tid like before.
+      const isDrone = (t.src === "pmm") || (t.class === "drone");
+      const colour = isDrone
+        ? "#ff3030"
+        : TARGET_COLORS[((t.tid % TARGET_COLORS.length) + TARGET_COLORS.length) % TARGET_COLORS.length];
       const { px, py, pxPerM } = this._worldToCanvas(t.x, t.y);
       const wpx = Math.max(6, 2 * t.sx * pxPerM);
       const hpx = Math.max(6, 2 * t.sy * pxPerM);
@@ -355,7 +361,14 @@ export class RadarView {
       const speed = Math.hypot(t.vx, t.vy);
       const range = Math.hypot(t.x, t.y);
       const suffix = coasting ? " · coast" : "";
-      const label = `${idPrefix}  ${speed.toFixed(1)} m/s · ${range.toFixed(0)} m${suffix}`;
+      // Phase 3: surface the radar-side class label when it's a PMM
+      // (drone) hit. Stock TLV continues to omit class — fusion still
+      // owns vehicle/human classification — but PMM IS a definitive
+      // drone source-of-truth at the radar layer (symmetric-sideband
+      // matched filter on slow-time), so flagging it here lets the
+      // operator see the drone immediately without waiting for fusion.
+      const classTag = isDrone ? " · DRONE" : "";
+      const label = `${idPrefix}  ${speed.toFixed(1)} m/s · ${range.toFixed(0)} m${suffix}${classTag}`;
       ctx.fillStyle = colour;
       ctx.fillText(label, px - wpx / 2 + 2 * dpr, py - hpx / 2 - 2 * dpr);
       ctx.globalAlpha = 1.0;

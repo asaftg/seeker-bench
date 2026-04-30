@@ -256,6 +256,14 @@ class FusionManager:
         tf: Optional[ThermalFrame] = BUS.get_latest(Topic.THERMAL)
         ef: Optional[EOFrame] = BUS.get_latest(Topic.EO)
         rf: Optional[RadarFrame] = BUS.get_latest(Topic.RADAR)
+        # Phase 3: also pull the raw-ADC pipeline's frame so PMM
+        # (propeller-motion) hits get fused. PMM is a definitive
+        # drone classifier at the radar layer, so we tag those
+        # observations with TargetClass.DRONE — fusion then carries
+        # the class through to FusedTrack without needing EO/thermal
+        # agreement (which is what the FUSED-class promotion rule
+        # requires for vehicles/humans).
+        rf_aa: Optional[RadarFrame] = BUS.get_latest(Topic.RADAR_AA)
         # Snapshot the current gimbal pose so we can compensate
         # tracker-track az/el during matching. Without this, fusion
         # matches new observations to existing tracks in CAMERA frame
@@ -273,6 +281,7 @@ class FusionManager:
         thermal_obs = self._observations_from_thermal(tf)
         eo_obs = self._observations_from_eo(ef)
         radar_obs = self._observations_from_radar(rf)
+        radar_obs.extend(self._observations_from_radar_aa(rf_aa))
 
         # ── Cross-sensor association (EO primary) ──
         # Produce a list of "candidates" per tick. Each candidate is a
@@ -564,6 +573,54 @@ class FusionManager:
                 "conf": float(d.classification.confidence),
                 "thermal_heat_id": (int(heat_id)
                                     if heat_id is not None else None),
+                "_pose_pan": pose_pan,
+                "_pose_tilt": pose_tilt,
+            })
+        return out
+
+    def _observations_from_radar_aa(self, rf: Optional[RadarFrame]) -> list[dict]:
+        """Convert PMM (raw-ADC) targets into fusion observations
+        tagged with TargetClass.DRONE. Same shape as the Stock TLV
+        radar observation — angular pose + extent — but the class is
+        DRONE (not RADAR_TARGET sentinel) because PMM IS a definitive
+        drone classifier at the radar layer (symmetric-sideband
+        matched filter on slow-time, blade-pass-frequency match).
+
+        Effect: a fused track that picks up a PMM observation gets
+        promoted to class=DRONE without needing EO/thermal agreement.
+        That's what lets the operator see 'DRONE' in the top-5 list
+        when the camera can't resolve a small drone at 200 m."""
+        import math
+        if rf is None or not rf.connected:
+            return []
+        out = []
+        pose_pan = getattr(rf, "gimbal_pan_at_capture", None)
+        pose_tilt = getattr(rf, "gimbal_tilt_at_capture", None)
+        with self._ext_lock:
+            az_bias = self.radar_az_bias_deg
+            el_bias = self.radar_el_bias_deg
+        for t in rf.targets:
+            if getattr(t, "coasting", False):
+                continue
+            if t.pos_y_m <= 0.1:
+                continue
+            slant = math.sqrt(t.pos_x_m * t.pos_x_m
+                              + t.pos_y_m * t.pos_y_m
+                              + t.pos_z_m * t.pos_z_m)
+            if slant < 0.1:
+                continue
+            az = math.degrees(math.atan2(t.pos_x_m, t.pos_y_m)) + az_bias
+            el = math.degrees(math.atan2(
+                t.pos_z_m,
+                math.sqrt(t.pos_x_m * t.pos_x_m + t.pos_y_m * t.pos_y_m)
+            )) + el_bias
+            ang_w = max(0.4, math.degrees(2.0 * math.atan2(t.size_x_m, slant)))
+            ang_h = max(0.4, math.degrees(2.0 * math.atan2(t.size_z_m, slant)))
+            out.append({
+                "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
+                "class": TargetClass.DRONE.value,    # ← THE point of A/A
+                "conf": float(t.confidence),
+                "radar_tid": int(t.tid),
                 "_pose_pan": pose_pan,
                 "_pose_tilt": pose_tilt,
             })
