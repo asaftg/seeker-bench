@@ -167,36 +167,53 @@ class CompositeRadarBackend:
     # ─────────────────────── lifecycle ──────────────────────────────────
     def start(self) -> None:
         """Start the TLV path first (which pushes the unified cfg to
-        the chip — that's what enables raw-ADC streaming). Then bring
-        up the DCA control plane and start the raw-ADC consumer.
+        the chip — that's what enables raw-ADC streaming). DCA bring-up
+        comes BEFORE that so the FPGA is in capture mode when the
+        chip's first LVDS frames hit it.
+
+        Race condition that motivates the order (proven 2026-04-30):
+          - Old order was AWR cfg push first, then DCA setup.
+          - The chip starts emitting LVDS the instant `sensorStart`
+            ack lands (~ms after cfg push).
+          - The DCA setup (reset_fpga + setup_capture + start_record)
+            takes ~1 second; during that second the chip's LVDS
+            frames hit a not-yet-listening FPGA, the chip's internal
+            DMA backs up, and after ~one buffer's worth (8-30 s of
+            samples) ``mmw_demoDDM`` silently halts streaming with
+            no UART error. Recovery required a 12V power cycle.
+          - Fix: bring up DCA first, THEN push the cfg. Chip's first
+            LVDS frame finds the FPGA in start_record state and
+            forwards cleanly.
 
         Each subsystem failure is non-fatal: TLV alone is enough for
         stock + AG modes; AA is the only mode that needs DCA.
         """
-        # 1. RadarManager — pushes unified cfg to chip, starts TLV
-        # capture + processing threads. NEVER overwrites the YAML-loaded
-        # tuning sliders — Stock keeps the operator's saved values.
-        log.info("Composite: starting TLV path (RadarManager) ...")
-        self._radar.start()
-
-        # 2. DCA control plane — set up FPGA + start UDP recording.
-        # Best-effort; AA mode is unavailable if this fails.
+        # 1. DCA control plane FIRST. We want the FPGA in
+        #    start_record mode before the AWR pushes its first
+        #    LVDS frames (race condition — see docstring).
         if self._dca_control is not None and self._dca_pipeline is not None and self._dca_listener is not None:
             try:
-                log.info("Composite: configuring DCA1000 + starting raw-ADC capture ...")
+                log.info("Composite: bringing DCA1000 up BEFORE AWR cfg push ...")
                 self._dca_control.reset_fpga()
                 self._dca_control.setup_capture()
                 self._dca_control.start_record()
                 # Start the UDP listener and the host-side parsing pipeline.
                 self._dca_listener.start()
                 self._dca_pipeline.start()
-                log.info("Composite: raw-ADC path live (Topic.RADAR_AA)")
+                log.info("Composite: DCA1000 in capture mode (waiting for LVDS)")
             except DCAControlError as e:
                 log.warning("Composite: DCA setup failed (%s) — AA mode will be unavailable", e)
             except Exception as e:
                 log.exception("Composite: DCA setup raised — AA mode will be unavailable: %s", e)
         else:
             log.info("Composite: no DCA pipeline configured — AA mode unavailable")
+
+        # 2. NOW start RadarManager. Its capture loop pushes the
+        # unified cfg + sensorStart, which is when the AWR begins
+        # emitting LVDS into the now-ready FPGA.
+        log.info("Composite: starting TLV path + AWR cfg push (RadarManager) ...")
+        self._radar.start()
+        log.info("Composite: raw-ADC path live (Topic.RADAR_AA)")
 
     def stop(self) -> None:
         """Stop everything in reverse order. Each step is best-effort —
