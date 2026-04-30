@@ -17,12 +17,14 @@ import struct
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import serial
 
 # Make repo importable when run from the seeker_bench root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from radar.cfg_sender import send_cfg
+from radar_dca.dca_control import DCAControl, DCAControlError
 
 CLI_PORT = "COM11"
 DATA_PORT = "COM10"
@@ -36,41 +38,95 @@ FAIL = "\033[91m✗"
 NC = "\033[0m"
 
 
-def _kick_chip() -> bool:
-    """sensorStop + sensorStart 0 over CLI. Returns True if chip
-    ack'd both 'Done'. The push of the cfg ending in `sensorStart`
-    is what the chip's mmw_demoDDM build apparently can't sustain;
-    we use the warm-restart path that scripts/radar_raw_test.py
-    proved keeps streaming for 30+ s."""
+def _kick_awr() -> bool:
+    """Push cfg + ensure chip is STARTED. Returns True if chip ack'd.
+
+    Acceptance is permissive: the cfg's final `sensorStart` returns
+    one of several strings depending on chip state:
+      - `Done`                                    — clean INIT path
+      - `Debug: Init Calibration Status = 0x...`  — STARTED with
+                                                     calibration
+                                                     debug print
+      - `Error: Invalid Sensor Start`             — chip wasn't in
+                                                     INIT; needs
+                                                     `sensorStart 0`
+                                                     recovery
+
+    All three are progress; only the last needs follow-up. Anything
+    else (port busy, no ack, hardware fault) is a real failure.
+    """
+    def _ok(s: str) -> bool:
+        return ("Done" in s
+                or "Init Calibration Status" in s
+                or "Calibration Status = 0x" in s)
+
+    def _read_cli_ack(cli, wait_s: float) -> str:
+        deadline = time.monotonic() + wait_s
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            if cli.in_waiting:
+                buf.extend(cli.read(cli.in_waiting))
+                if (b"Done" in buf
+                        or b"Init Calibration Status" in buf
+                        or b"Error" in buf):
+                    break
+            else:
+                time.sleep(0.05)
+        return buf.decode("ascii", errors="replace").strip()
+
     try:
         with serial.Serial(CLI_PORT, CLI_BAUD, timeout=0.5) as cli:
-            # Push cfg first so the chip has the unified profile loaded.
             try:
                 responses = send_cfg(cli, CFG_PATH)
-                tail = responses[-1] if responses else ""
             except Exception as e:
                 print(f"  {FAIL}{NC} cfg push failed: {e}")
                 return False
-            cli.reset_input_buffer()
-            for cmd, wait in [("sensorStop", 1.0), ("sensorStart 0", 2.0)]:
-                cli.write((cmd + "\n").encode("ascii"))
+            tail = (responses[-1] if responses else "").strip()
+            if _ok(tail):
+                return True
+            if "Invalid" in tail or "Error" in tail:
+                cli.reset_input_buffer()
+                cli.write(b"sensorStart 0\n")
                 cli.flush()
-                deadline = time.monotonic() + wait
-                buf = bytearray()
-                while time.monotonic() < deadline:
-                    if cli.in_waiting:
-                        buf.extend(cli.read(cli.in_waiting))
-                        if b"Done" in buf or b"Error" in buf:
-                            break
-                    else:
-                        time.sleep(0.05)
-                if b"Done" not in buf:
-                    print(f"  {FAIL}{NC} {cmd!r} did not ack: "
-                          f"{buf.decode('ascii', errors='replace').strip()!r}")
-                    return False
-        return True
+                ack = _read_cli_ack(cli, 2.0)
+                if _ok(ack):
+                    return True
+                print(f"  {FAIL}{NC} sensorStart 0 ack: {ack!r}")
+                return False
+            print(f"  {FAIL}{NC} unexpected cfg-push tail: {tail!r}")
+            return False
     except serial.SerialException as e:
         print(f"  {FAIL}{NC} CLI port busy ({e}). Stop Seeker first.")
+        return False
+
+
+def _kick_dca() -> bool:
+    """Tell the DCA1000 to forward LVDS as UDP. Without this the
+    DCA's FPGA receives bytes from the AWR over the ribbon but
+    discards them — host sees zero UDP packets even though the AWR
+    is happily streaming. Returns True if all three steps succeeded.
+    """
+    ctrl = DCAControl(host_ip=HOST_IP, dca_ip="192.168.33.180",
+                      config_port=4096, data_port=DATA_UDP_PORT)
+    try:
+        # Stop any lingering capture from a prior preflight run.
+        # Without this, setup_capture errors with "Stop the already
+        # running process." on the second back-to-back preflight.
+        try:
+            ctrl.stop_record()
+        except Exception:
+            pass
+        time.sleep(0.2)
+        ctrl.reset_fpga()
+        time.sleep(0.2)
+        ctrl.setup_capture()
+        ctrl.start_record()
+        return True
+    except DCAControlError as e:
+        print(f"  {FAIL}{NC} DCA setup failed: {e}")
+        return False
+    except Exception as e:
+        print(f"  {FAIL}{NC} DCA setup unexpected error: {e}")
         return False
 
 
@@ -94,7 +150,7 @@ def _test_lvds(duration_s: float = 8.0) -> tuple[bool, int]:
     sock.settimeout(0.5)
 
     bytes_total = 0
-    last_byte_t = time.monotonic()
+    last_byte_t: Optional[float] = None  # type: ignore[name-defined]
     longest_gap = 0.0
     deadline = time.monotonic() + duration_s
 
@@ -103,17 +159,28 @@ def _test_lvds(duration_s: float = 8.0) -> tuple[bool, int]:
             data, _ = sock.recvfrom(16384)
             bytes_total += len(data)
             now = time.monotonic()
-            longest_gap = max(longest_gap, now - last_byte_t)
+            # Only measure inter-packet gaps AFTER the first packet
+            # arrives — the gap between "start listening" and "first
+            # packet" is just cfg-push startup latency, not a chip stall.
+            if last_byte_t is not None:
+                longest_gap = max(longest_gap, now - last_byte_t)
             last_byte_t = now
         except socket.timeout:
             continue
     sock.close()
+    if last_byte_t is None:
+        # Never received a single packet.
+        print(f"     received 0 B  (chip never started streaming)")
+        return False, 0
     final_gap = time.monotonic() - last_byte_t
-    passed = (bytes_total > 100_000   # at least ~100 KB in `duration_s`
+    # Pass: meaningful volume + no >1 s mid-stream gap + still
+    # streaming at the end (final_gap < 1.5 s gives one ongoing
+    # frame period of grace; recvfrom timeout is 0.5 s).
+    passed = (bytes_total > 1_000_000   # >1 MB in `duration_s`
               and longest_gap < 1.0
-              and final_gap < 1.0)
-    print(f"     received {bytes_total:>12,} B  longest gap {longest_gap:.2f}s  "
-          f"final gap {final_gap:.2f}s")
+              and final_gap < 1.5)
+    print(f"     received {bytes_total:>12,} B  longest mid-stream gap "
+          f"{longest_gap:.2f}s  final gap {final_gap:.2f}s")
     return passed, bytes_total
 
 
@@ -121,17 +188,27 @@ def main() -> int:
     print("Radar pre-flight check")
     print("======================")
     print()
-    print("[1/2] Kicking chip (cfg push + sensorStart 0)...")
-    if not _kick_chip():
+    print("[1/3] Pushing cfg to AWR (CLI on COM11)...")
+    if not _kick_awr():
         print()
-        print(f"  {FAIL}{NC} Chip did not respond. Try:")
+        print(f"  {FAIL}{NC} AWR did not start. Try:")
         print("       1. Confirm COM11 is the AWR XDS110 port")
         print("       2. Power-cycle the AWR (pull 12V, plug back)")
         print("       3. Re-run this script")
         return 2
-    print(f"  {OK}{NC} chip kicked")
+    print(f"  {OK}{NC} AWR kicked")
     print()
-    print("[2/2] Listening for LVDS for 8 seconds...")
+    print("[2/3] Telling DCA1000 to forward LVDS as UDP...")
+    if not _kick_dca():
+        print()
+        print(f"  {FAIL}{NC} DCA1000 setup failed. Check:")
+        print("       1. RJ45 cable between DCA1000 and host")
+        print("       2. Host NIC IP is 192.168.33.30/24 (run `ipconfig`)")
+        print("       3. DCA1000 5V barrel + FTDI USB plugged in")
+        return 3
+    print(f"  {OK}{NC} DCA1000 in start_record mode")
+    print()
+    print("[3/3] Listening for LVDS over UDP for 8 seconds...")
     passed, _ = _test_lvds(duration_s=8.0)
     print()
     if passed:
