@@ -106,12 +106,13 @@ class CompositeRadarBackend:
         if self._mode not in _MODE_FILTERS:
             self._mode = "stock"
         self._lock = threading.RLock()
-        # Hand the pipeline a back-ref to the RadarManager so its LVDS
-        # stall watchdog can call kick_lvds() directly. The chip on
-        # this firmware emits LVDS in bursts and halts; the kick
-        # (sensorStop + sensorStart 0) is the only way to resume.
+        # Hand the pipeline back-refs so its LVDS stall watchdog can
+        # do the FULL recovery dance: reset DCA FPGA + kick chip cfg.
+        # The chip on this firmware emits LVDS in bursts then halts;
+        # both sides need a reset to resume cleanly.
         if self._dca_pipeline is not None:
             self._dca_pipeline._radar_manager_ref = self._radar
+            self._dca_pipeline._dca_control_ref = self._dca_control
 
     # ─────────────────────── pass-through attributes ────────────────────
     @property

@@ -266,6 +266,10 @@ class DCAPipeline:
         # watchdog (in _loop) can call kick_lvds() to recover when
         # the chip's DMA halts. Set by CompositeRadarBackend.
         self._radar_manager_ref = None
+        # Optional back-ref to the DCAControl so the auto-kick can
+        # ALSO reset the DCA's FPGA when chip-side recovery alone
+        # isn't enough (DCA buffer flushed, start_record re-armed).
+        self._dca_control_ref = None
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -388,18 +392,45 @@ class DCAPipeline:
                             ds.packets_total, ds.seq_drops_total,
                         )
                         _stall_logged = True
-                    # Auto-kick the chip's CLI to recover. radar_manager
-                    # exposes kick_lvds() — issues sensorStop +
-                    # sensorStart 0 over COM11. Rate-limited so we
-                    # don't spam if the kick itself doesn't bring the
-                    # chip back (e.g., chip truly dead).
+                    # Auto-kick to recover. The chip on this firmware
+                    # halts LVDS DMA after a finite burst; the only
+                    # reliable recovery is to reset BOTH sides:
+                    #   1. DCA1000: stop_record → reset_fpga →
+                    #      setup_capture → start_record (flushes the
+                    #      FPGA's internal buffer and re-arms it).
+                    #   2. AWR chip: kick_lvds() (Stop+Start 0, then
+                    #      heavy-path full cfg re-push if needed).
+                    # Without resetting the DCA, the chip's restarted
+                    # LVDS frames hit a DCA in some stale state and
+                    # never make it onto the wire.
                     now_t = time.monotonic()
                     if (age > STALL_KICK_S
                             and now_t - _last_kick_t > STALL_KICK_COOLDOWN_S
                             and self._radar_manager_ref is not None
                             and hasattr(self._radar_manager_ref, "kick_lvds")):
-                        log.info("LVDS auto-kick: issuing sensorStop+sensorStart 0")
+                        log.info("LVDS auto-kick: resetting DCA FPGA + "
+                                 "kicking chip")
                         try:
+                            # 1. Reset DCA first so it's ready for the
+                            # chip's first post-kick LVDS frame.
+                            if self._dca_control_ref is not None:
+                                try:
+                                    self._dca_control_ref.stop_record()
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
+                                try:
+                                    self._dca_control_ref.reset_fpga()
+                                except Exception:
+                                    log.exception("auto-kick: DCA reset_fpga raised")
+                                time.sleep(0.1)
+                                try:
+                                    self._dca_control_ref.setup_capture()
+                                    self._dca_control_ref.start_record()
+                                    log.info("auto-kick: DCA back in start_record")
+                                except Exception:
+                                    log.exception("auto-kick: DCA setup_capture/start_record raised")
+                            # 2. Kick the chip.
                             self._radar_manager_ref.kick_lvds()
                             _last_kick_t = now_t
                         except Exception:
