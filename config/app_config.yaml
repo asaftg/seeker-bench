@@ -408,6 +408,15 @@ radar:
   data_port: COM10              # data UART (3_125_000), TLV stream comes in here
   cli_baud: 115200
   data_baud: 3125000            # verified by brute-forcing bauds until magic word aligned
+  # stream_timeout_s = 0 disables the V1.0 "no TLV for 3s → reconnect"
+  # path. The unified cfg's `lvdsStreamCfg -1 0 1 0` line enables raw-ADC
+  # LVDS but appears to suppress UART TLV output on this firmware build,
+  # so the legacy 3 s timeout fires every cycle and the reconnect's
+  # `sensorStop` kills LVDS. With 0, the manager pushes the cfg once,
+  # opens the data port, and just stays open — chip keeps streaming
+  # LVDS continuously to the DCA1000. A/A path is the source of truth
+  # in stock/AG/AA modes here.
+  stream_timeout_s: 0.0
   # Phase 3 (validated 2026-04-29): unified cfg pushed once at boot.
   # Identical to TI's highRange profile + ``lvdsStreamCfg -1 0 1 0`` so
   # the chip emits BOTH TLV (existing path, drives Stock + A/G) AND raw

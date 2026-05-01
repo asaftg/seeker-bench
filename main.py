@@ -221,6 +221,11 @@ def main() -> int:
                 speed_min_mps=float(radar_cfg.get("speed_min_mps", 0.0)),
                 range_min_m=float(radar_cfg.get("range_min_m", 0.0)),
                 profile_name=str(radar_cfg.get("profile_name", "awr2944p_ddm")),
+                # 0 disables the legacy "no TLV → reconnect" path; the
+                # unified cfg's lvdsStreamCfg suppresses UART TLV on
+                # this firmware so the timeout would fire forever and
+                # the reconnect would stomp LVDS.
+                stream_timeout_s=float(radar_cfg.get("stream_timeout_s", 3.0)),
                 cluster_params=cluster_params,
                 az_bias_deg=float(_ext.get("az_bias_deg", 0.0)),
                 el_bias_deg=float(_ext.get("el_bias_deg", 0.0)),

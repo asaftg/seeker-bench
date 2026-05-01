@@ -471,10 +471,30 @@ class RadarManager:
                         self._latest_cond.notify_all()
                     last_pkt_time = now
 
-            # Stream-timeout disconnect: if we've been connected but
-            # haven't seen a valid packet in stream_timeout_s, assume
-            # the chip died / USB glitch and reconnect.
-            if ever_connected and (now - last_pkt_time) > self.stream_timeout_s:
+            # Stream-timeout disconnect (LEGACY): if we've been
+            # connected but haven't seen a valid packet in
+            # stream_timeout_s, V1.0 reconnected — which re-pushed
+            # the cfg, which started with `sensorStop`, which killed
+            # any active LVDS streaming to the DCA1000.
+            #
+            # On the unified Phase-3 cfg this reconnect is HARMFUL:
+            # `lvdsStreamCfg -1 0 1 0` enables LVDS but appears to
+            # disable UART TLV output on this firmware build, so the
+            # 3 s timeout fires every cycle. The reconnect's
+            # sensorStop then breaks the LVDS stream that A/A
+            # depends on. Field log 2026-04-30 19:21 showed the
+            # chip cycling cfg pushes every 3 s and LVDS stalling
+            # right after each one (76,556 packets received then
+            # halted, repeat).
+            #
+            # Fix: when stream_timeout_s is 0 or negative, skip the
+            # reconnect entirely. The chip stays running, LVDS
+            # streams continuously into the DCA pipeline. If the
+            # operator needs A/A only, they set stream_timeout_s=0
+            # and the manager becomes a one-shot cfg pusher.
+            if (self.stream_timeout_s > 0
+                    and ever_connected
+                    and (now - last_pkt_time) > self.stream_timeout_s):
                 log.warning("No radar packets for %.1fs — reconnecting",
                             now - last_pkt_time)
                 self._close_data_port()
