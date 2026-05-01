@@ -382,29 +382,58 @@ class RadarManager:
         responses so the caller can see whether the chip ack'd.
         """
         out: dict = {"sensorStop": None, "sensorStart_0": None}
+        # First try the cheap path: just sensorStop + sensorStart 0.
+        # If chip is in STARTED but DMA stalled, this resets it.
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
-                # sensorStop is idempotent from any state; clears the
-                # chip's LVDS DMA and frame counters.
                 resp_stop = self._cli_send(ser, "sensorStop", wait_s=1.0)
                 out["sensorStop"] = resp_stop.strip()
                 time.sleep(0.1)
-                # sensorStart 0 resumes the previously-loaded profile
-                # (the unified.cfg we pushed at boot, including the
-                # lvdsStreamCfg line). Same call that brings the chip
-                # up cleanly at startup — see _push_profile docstring.
                 resp_start = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
                 out["sensorStart_0"] = resp_start.strip()
-                if "Done" not in resp_start:
-                    out["ok"] = False
-                    log.warning("kick_lvds: sensorStart 0 did not ack: %r",
-                                resp_start.strip())
+                if "Done" in resp_start:
+                    log.info("kick_lvds: chip kicked (sensorStop + sensorStart 0)")
                     return out
-            log.info("kick_lvds: chip kicked (sensorStop + sensorStart 0)")
-            return out
+                # Empty response or Invalid Sensor Start → chip in a
+                # state where sensorStart 0 doesn't help (likely the
+                # DMA halt state where Stop+Start 0 isn't enough on
+                # this firmware build). Fall through to a full cfg
+                # re-push, which forces the chip through INIT.
+                log.warning("kick_lvds: sensorStart 0 didn't recover "
+                            "(resp=%r); will re-push full cfg",
+                            resp_start.strip()[:80])
         except serial.SerialException as e:
             log.warning("kick_lvds: could not open CLI port %s: %s",
                         self.cli_port, e)
+            out["error"] = str(e)
+            return out
+
+        # Heavy path: full cfg re-push. The cfg starts with sensorStop
+        # + flushCfg, which forces the chip back through its state
+        # machine. The cfg's final sensorStart should then bring the
+        # chip back into STARTED with LVDS DMA reset.
+        log.info("kick_lvds: heavy path — re-pushing full cfg")
+        try:
+            with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
+                responses = send_cfg(ser, self.cfg_path)
+                tail = responses[-1] if responses else ""
+                n_rejected = sum(
+                    1 for r in responses if ("Error" in r or "error" in r)
+                )
+                ok = (n_rejected == 0
+                      and ("0xffe" in tail or "Done" in tail))
+                if ok:
+                    out["cfg_repush"] = "ok"
+                    log.info("kick_lvds: cfg re-push succeeded "
+                             "(0 rejected, tail had 0xffe/Done)")
+                else:
+                    out["cfg_repush"] = f"failed (rejected={n_rejected})"
+                    log.warning("kick_lvds: cfg re-push failed: "
+                                "%d rejected, tail=%r",
+                                n_rejected, tail.strip()[:80])
+            return out
+        except serial.SerialException as e:
+            log.warning("kick_lvds: cfg re-push could not open CLI: %s", e)
             out["error"] = str(e)
             return out
 
