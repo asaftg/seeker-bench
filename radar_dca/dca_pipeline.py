@@ -349,19 +349,23 @@ class DCAPipeline:
         bpf = self._dims.bytes_per_frame
         TICK_S = 0.020
         # LVDS stall watchdog. The chip on this firmware emits LVDS
-        # in bursts (~5 s of streaming, then halts the DMA). The only
-        # known way to recover without a power cycle is to issue
-        # `sensorStop` + `sensorStart 0` over the radar CLI — that
-        # forces the chip to reset its LVDS DMA and resume streaming.
-        # We do this automatically every 8 s of stall, rate-limited
-        # to once per 12 s so a truly dead chip doesn't get hammered.
-        # Validated end-to-end on 2026-04-30 19:26 (after V1.0 +
-        # surgical fixes): chip stops emitting after a ~5 s burst,
-        # auto-kick brings it back, repeat — keeps PMM detector
-        # supplied with continuous slow-time windows.
+        # in a finite burst (5-30 s) then halts the DMA. EMPIRICALLY
+        # NEITHER `sensorStop+sensorStart 0`, NOR a full cfg re-push,
+        # NOR a DCA FPGA reset, NOR `xds110reset.exe` brings it
+        # back — only a 12 V power-cycle does. Repeated kicks make
+        # things WORSE (chip falls into a deeper hang where it stops
+        # responding even to queryDemoStatus).
+        #
+        # So: STALL_KICK_COOLDOWN_S=99999 effectively disables the
+        # auto-kick. The watchdog still LOGS the stall once so the
+        # operator knows when the burst ended. To recover, manually
+        # power-cycle the AWR (pull 12 V, replug) and restart Seeker.
+        # The first burst after a clean power-cycle is what you get
+        # for radar — typically enough for PMM (slow-time window =
+        # 256 chirps = ~1.6 s at this cfg's 20 Hz frame rate).
         STALL_WARN_S = 5.0
         STALL_KICK_S = 8.0
-        STALL_KICK_COOLDOWN_S = 12.0
+        STALL_KICK_COOLDOWN_S = 99999.0  # auto-kick disabled — see above
         _stall_logged = False
         _last_kick_t = 0.0
 
