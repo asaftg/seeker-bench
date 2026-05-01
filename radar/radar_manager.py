@@ -301,14 +301,28 @@ class RadarManager:
 
                 if state in (0, None):
                     # Fresh boot or unknown state — push the full
-                    # profile so the chip has our cfg loaded. The
-                    # final `sensorStart` line in the cfg WILL be
-                    # rejected (chip is no longer in INIT after the
-                    # cfg's own sensorStop+flushCfg moved it through
-                    # the state machine). That rejection is expected;
-                    # we recover with sensorStart 0 below.
+                    # profile so the chip has our cfg loaded.
+                    #
+                    # The cfg's last line is ``sensorStart``. On THIS
+                    # firmware build the cfg's sensorStart from INIT
+                    # actually succeeds (chip moves INIT → STARTED).
+                    # If we then send our own ``sensorStart 0`` below
+                    # the chip rejects it ("Invalid Sensor Start" —
+                    # it's already STARTED) and V1.0's downstream
+                    # check returned False → reconnect cycle, which
+                    # broke streaming. Detect cfg-started-chip via
+                    # "Done" / "Init Calibration Status" in the cfg's
+                    # last-line response and return True directly,
+                    # skipping the redundant sensorStart 0.
                     responses = send_cfg(ser, self.cfg_path)
                     tail = responses[-1] if responses else ""
+                    if ("Done" in tail
+                            or "Init Calibration Status" in tail
+                            or "Calibration Status = 0x" in tail):
+                        log.info("Chip started by cfg's own sensorStart "
+                                 "(tail=%r) — skipping redundant sensorStart 0",
+                                 tail.strip()[:80])
+                        return True
 
                 # Final step on every path: sensorStart 0. This is the
                 # ONLY sensorStart variant we trust on this firmware
