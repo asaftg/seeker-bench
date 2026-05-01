@@ -316,13 +316,39 @@ class RadarManager:
                     # skipping the redundant sensorStart 0.
                     responses = send_cfg(ser, self.cfg_path)
                     tail = responses[-1] if responses else ""
-                    if ("Done" in tail
-                            or "Init Calibration Status" in tail
-                            or "Calibration Status = 0x" in tail):
+                    # Count rejected lines in the cfg push. The chip's
+                    # state machine sometimes rejects critical lines
+                    # (profileCfg, chirpCfg, frameCfg) with "Error:
+                    # Configuration is valid only if DFE Output Mode
+                    # is X" — a chip-side state-machine race we don't
+                    # fully understand. When that happens the chip's
+                    # cfg is incomplete; sensorStart will still emit
+                    # a partial calibration status (0x11e instead of
+                    # the full 0xffe) but no useful frames stream.
+                    # Don't fool ourselves — if any critical line was
+                    # rejected, treat the push as failed and let the
+                    # reconnect loop retry (next attempt often works
+                    # because the chip happens to be in a clean
+                    # state).
+                    n_rejected = sum(
+                        1 for r in responses
+                        if ("Error" in r or "error" in r)
+                    )
+                    full_cal = ("0xffe" in tail or "Done" in tail)
+                    if n_rejected == 0 and full_cal:
                         log.info("Chip started by cfg's own sensorStart "
-                                 "(tail=%r) — skipping redundant sensorStart 0",
+                                 "(tail=%r, rejected=0) — skipping "
+                                 "redundant sensorStart 0",
                                  tail.strip()[:80])
                         return True
+                    if n_rejected > 0:
+                        log.warning("cfg push had %d rejected line(s); "
+                                    "chip cfg is incomplete — will retry",
+                                    n_rejected)
+                        return False
+                    log.warning("cfg push tail=%r unrecognized as success; "
+                                "will retry", tail.strip()[:120])
+                    return False
 
                 # Final step on every path: sensorStart 0. This is the
                 # ONLY sensorStart variant we trust on this firmware
