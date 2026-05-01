@@ -103,6 +103,11 @@ class RadarManager:
         self._data_ser: Optional[serial.Serial] = None
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
+        # Mutex around CLI port (COM11). Without this, the capture
+        # loop's _push_profile and the DCAPipeline's auto-kick via
+        # kick_lvds() can both try to open COM11 at once → loser
+        # gets PermissionError. Observed in field run 2026-04-30.
+        self._cli_lock = threading.Lock()
 
     # ─────────────────────── live tuning ─────────────────────
     def set_tuning(
@@ -294,21 +299,41 @@ class RadarManager:
         proved works continuously. We never use plain ``sensorStart``
         from INIT — that's the path that emits a few frames and dies.
         """
+        if not self._cli_lock.acquire(timeout=5.0):
+            log.warning("_push_profile: could not acquire CLI lock")
+            return False
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
                 state = self._query_sensor_state(ser)
                 log.info("Radar CLI reports sensor state=%s", state)
 
                 if state in (0, None):
-                    # Fresh boot or unknown state — push the full
-                    # profile so the chip has our cfg loaded. The
-                    # final `sensorStart` line in the cfg WILL be
-                    # rejected (chip is no longer in INIT after the
-                    # cfg's own sensorStop+flushCfg moved it through
-                    # the state machine). That rejection is expected;
-                    # we recover with sensorStart 0 below.
+                    # Fresh boot — push the full profile. On THIS chip
+                    # the cfg's final `sensorStart` actually succeeds
+                    # (chip moves INIT → STARTED), and a follow-up
+                    # `sensorStart 0` would be rejected with "Invalid
+                    # Sensor Start" because the chip is already STARTED.
+                    # That rejection is harmless: the chip is streaming
+                    # fine; if we reconnect-loop on this we just end up
+                    # cycling sensorStop→sensorStart 0 forever and
+                    # never letting the data flow. So: after a cfg
+                    # push from INIT, treat "Done" or "Init Calibration
+                    # Status" or even "Invalid Sensor Start" on the
+                    # follow-up as success — chip is already started.
                     responses = send_cfg(ser, self.cfg_path)
                     tail = responses[-1] if responses else ""
+                    cfg_started_chip = (
+                        "Done" in tail
+                        or "Init Calibration Status" in tail
+                        or "Calibration Status = 0x" in tail
+                    )
+                    if cfg_started_chip:
+                        # Chip is already STARTED via cfg's sensorStart.
+                        # Skip the follow-up sensorStart 0 — it would
+                        # only return Invalid and trip the reconnect
+                        # cycle, which would re-send sensorStop and
+                        # disrupt the actively-streaming chip.
+                        return True
 
                 # Final step on every path: sensorStart 0. This is the
                 # ONLY sensorStart variant we trust on this firmware
@@ -321,13 +346,21 @@ class RadarManager:
                     self._cli_send(ser, "sensorStop", wait_s=1.0)
                     time.sleep(0.05)
                 resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
-                if "Done" not in resp:
-                    log.warning("sensorStart 0 did not ack: %r", resp.strip())
-                    return False
-                return True
+                if "Done" in resp:
+                    return True
+                # "Invalid Sensor Start" from STARTED state means the
+                # chip is already running — accept as success rather
+                # than reconnect-cycling and breaking streaming.
+                if "Invalid Sensor Start" in resp:
+                    log.info("sensorStart 0 returned Invalid (chip already STARTED) — accepted")
+                    return True
+                log.warning("sensorStart 0 did not ack: %r", resp.strip())
+                return False
         except serial.SerialException as e:
             log.warning("Could not open CLI port %s: %s", self.cli_port, e)
             return False
+        finally:
+            self._cli_lock.release()
 
     # ─────────────────────── chip kick (LVDS recovery) ─────────────────
     def kick_lvds(self) -> dict:
@@ -342,6 +375,9 @@ class RadarManager:
         responses so the caller can see whether the chip ack'd.
         """
         out: dict = {"sensorStop": None, "sensorStart_0": None}
+        if not self._cli_lock.acquire(timeout=1.0):
+            out["error"] = "CLI busy (reconnect in progress)"
+            return out
         try:
             with serial.Serial(self.cli_port, self.cli_baud, timeout=0.5) as ser:
                 # sensorStop is idempotent from any state; clears the
@@ -367,6 +403,8 @@ class RadarManager:
                         self.cli_port, e)
             out["error"] = str(e)
             return out
+        finally:
+            self._cli_lock.release()
 
     def _open_data_port(self) -> bool:
         try:
