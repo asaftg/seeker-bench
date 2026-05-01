@@ -106,6 +106,12 @@ class CompositeRadarBackend:
         if self._mode not in _MODE_FILTERS:
             self._mode = "stock"
         self._lock = threading.RLock()
+        # Hand the pipeline a back-ref to the RadarManager so its LVDS
+        # stall watchdog can call kick_lvds() directly. The chip on
+        # this firmware emits LVDS in bursts and halts; the kick
+        # (sensorStop + sensorStart 0) is the only way to resume.
+        if self._dca_pipeline is not None:
+            self._dca_pipeline._radar_manager_ref = self._radar
 
     # ─────────────────────── pass-through attributes ────────────────────
     @property
