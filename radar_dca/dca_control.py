@@ -125,7 +125,7 @@ class DCAControl:
                 "dataCaptureMode": "ethernetStream",
                 "lvdsMode": 1,
                 "dataFormatMode": 3,
-                "packetDelay_us": 75,  # was 25 — see above
+                "packetDelay_us": 200,  # 25 → 75 → 200 escalation
                 "ethernetConfig": {
                     "DCA1000IPAddress": self.dca_ip,
                     "DCA1000ConfigPort": self.config_port,
