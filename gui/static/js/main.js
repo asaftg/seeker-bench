@@ -589,27 +589,53 @@ const _tiltSliderVal = $("gimbal-tilt-slider-val");
 // programmatic `slider.value = …` would normally fire `input` and echo
 // the value back — pumping the gimbal. The flag short-circuits that.
 let _suppressSliderEcho = false;
+// User's intended setpoints, decoupled from slider DOM values. The DOM
+// values are constantly overwritten by updateGimbalUI to reflect the
+// MEASURED pose. When the user drags one slider, we must NOT read the
+// other slider's DOM value (which is measured, not what the user
+// wants) — that yanks the un-dragged axis backward to wherever the
+// servo currently lags. Symptom: dragging pan made tilt "crawl"
+// because the tilt slider's DOM value was the still-climbing measured
+// tilt, and we kept resending it as a fresh tilt command. Fix: track
+// what the USER asked for separately, and send those values.
+let _userPanSetpoint = 0.0;
+let _userTiltSetpoint = 0.0;
 
-function _sendPanTilt() {
+function _sendPanTiltFrom(axis) {
   if (!_panSlider || !_tiltSlider) return;
-  const pan  = parseFloat(_panSlider.value);
-  const tilt = parseFloat(_tiltSlider.value);
-  if (_panSliderVal)  _panSliderVal.textContent  = pan.toFixed(1)  + "°";
-  if (_tiltSliderVal) _tiltSliderVal.textContent = tilt.toFixed(1) + "°";
   if (_suppressSliderEcho) return;
-  wsSend({ command: "gimbal_absolute", pan_deg: pan, tilt_deg: tilt });
+  if (axis === "pan") {
+    _userPanSetpoint = parseFloat(_panSlider.value);
+    if (_panSliderVal) _panSliderVal.textContent = _userPanSetpoint.toFixed(1) + "°";
+  } else if (axis === "tilt") {
+    _userTiltSetpoint = parseFloat(_tiltSlider.value);
+    if (_tiltSliderVal) _tiltSliderVal.textContent = _userTiltSetpoint.toFixed(1) + "°";
+  }
+  wsSend({ command: "gimbal_absolute",
+           pan_deg: _userPanSetpoint, tilt_deg: _userTiltSetpoint });
 }
 
-if (_panSlider)  _panSlider.addEventListener("input", _sendPanTilt);
-if (_tiltSlider) _tiltSlider.addEventListener("input", _sendPanTilt);
+if (_panSlider)  _panSlider.addEventListener("input",  () => _sendPanTiltFrom("pan"));
+if (_tiltSlider) _tiltSlider.addEventListener("input", () => _sendPanTiltFrom("tilt"));
 
 const homeBtn = $("gimbal-home-btn");
 if (homeBtn) {
   homeBtn.addEventListener("click", () => {
     // Backend knows the configured home pose — don't compute it client-side.
     wsSend({ command: "gimbal_home" });
+    // Reset user setpoints so the next slider drag doesn't yank either
+    // axis back to a stale value left over from before HOME.
+    _userPanSetpoint = 0.0;
+    _userTiltSetpoint = 0.0;
   });
 }
+
+// Track mode (manual ↔ auto) so we resync user setpoints on transitions.
+// During auto-track the backend drives the gimbal, and our cached user
+// setpoints would be stale by the time the user takes manual control
+// back.
+let _lastGimbalMode = null;
+let _userSetpointsInitialized = false;
 
 function updateGimbalUI(gimbal) {
   if (!gimbal) return;
@@ -619,6 +645,20 @@ function updateGimbalUI(gimbal) {
   const tiltEl = $("gimbal-tilt");
   if (panEl)  panEl.textContent  = (_gimbalPan  != null) ? _gimbalPan.toFixed(1)  + "°" : "—";
   if (tiltEl) tiltEl.textContent = (_gimbalTilt != null) ? _gimbalTilt.toFixed(1) + "°" : "—";
+
+  // First-frame init + resync on auto→manual transition: snap user
+  // setpoints to the current measured pose so the next slider drag
+  // doesn't send a stale absolute setpoint.
+  const mode = gimbal.mode || "manual";
+  const transitionToManual = (_lastGimbalMode === "auto" && mode === "manual");
+  if ((!_userSetpointsInitialized || transitionToManual)
+      && _gimbalPan != null && _gimbalTilt != null) {
+    _userPanSetpoint = _gimbalPan;
+    _userTiltSetpoint = _gimbalTilt;
+    _userSetpointsInitialized = true;
+  }
+  _lastGimbalMode = mode;
+
   // Sync slider handles to reported gimbal position so the UI doesn't
   // get stuck showing the user's last drag while auto-track or HOME
   // commands move the gimbal elsewhere. Suppress the echo loop.

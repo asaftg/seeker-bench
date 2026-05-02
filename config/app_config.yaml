@@ -579,16 +579,13 @@ fusion:
   radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
 
 gimbal:
-  # Pan/tilt via Pololu Micro Maestro 6-Channel (Ticket 4).
-  # Port is auto-detected via USB VID=0x1FFB, BUT: in "USB Dual Port"
-  # serial mode the Maestro exposes TWO COM ports (Command + TTL), and
-  # on this laptop Windows shows them both as plain "USB Serial Device"
-  # with no "Command Port" suffix — so auto-detect can pick the wrong
-  # one and every write silently no-ops (or errors with PermissionError
-  # 13). COM4 was verified as the Command Port via `scripts/gimbal_probe
-  # --sweep`. Leave this pinned; run the probe again if ports shuffle.
+  # driver:
+  #   maestro            — V1 Pololu Maestro + hobby servos on COM4
+  #   waveshare_st3025   — V2 Waveshare bus-servo adapter + ST3025 (default)
+  # 2026-05-01: V2 hardware live on the bench, both servos calibrated.
+  driver: waveshare_st3025
   enabled: true
-  port: COM4                    # Command Port (COM5 on this box is TTL)
+  port: COM4                    # legacy Maestro pin; ignored when driver=waveshare_st3025
   rate_hz: 60                   # command/publish loop rate
 
   # Home / rest pose. tilt convention: 0 = horizon, higher = more up.
@@ -781,18 +778,20 @@ gimbal:
   #               (tilt floor lowered from 3° to 0° — operator now
   #                wants the gimbal to be able to look straight at
   #                ground-level / horizon-level targets.)
+  # V2 (ST3025) envelope. When flipping driver back to maestro, narrow
+  # to {pan ±45, tilt 0..90} for V1 mechanical safety.
   limits:
-    pan_min_deg: -45.0
-    pan_max_deg:  45.0
-    tilt_min_deg:  0.0
-    tilt_max_deg: 90.0
-    # 2026-04-27 test (recordings/diag_slew500_high_tilt.jsonl): bumped
-    # both to 500 dps and the camera moved LESS, not more (3% effective
-    # vs 79% with the conservative values). Conclusion: the slow ramp
-    # of small per-tick PWM steps is what lets the analog servo
-    # actually track. Reverted to known-good defaults.
+    pan_min_deg: -60.0
+    pan_max_deg:  60.0
+    tilt_min_deg:   0.0
+    tilt_max_deg:  90.0
+    # ST3025's brushless motor + 12-bit encoder can do >300 deg/s; these
+    # caps protect against absurd setpoint jumps from tracking, not
+    # against the servo's physical capability. Symmetric for V2 — V1
+    # had tilt at half (60) because the hobby tilt servo couldn't keep
+    # up under load; that constraint is gone with the bus servos.
     pan_slew_deg_per_s:  120.0
-    tilt_slew_deg_per_s:  60.0
+    tilt_slew_deg_per_s: 120.0
 
   # Linear angle→µs calibration per servo.
   # Values reflect the actual mechanical/electrical envelope of THIS
@@ -826,6 +825,47 @@ gimbal:
     us_at_min_deg: 1030.0
     us_at_max_deg: 2000.0
     invert: false
+
+  # ── V2 (Waveshare ST3025) bus-servo calibration ─────────────
+  # Active when driver: waveshare_st3025. Calibrated 2026-05-01 by
+  # hand-positioning the gimbal at home pose (tilt=horizon, pan=
+  # forward-centered) and reading the encoders. raw_min/max widen
+  # to ±60° (pan) and -15..+90° (tilt) around the calibrated zero.
+  waveshare:
+    port: null                  # auto-detect by VID/PID; pin to "COMn" if needed
+    baud: 1000000
+    # Servo-side acceleration ramp (register 0x29, 0..255). Higher = snappier
+    # response, lower = smoother. 0 disables the ramp (default firmware
+    # behaviour) and produces visible jerk on per-tick goal-position writes.
+    # Symmetric across axes — both servos are identical hardware and at
+    # the same per-tick rate they should feel the same.
+    # ki = Position-Integral gain (register 0x17, 0..255). Factory
+    # default is 0, which leaves a couple degrees of steady-state
+    # error against any constant load. Tilt has gravity pulling the
+    # mounted system down so it benefits more from I; pan only fights
+    # rolling friction. Too high causes hunting — 1..4 is the safe
+    # band.
+    tilt:
+      servo_id: 1
+      # 2026-05-01: spline re-clocked. Was zero_raw=893 invert=false;
+      # post-rework horizon sits at raw 1917 and vertical at raw 893,
+      # so we flip the convention: zero_raw=1917 (=horizon) with
+      # invert=true so increasing system tilt walks raw downward
+      # toward 893 (=vertical).
+      zero_raw: 1917            # raw at system 0° (horizon)
+      invert: true
+      raw_min: 893              # ≈ +90° system (vertical, lower raw end)
+      raw_max: 1917             # ≈   0° system (horizon, upper raw end)
+      acceleration: 50
+      ki: 8                     # gravity + stiction; raise if still settles off-zero, lower if it hunts
+    pan:
+      servo_id: 2
+      zero_raw: 2321            # raw at system 0° (forward-centered)
+      invert: false
+      raw_min: 1638             # ≈ -60° system
+      raw_max: 3004             # ≈ +60° system
+      acceleration: 50
+      ki: 2
 
 gui:
   host: 127.0.0.1

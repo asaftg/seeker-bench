@@ -33,6 +33,8 @@ from gimbal.gimbal_controller import (
     GimbalLimits,
     ServoCalibration,
 )
+from gimbal.bus_servo_calibration import BusServoCalibration
+from gimbal.bus_servo_driver import BusServoDriver
 from gimbal.maestro_driver import MaestroDriver
 from gimbal.optical_residual import OpticalResidualTracker
 
@@ -202,32 +204,61 @@ class GimbalManager:
         cfg = load_config()
         gcfg = cfg.get("gimbal", {}) or {}
 
-        # ── Calibration (per-servo linear map angle→µs) ──────
-        pcal_cfg = (gcfg.get("pan_calibration")  or {})
-        tcal_cfg = (gcfg.get("tilt_calibration") or {})
-        self._pan_cal = ServoCalibration(
-            channel=int(pcal_cfg.get("channel", 0)),
-            min_deg=float(pcal_cfg.get("min_deg", -90.0)),
-            max_deg=float(pcal_cfg.get("max_deg",  90.0)),
-            us_at_min_deg=float(pcal_cfg.get("us_at_min_deg", 500.0)),
-            us_at_max_deg=float(pcal_cfg.get("us_at_max_deg", 2500.0)),
-            invert=bool(pcal_cfg.get("invert", False)),
-        )
-        self._tilt_cal = ServoCalibration(
-            channel=int(tcal_cfg.get("channel", 1)),
-            min_deg=float(tcal_cfg.get("min_deg",  0.0)),
-            max_deg=float(tcal_cfg.get("max_deg", 22.0)),
-            us_at_min_deg=float(tcal_cfg.get("us_at_min_deg", 1500.0)),
-            us_at_max_deg=float(tcal_cfg.get("us_at_max_deg", 2000.0)),
-            invert=bool(tcal_cfg.get("invert", False)),
-        )
+        # ── Driver selection ────────────────────────────────
+        #   maestro            — V1 Pololu Maestro + hobby servos (PWM µs)
+        #   waveshare_st3025   — V2 Waveshare bus-servo adapter + ST3025
+        self._driver_kind = str(gcfg.get("driver", "maestro")).lower()
+        self._is_v2 = (self._driver_kind == "waveshare_st3025")
+
+        # ── Calibration (per-servo) ─────────────────────────
+        if self._is_v2:
+            ws_cfg = (gcfg.get("waveshare") or {})
+            pcal_cfg = (ws_cfg.get("pan")  or {})
+            tcal_cfg = (ws_cfg.get("tilt") or {})
+            self._pan_cal = BusServoCalibration(
+                servo_id=int(pcal_cfg.get("servo_id", 2)),
+                zero_raw=int(pcal_cfg.get("zero_raw", 2048)),
+                invert=bool(pcal_cfg.get("invert", False)),
+                raw_min=int(pcal_cfg.get("raw_min", 1365)),
+                raw_max=int(pcal_cfg.get("raw_max", 2731)),
+            )
+            self._tilt_cal = BusServoCalibration(
+                servo_id=int(tcal_cfg.get("servo_id", 1)),
+                zero_raw=int(tcal_cfg.get("zero_raw", 1024)),
+                invert=bool(tcal_cfg.get("invert", False)),
+                raw_min=int(tcal_cfg.get("raw_min", 853)),
+                raw_max=int(tcal_cfg.get("raw_max", 2048)),
+            )
+            lim_pan_lo, lim_pan_hi = -60.0,  60.0
+            lim_tilt_lo, lim_tilt_hi = -15.0, 90.0
+        else:
+            pcal_cfg = (gcfg.get("pan_calibration")  or {})
+            tcal_cfg = (gcfg.get("tilt_calibration") or {})
+            self._pan_cal = ServoCalibration(
+                channel=int(pcal_cfg.get("channel", 0)),
+                min_deg=float(pcal_cfg.get("min_deg", -90.0)),
+                max_deg=float(pcal_cfg.get("max_deg",  90.0)),
+                us_at_min_deg=float(pcal_cfg.get("us_at_min_deg", 500.0)),
+                us_at_max_deg=float(pcal_cfg.get("us_at_max_deg", 2500.0)),
+                invert=bool(pcal_cfg.get("invert", False)),
+            )
+            self._tilt_cal = ServoCalibration(
+                channel=int(tcal_cfg.get("channel", 1)),
+                min_deg=float(tcal_cfg.get("min_deg",  0.0)),
+                max_deg=float(tcal_cfg.get("max_deg", 22.0)),
+                us_at_min_deg=float(tcal_cfg.get("us_at_min_deg", 1500.0)),
+                us_at_max_deg=float(tcal_cfg.get("us_at_max_deg", 2000.0)),
+                invert=bool(tcal_cfg.get("invert", False)),
+            )
+            lim_pan_lo, lim_pan_hi = self._pan_cal.min_deg, self._pan_cal.max_deg
+            lim_tilt_lo, lim_tilt_hi = self._tilt_cal.min_deg, self._tilt_cal.max_deg
 
         lims_cfg = (gcfg.get("limits") or {})
         limits = GimbalLimits(
-            pan_min_deg=float(lims_cfg.get("pan_min_deg",  self._pan_cal.min_deg)),
-            pan_max_deg=float(lims_cfg.get("pan_max_deg",  self._pan_cal.max_deg)),
-            tilt_min_deg=float(lims_cfg.get("tilt_min_deg", self._tilt_cal.min_deg)),
-            tilt_max_deg=float(lims_cfg.get("tilt_max_deg", self._tilt_cal.max_deg)),
+            pan_min_deg=float(lims_cfg.get("pan_min_deg",  lim_pan_lo)),
+            pan_max_deg=float(lims_cfg.get("pan_max_deg",  lim_pan_hi)),
+            tilt_min_deg=float(lims_cfg.get("tilt_min_deg", lim_tilt_lo)),
+            tilt_max_deg=float(lims_cfg.get("tilt_max_deg", lim_tilt_hi)),
             pan_slew_deg_per_s=float(lims_cfg.get("pan_slew_deg_per_s", 120.0)),
             tilt_slew_deg_per_s=float(lims_cfg.get("tilt_slew_deg_per_s", 60.0)),
         )
@@ -237,9 +268,11 @@ class GimbalManager:
         home_tilt = float(gcfg.get("home_tilt_deg",
                                    (limits.tilt_min_deg + limits.tilt_max_deg) / 2.0))
 
+        # V1 needs pan_cal/tilt_cal for `angles_to_us`; V2 doesn't call
+        # that helper but passing them through is harmless.
         self._controller = GimbalController(
-            pan_cal=self._pan_cal,
-            tilt_cal=self._tilt_cal,
+            pan_cal=self._pan_cal if not self._is_v2 else None,
+            tilt_cal=self._tilt_cal if not self._is_v2 else None,
             limits=limits,
             home_pan_deg=home_pan,
             home_tilt_deg=home_tilt,
@@ -685,17 +718,33 @@ class GimbalManager:
         self._tilt_saturated_logged = False
 
         # Driver — may or may not actually open.
-        # PWM-gating: skip Maestro writes when |new_us - last_sent_us| <
-        # min_us_step. Turns a stream of tiny per-tick PWM updates into
-        # discrete steps the servo can act on. See MaestroDriver init
-        # docstring for details. 5 µs ≈ 0.5° at our calibration; matches
-        # the Yahboom internal servo deadband. Set 0 to disable.
-        min_us_step = float(gcfg.get("maestro_min_us_step", 5.0))
-        self._driver = MaestroDriver(port=port or gcfg.get("port"),
-                                      min_us_step=min_us_step)
+        if self._is_v2:
+            ws_cfg = (gcfg.get("waveshare") or {})
+            # NOTE: do NOT fall back to gcfg["port"] — that's the legacy
+            # Maestro Command Port pin (COM4) which is a different device
+            # entirely. If ws_cfg.port is null, let BusServoDriver auto-
+            # detect the CH343 by VID/PID instead.
+            self._driver = BusServoDriver(
+                port=port or ws_cfg.get("port"),
+                baud=int(ws_cfg.get("baud", 1_000_000)),
+            )
+        else:
+            # PWM-gating: skip Maestro writes when |new_us - last_sent_us|
+            # < min_us_step. See MaestroDriver init docstring.
+            min_us_step = float(gcfg.get("maestro_min_us_step", 5.0))
+            self._driver = MaestroDriver(
+                port=port or gcfg.get("port"),
+                min_us_step=min_us_step,
+            )
         self._connected = False
         # Counter for consecutive write failures (auto-reconnect logic).
         self._consec_write_fail = 0
+        # V2 only: last successful measured pose. Used as the published
+        # pan/tilt and as the fallback when an encoder read times out so
+        # the bus doesn't flap between measured and stale-commanded on a
+        # single dropped reply.
+        self._last_measured_pan: Optional[float] = None
+        self._last_measured_tilt: Optional[float] = None
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -724,6 +773,13 @@ class GimbalManager:
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
 
+    def _axis_addrs(self) -> list:
+        """Per-axis addressing list the active driver expects:
+        Maestro channels for V1, bus-servo IDs for V2."""
+        if self._is_v2:
+            return [self._pan_cal.servo_id, self._tilt_cal.servo_id]
+        return [self._pan_cal.channel, self._tilt_cal.channel]
+
     # ── lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
@@ -731,8 +787,32 @@ class GimbalManager:
             return
         self._connected = self._driver.open()
         if self._connected:
+            # V2: write Acceleration register on each servo so per-tick
+            # goal-position writes ramp instead of snapping. Default 0
+            # is "max instant acceleration" which feels jerky at 60 Hz
+            # update rates. ~50 is a noticeable smoothing without
+            # killing responsiveness.
+            if self._is_v2:
+                ws_cfg = (load_config().get("gimbal", {}) or {}).get("waveshare", {}) or {}
+                pan_cfg = ws_cfg.get("pan") or {}
+                tilt_cfg = ws_cfg.get("tilt") or {}
+                # Acceleration ramp on the motor commutation (0..255).
+                self._driver.set_acceleration(self._pan_cal.servo_id,
+                                               int(pan_cfg.get("acceleration", 50)))
+                self._driver.set_acceleration(self._tilt_cal.servo_id,
+                                               int(tilt_cfg.get("acceleration", 50)))
+                # Position-Integral gain (0..255). Default firmware ships
+                # this at 0, which leaves a steady-state error against
+                # any constant load (gravity on the tilted-up gimbal
+                # sits the axis a couple degrees below commanded). A
+                # small I drives that residual to zero. Too large will
+                # hunt. 2..3 is a conservative starting point.
+                self._driver.set_position_i_gain(self._pan_cal.servo_id,
+                                                  int(pan_cfg.get("ki", 2)))
+                self._driver.set_position_i_gain(self._tilt_cal.servo_id,
+                                                  int(tilt_cfg.get("ki", 3)))
             # Move gently to home instead of snapping — avoids a
-            # startup slam when the servos wake up at a random µs.
+            # startup slam when the servos wake up at a random pose.
             self._controller.reset_to(self._home_pan, self._home_tilt)
             self._command_now(self._home_pan, self._home_tilt)
         self._stop_evt.clear()
@@ -751,7 +831,7 @@ class GimbalManager:
         if self._connected:
             # Release servos on shutdown so they don't keep holding
             # torque and overheat.
-            self._driver.release_all([self._pan_cal.channel, self._tilt_cal.channel])
+            self._driver.release_all(self._axis_addrs())
         self._driver.close()
         log.info("GimbalManager stopped")
 
@@ -780,8 +860,8 @@ class GimbalManager:
                 self._tracked_heat_id = None
             new_pan  = self._manual_pan  + float(d_pan_deg)
             new_tilt = self._manual_tilt + float(d_tilt_deg)
-            pan_lo  = float(self._pan_cal.min_deg)
-            pan_hi  = float(self._pan_cal.max_deg)
+            pan_lo  = float(self._pan_floor)
+            pan_hi  = float(self._pan_ceil)
             tilt_lo = float(self._tilt_floor)
             tilt_hi = float(self._tilt_ceil)
             self._manual_pan  = max(pan_lo,  min(pan_hi,  new_pan))
@@ -1524,12 +1604,29 @@ class GimbalManager:
         # — the servo wasn't moving, but published tilt advanced
         # 0.5°/tick.)
         # Falls back to cmd_pan/tilt when nothing has been written yet.
-        last_us_pan  = self._driver.get_last_written_us(self._pan_cal.channel)
-        last_us_tilt = self._driver.get_last_written_us(self._tilt_cal.channel)
-        actual_pan  = (self._pan_cal.us_to_angle(last_us_pan)
-                        if last_us_pan is not None else cmd_pan)
-        actual_tilt = (self._tilt_cal.us_to_angle(last_us_tilt)
-                        if last_us_tilt is not None else cmd_tilt)
+        if self._is_v2:
+            # V2: read the ST3025's 12-bit absolute encoder for the
+            # *measured* pose. Cache the last successful read so a
+            # single dropped reply doesn't fall back to commanded for
+            # one tick.
+            if self._connected:
+                raw_p = self._driver.read_position(self._pan_cal.servo_id)
+                raw_t = self._driver.read_position(self._tilt_cal.servo_id)
+                if raw_p is not None:
+                    self._last_measured_pan = self._pan_cal.units_to_angle(raw_p)
+                if raw_t is not None:
+                    self._last_measured_tilt = self._tilt_cal.units_to_angle(raw_t)
+            actual_pan  = (self._last_measured_pan
+                           if self._last_measured_pan is not None else cmd_pan)
+            actual_tilt = (self._last_measured_tilt
+                           if self._last_measured_tilt is not None else cmd_tilt)
+        else:
+            last_us_pan  = self._driver.get_last_written_us(self._pan_cal.channel)
+            last_us_tilt = self._driver.get_last_written_us(self._tilt_cal.channel)
+            actual_pan  = (self._pan_cal.us_to_angle(last_us_pan)
+                            if last_us_pan is not None else cmd_pan)
+            actual_tilt = (self._tilt_cal.us_to_angle(last_us_tilt)
+                            if last_us_tilt is not None else cmd_tilt)
 
         # Publish state. `tracked_target_id` carries whichever lock is
         # live — fused id if that's set, else the heat id. The GUI only
@@ -1709,8 +1806,7 @@ class GimbalManager:
         except Exception:
             pass
         try:
-            self._driver.release_all([self._pan_cal.channel,
-                                       self._tilt_cal.channel])
+            self._driver.release_all(self._axis_addrs())
         except Exception as e:
             log.warning("release_all failed: %s", e)
         # Clear synth lock so subsequent ticks don't re-engage.
@@ -1977,9 +2073,15 @@ class GimbalManager:
                 return
             log.info("Maestro re-connected after transient failure")
             self._consec_write_fail = 0
-        us_p, us_t = self._controller.angles_to_us(pan_deg, tilt_deg)
-        ok1 = self._driver.set_target_us(self._pan_cal.channel,  us_p)
-        ok2 = self._driver.set_target_us(self._tilt_cal.channel, us_t)
+        if self._is_v2:
+            raw_p = self._pan_cal.angle_to_units(pan_deg)
+            raw_t = self._tilt_cal.angle_to_units(tilt_deg)
+            ok1 = self._driver.set_target_units(self._pan_cal.servo_id, raw_p)
+            ok2 = self._driver.set_target_units(self._tilt_cal.servo_id, raw_t)
+        else:
+            us_p, us_t = self._controller.angles_to_us(pan_deg, tilt_deg)
+            ok1 = self._driver.set_target_us(self._pan_cal.channel,  us_p)
+            ok2 = self._driver.set_target_us(self._tilt_cal.channel, us_t)
         if not (ok1 and ok2):
             self._consec_write_fail += 1
             if self._consec_write_fail >= 3:
