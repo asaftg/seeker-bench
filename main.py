@@ -343,7 +343,23 @@ def main() -> int:
                     initial_mode="stock",
                     radar_firmware=args.radar_firmware,
                 )
-                composite.start()
+                # Run composite.start() in a daemon thread. The mmW
+                # Studio bring-up inside it waits up to 90 s for the
+                # first DCA1000 packet on UDP:4098 — historically
+                # blocked main.py from reaching GUI startup until the
+                # wait completed or timed out. Composite construction
+                # above is non-blocking, so `radar = composite` is
+                # safe to assign IMMEDIATELY; create_app downstream
+                # gets a valid reference even if the chip bring-up is
+                # still in progress when the GUI binds. The composite
+                # publishes connected=False sentinels until the DCA
+                # path is alive — same UX as a missing EVM.
+                _comp_starter = threading.Thread(
+                    target=composite.start,
+                    name="composite_start",
+                    daemon=True,
+                )
+                _comp_starter.start()
                 # Use composite as THE radar reference everywhere — it
                 # exposes the same set_tuning/set_extrinsic/diagnostics
                 # surface as RadarManager and additionally drives mode.
