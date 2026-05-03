@@ -632,6 +632,15 @@ gimbal:
   kp_track:    0.50
   deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
   max_step_deg: 3.0           # was 2.0 — V2 servos can handle bigger steps
+  # D term on MEASUREMENT (not error). Subtracts kd × encoder velocity
+  # (dpose/dt) from the closed-loop proportional output. Brakes when the
+  # gimbal is moving fast toward target → smooth deceleration → no
+  # overshoot. `tracking 532026 try3.jsonl` track #1 transit had a 0.6°
+  # peak overshoot and ~3 cycles of bounce-back before settling — exactly
+  # what kd is for.
+  # 0.0 = pure-P (legacy). 0.02 is conservative; if overshoot persists,
+  # bump to 0.04. If gimbal feels sluggish near target, drop to 0.01.
+  kd_track:    0.02
 
   # Soft-deadband band edges for the proportional control law. Below
   # `track_zero_band_deg` of error: zero command. Between zero_band and

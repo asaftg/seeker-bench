@@ -353,6 +353,17 @@ class GimbalManager:
         self._kp_track       = float(gcfg.get("kp_track", 0.15))
         self._deadband_deg   = float(gcfg.get("deadband_deg", 2.5))
         self._max_step_deg   = float(gcfg.get("max_step_deg", 2.0))
+        # D term on measurement (encoder velocity). Subtracts kd × dpose/dt
+        # from d_pan_cl / d_tilt_cl in the closed-loop, which acts as a
+        # brake when the gimbal is moving fast toward target → smooth
+        # deceleration, no overshoot. Operates on MEASUREMENT (encoder
+        # velocity) rather than ERROR derivative so setpoint changes
+        # don't kick the controller. 0.0 = pure-P (legacy). Sensible
+        # range: 0.01 – 0.05 with V2 encoder; bigger values can fight
+        # the P term and slow convergence.
+        # `tracking 532026 try3.jsonl` track #1 transit showed 0.6° peak
+        # overshoot + reverse — the canonical use case for this knob.
+        self._kd_track       = float(gcfg.get("kd_track", 0.02))
 
         # Error-signal low-pass: hot targets like vehicles don't have a
         # single crisp centroid. Headlights, grille, engine bay, wheel
@@ -745,6 +756,14 @@ class GimbalManager:
         # single dropped reply.
         self._last_measured_pan: Optional[float] = None
         self._last_measured_tilt: Optional[float] = None
+        # Previous-tick measured pose + timestamp for the closed-loop's
+        # D-term-on-measurement. dpose/dt computed here is the encoder's
+        # measured angular velocity; multiplied by kd_track and
+        # subtracted from d_pan_cl / d_tilt_cl in the closed-loop to
+        # damp overshoot.
+        self._prev_pose_pan: Optional[float] = None
+        self._prev_pose_tilt: Optional[float] = None
+        self._prev_pose_t: Optional[float] = None
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -1003,6 +1022,26 @@ class GimbalManager:
             pose_tilt = self._last_measured_tilt
         if pose_pan is None or pose_tilt is None:
             pose_pan, pose_tilt = self._controller.current
+
+        # Encoder-measured angular velocity for the closed-loop D term.
+        # D-on-MEASUREMENT (not on error) so setpoint changes don't kick
+        # the controller. Brakes proportional to how fast the gimbal is
+        # physically moving — when approaching target fast, command
+        # shrinks → smooth deceleration → no overshoot.
+        import time as _t_dt
+        _now_dt = _t_dt.time()
+        meas_dpan_dps = 0.0
+        meas_dtilt_dps = 0.0
+        if (self._prev_pose_pan is not None
+                and self._prev_pose_tilt is not None
+                and self._prev_pose_t is not None):
+            _dt = max(1e-3, _now_dt - self._prev_pose_t)
+            if _dt < 0.5:   # ignore stale-prev (e.g. after a long pause)
+                meas_dpan_dps  = (pose_pan  - self._prev_pose_pan)  / _dt
+                meas_dtilt_dps = (pose_tilt - self._prev_pose_tilt) / _dt
+        self._prev_pose_pan  = pose_pan
+        self._prev_pose_tilt = pose_tilt
+        self._prev_pose_t    = _now_dt
 
         # Visual feedback freshness gate. The camera supplies error
         # samples at ~30 Hz; the control loop ticks at 60 Hz. Commanding
@@ -1380,6 +1419,17 @@ class GimbalManager:
                             el_in, kp_eff,
                             self._track_zero_band_deg,
                             self._track_full_band_deg)
+                        # D term on encoder velocity (kd * dpose/dt
+                        # subtracted from the proportional output).
+                        # Brakes the controller when the gimbal is
+                        # already moving fast in the same direction as
+                        # the commanded delta — kills the overshoot
+                        # seen in `tracking 532026 try3.jsonl` track #1
+                        # (transit at 36 dps, then bounce-back at 0.6°
+                        # amplitude before settling). kd=0 (legacy
+                        # pure-P) is still selectable via YAML.
+                        d_pan_cl  -= self._kd_track * meas_dpan_dps
+                        d_tilt_cl -= self._kd_track * meas_dtilt_dps
                         if abs(d_pan_cl)  < self._track_min_step_deg:
                             d_pan_cl  = 0.0
                         if abs(d_tilt_cl) < self._track_min_step_deg:
