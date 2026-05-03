@@ -50,6 +50,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
     p.add_argument("--no-gimbal", action="store_true", help="Disable gimbal (Maestro servo controller)")
     p.add_argument("--no-radar", action="store_true", help="Disable radar (AWR2944P)")
+    p.add_argument(
+        "--radar-firmware",
+        choices=["demoDDM", "studio", "studio-py"],
+        default="studio",
+        help="Radar firmware backend. 'demoDDM' (legacy) uses the SDK demo "
+             "firmware; chip emits TLV + LVDS but halts after 30-90s by "
+             "design. 'studio' (current production path) drives TI's mmW "
+             "Studio GUI which downloads the radar-only firmware and runs "
+             "continuous LVDS streaming -- Windows-only. 'studio-py' (Phase "
+             "2, in development) replaces Studio with a pure-Python "
+             "mmwavelink client over pyserial -- Jetson-portable. "
+             "See radar_dca/mmwave_commands.py + mmwavelink_proto.py.",
+    )
     p.add_argument("--host", default=None, help="GUI bind host")
     p.add_argument("--port", type=int, default=None, help="GUI bind port")
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser")
@@ -179,6 +192,23 @@ def main() -> int:
         fusion = FusionManager()
         fusion.start()
 
+    # Start gimbal manager early — independent of every other sensor and
+    # we don't want it blocked by long downstream startups (the radar
+    # path's mmW Studio bring-up waits up to 90 s for the first DCA1000
+    # packet on UDP:4098, which previously starved the gimbal of any
+    # initialization until that wait completed or timed out — visible
+    # in seeker.log as "Studio launched ... Waiting for first DCA1000
+    # packet" with NO subsequent "GimbalManager started" line).
+    gimbal: GimbalManager | None = None
+    gimbal_cfg = (cfg.get("gimbal") or {})
+    if not args.no_gimbal and bool(gimbal_cfg.get("enabled", True)):
+        try:
+            gimbal = GimbalManager()
+            gimbal.start()
+        except Exception as e:
+            log.warning("Gimbal manager failed to start: %s — continuing without gimbal", e)
+            gimbal = None
+
     # Start radar manager — optional. Degrades gracefully if the EVM
     # is absent (publishes connected=false sentinel; GUI shows DISCONNECTED).
     radar: RadarManager | None = None
@@ -230,7 +260,19 @@ def main() -> int:
                 az_bias_deg=float(_ext.get("az_bias_deg", 0.0)),
                 el_bias_deg=float(_ext.get("el_bias_deg", 0.0)),
             )
-            radar.start()
+            # In demoDDM firmware mode the RadarManager owns the chip
+            # via UART CLI (cfg push, sensorStart, TLV consumer). In
+            # Studio firmware mode the chip is driven by mmW Studio's
+            # mmwavelink path — there's no TLV and we MUST NOT push
+            # CLI cfg over the same UART (would race Studio).
+            if args.radar_firmware in ("studio", "studio-py"):
+                log.info("%s firmware mode: skipping RadarManager.start() "
+                         "(no TLV path -- chip is driven by mmW Studio Lua "
+                         "bring-up + DCA UDP, OR by Phase 2 Python mmwavelink "
+                         "client). RadarManager instance kept for set_tuning() "
+                         "compatibility only.", args.radar_firmware)
+            else:
+                radar.start()
             # Phase 3: build the composite that wraps RadarManager + the
             # DCA1000 raw-ADC pipeline. The composite owns mode dispatch
             # (Stock / A/G / A/A) and the raw-ADC consumer. RadarManager
@@ -299,6 +341,7 @@ def main() -> int:
                     dca_listener=_dca_listener,
                     dca_pipeline=_dca_pipeline,
                     initial_mode="stock",
+                    radar_firmware=args.radar_firmware,
                 )
                 composite.start()
                 # Use composite as THE radar reference everywhere — it
@@ -351,17 +394,8 @@ def main() -> int:
             log.warning("Radar manager failed to start: %s — continuing without radar", e)
             radar = None
 
-    # Start gimbal manager — optional. Degrades gracefully if the
-    # Maestro isn't plugged in (publishes connected=false state).
-    gimbal: GimbalManager | None = None
-    gimbal_cfg = (cfg.get("gimbal") or {})
-    if not args.no_gimbal and bool(gimbal_cfg.get("enabled", True)):
-        try:
-            gimbal = GimbalManager()
-            gimbal.start()
-        except Exception as e:
-            log.warning("Gimbal manager failed to start: %s — continuing without gimbal", e)
-            gimbal = None
+    # (Gimbal manager started earlier — moved ahead of radar so the
+    # radar's mmW Studio bring-up doesn't gate manual control.)
 
     # Load persisted extrinsic calibration (if any) and apply it to the
     # live managers BEFORE the GUI starts pushing frames. This is what
