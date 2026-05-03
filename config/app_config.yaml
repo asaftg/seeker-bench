@@ -680,18 +680,28 @@ gimbal:
 
   # Alpha-beta predictor knobs (algorithms/track_predictor.py).
   # Defaults are baked into PredictorParams; override here per rig.
+  #
+  # 2026-05-03: conservative re-tune for V2 (Waveshare ST3025 with
+  # encoders). The predictor now sees ENCODER-MEASURED pose instead
+  # of the controller's commanded rate-limited pose, so:
+  #   * gimbal_dps reflects real angular velocity (no longer flapping
+  #     because of commanded-pose jumps); the settled gate is stable.
+  #     Tightened settled_dps 15 → 8 to be more decisive about whether
+  #     the gimbal is actually moving — only safe with the cleaner
+  #     signal from Fix 1.
+  #   * predict_warmup_n 5 → 3 enables lookahead ~67ms sooner at 30 Hz
+  #     fresh-obs rate. Cleaner initial velocity estimate makes 3 obs
+  #     enough.
+  # vel_alpha and vel_clip_dps left at the conservative V1 values for
+  # now — bumping them is risky if any noise survives, and the bigger
+  # win is from Fix 1 (pose source) rather than re-tuning the filter.
+  # Revisit after a clean V2 recording shows the noise floor.
   track_lead_time_s: 0.30
   track_vel_alpha: 0.30
-  track_predict_warmup_n: 5
+  track_predict_warmup_n: 3
   track_predict_cap_deg: 5.0
-  track_gimbal_settled_dps: 15.0
+  track_gimbal_settled_dps: 8.0
   track_extrap_horizon_s: 2.0
-  # Tightened 2026-04-26 (was 60). A single fresh observation arriving
-  # on a brief settle between fast slews used to produce a 49 dps
-  # raw_dot that smoothed into +17 dps and pushed the setpoint past
-  # the cap → gimbal hunted blindly until grace. 30 dps is well above
-  # legitimate target rate at our ranges, well below the latency
-  # spike envelope.
   track_vel_clip_dps: 30.0
   # New 2026-04-26. When fresh observations stop, decay world_*_dot
   # toward 0 with this half-life so the predictor doesn't coast on a

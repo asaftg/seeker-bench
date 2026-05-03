@@ -964,6 +964,46 @@ class GimbalManager:
         sp_pan, sp_tilt = manual_pan, manual_tilt
         err: Optional[str] = None
 
+        # ── Pose source for the predictor + closed-loop ──────────────
+        # V2 (waveshare_st3025) has a 12-bit absolute encoder per servo.
+        # Reading it here at the top of the tick gives us the SERVO'S
+        # ACTUAL angular position (not the controller's commanded
+        # rate-limited setpoint, which leads the encoder during slews).
+        # Critical for two reasons:
+        #   1. world_az = obs_az + cur_pan_at_capture_time. Using the
+        #      commanded pose (which leads measured by 1-3°) injects
+        #      that gap as observation noise, which the velocity filter
+        #      then turns into phantom motion → noisy lookahead → jitter.
+        #      `tracker 532026.jsonl` track #11: cam_az per-tick max
+        #      delta 6.92° while world_az delta only 1.4° — the cam-frame
+        #      jitter was almost entirely from pose-source mismatch.
+        #   2. `gimbal_dps` (used by the predictor's settled gate)
+        #      computed from MEASURED pose differences reflects real
+        #      angular velocity. Computed from commanded pose, it
+        #      flapped: 138 settled-flips in 451 ticks because the
+        #      controller's commanded-pose jumps every tick when sp
+        #      moves, even though the gimbal physically isn't moving
+        #      at that rate.
+        # V1 (Maestro PWM, no feedback): keep the historical commanded
+        # path — `actual_pan/actual_tilt` is recovered from
+        # get_last_written_us downstream of _command_now.
+        pose_pan: Optional[float] = None
+        pose_tilt: Optional[float] = None
+        if self._is_v2 and self._connected:
+            try:
+                raw_p = self._driver.read_position(self._pan_cal.servo_id)
+                raw_t = self._driver.read_position(self._tilt_cal.servo_id)
+                if raw_p is not None:
+                    self._last_measured_pan = self._pan_cal.units_to_angle(raw_p)
+                if raw_t is not None:
+                    self._last_measured_tilt = self._tilt_cal.units_to_angle(raw_t)
+            except Exception as e:
+                log.debug("V2 read_position at tick top failed: %r", e)
+            pose_pan = self._last_measured_pan
+            pose_tilt = self._last_measured_tilt
+        if pose_pan is None or pose_tilt is None:
+            pose_pan, pose_tilt = self._controller.current
+
         # Visual feedback freshness gate. The camera supplies error
         # samples at ~30 Hz; the control loop ticks at 60 Hz. Commanding
         # a fresh P correction on every tick would fire 2 corrections
@@ -987,7 +1027,9 @@ class GimbalManager:
 
         if tracked_heat_id is not None and tracked_id is None:
             if heat_obs is not None:
-                cur_pan, cur_tilt = self._controller.current
+                # Same rationale as fused-track path: use measured pose
+                # (V2 encoder) for the predictor + closed-loop reference.
+                cur_pan, cur_tilt = pose_pan, pose_tilt
                 # Centroid-move gate. The OF tracker that propagates
                 # synthetic targets advances cx/cy only every few
                 # thermal frames. If we recompute the setpoint on
@@ -1208,7 +1250,12 @@ class GimbalManager:
                         trk = t
                         break
             if trk is not None:
-                cur_pan, cur_tilt = self._controller.current
+                # Use measured pose (encoder) on V2 instead of the
+                # controller's commanded pose. See pose_pan/pose_tilt
+                # docstring at the top of _tick — leads to clean
+                # gimbal_dps, stable settled gate, and correct
+                # world_az = obs_az + cur_pan_at_capture conversion.
+                cur_pan, cur_tilt = pose_pan, pose_tilt
                 # Fused-track freshness gate. Only feed the predictor
                 # a "fresh" observation when the FUSED track has
                 # actually been refreshed (id+hits tuple changed) --
@@ -1605,17 +1652,12 @@ class GimbalManager:
         # 0.5°/tick.)
         # Falls back to cmd_pan/tilt when nothing has been written yet.
         if self._is_v2:
-            # V2: read the ST3025's 12-bit absolute encoder for the
-            # *measured* pose. Cache the last successful read so a
-            # single dropped reply doesn't fall back to commanded for
-            # one tick.
-            if self._connected:
-                raw_p = self._driver.read_position(self._pan_cal.servo_id)
-                raw_t = self._driver.read_position(self._tilt_cal.servo_id)
-                if raw_p is not None:
-                    self._last_measured_pan = self._pan_cal.units_to_angle(raw_p)
-                if raw_t is not None:
-                    self._last_measured_tilt = self._tilt_cal.units_to_angle(raw_t)
+            # V2: encoder was already read at the top of _tick (and the
+            # measured pose cached in self._last_measured_*). Reuse the
+            # cached value here — avoids a second pair of bus reads per
+            # tick (saves ~3-6 ms of bus time) and ensures the published
+            # GimbalState matches the pose the predictor + closed-loop
+            # actually used this tick.
             actual_pan  = (self._last_measured_pan
                            if self._last_measured_pan is not None else cmd_pan)
             actual_tilt = (self._last_measured_tilt
