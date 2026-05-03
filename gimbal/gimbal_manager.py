@@ -364,6 +364,26 @@ class GimbalManager:
         # `tracking 532026 try3.jsonl` track #1 transit showed 0.6° peak
         # overshoot + reverse — the canonical use case for this knob.
         self._kd_track       = float(gcfg.get("kd_track", 0.02))
+        # World-target smoothing alpha for the absolute-target
+        # closed-loop. Each fresh fused observation contributes this
+        # weight to the running target; previous value gets (1−alpha).
+        # Lower = smoother (less obs-jitter passes through to gimbal),
+        # higher = snappier response to actual target motion.
+        # Try-4 transit analysis showed YOLO obs jumping by 2.5° in
+        # one fresh-obs interval (cluster centroid hopping between
+        # detections); 0.30 attenuates that to ~0.75° per smoothed
+        # update, then the controller's slew rate handles the rest
+        # smoothly. For fast-moving targets the lookahead term
+        # (lead_time × world_az_dot) compensates for the ~3-tick
+        # smoothing lag.
+        self._track_target_lp_alpha = float(
+            gcfg.get("track_target_lp_alpha", 0.30))
+        # Switch: legacy proportional closed-loop vs new absolute-target
+        # closed-loop. Default to the new path for V2 (encoder feedback
+        # makes the absolute path safe). Set false to fall back to
+        # cur_pan + d_pan_cl + ff if the absolute path needs more tuning.
+        self._track_use_absolute_target = bool(
+            gcfg.get("track_use_absolute_target", True))
 
         # Error-signal low-pass: hot targets like vehicles don't have a
         # single crisp centroid. Headlights, grille, engine bay, wheel
@@ -764,6 +784,13 @@ class GimbalManager:
         self._prev_pose_pan: Optional[float] = None
         self._prev_pose_tilt: Optional[float] = None
         self._prev_pose_t: Optional[float] = None
+        # Smoothed world-frame target. Maintained across fresh
+        # observations to absorb YOLO bbox jitter before commanding
+        # the gimbal. EMA: new value contributes _target_lp_alpha,
+        # previous (1 − _target_lp_alpha). Reset to None on a new
+        # track-engagement so the first obs anchors the smoother.
+        self._smooth_target_az: Optional[float] = None
+        self._smooth_target_el: Optional[float] = None
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -1474,8 +1501,37 @@ class GimbalManager:
                             cap = self._track_predict_cap_deg
                             ff_az_deg = max(-cap, min(cap, ff_az_deg))
                             ff_el_deg = max(-cap, min(cap, ff_el_deg))
-                        sp_pan_pred  = cur_pan  + d_pan_cl  + ff_az_deg
-                        sp_tilt_pred = cur_tilt + d_tilt_cl + ff_el_deg
+                        if (self._track_use_absolute_target
+                                and trk_world_az is not None
+                                and trk_world_el is not None):
+                            # ABSOLUTE-TARGET path. Treat the
+                            # smoothed world-frame target as the
+                            # setpoint directly — exactly like the
+                            # Home button. Controller's slew rate
+                            # limit handles smooth approach; servo
+                            # arrives once and stays. No more
+                            # cur_pan + d_pan_cl Zeno asymptote that
+                            # caused the visible "stuck on the way"
+                            # stutter in `tracker 532026 try 4`.
+                            a = self._track_target_lp_alpha
+                            if self._smooth_target_az is None:
+                                self._smooth_target_az = float(trk_world_az)
+                                self._smooth_target_el = float(trk_world_el)
+                            else:
+                                self._smooth_target_az = (
+                                    (1.0 - a) * self._smooth_target_az
+                                    + a * float(trk_world_az))
+                                self._smooth_target_el = (
+                                    (1.0 - a) * self._smooth_target_el
+                                    + a * float(trk_world_el))
+                            sp_pan_pred  = self._smooth_target_az  + ff_az_deg
+                            sp_tilt_pred = self._smooth_target_el + ff_el_deg
+                        else:
+                            # Legacy delta-from-current closed-loop.
+                            # Kept as a fallback when world coords
+                            # aren't available or operator wants A/B.
+                            sp_pan_pred  = cur_pan  + d_pan_cl  + ff_az_deg
+                            sp_tilt_pred = cur_tilt + d_tilt_cl + ff_el_deg
                     else:
                         # Stale tick — hold the previous setpoint so
                         # the gimbal finishes its in-flight motion
@@ -1654,6 +1710,10 @@ class GimbalManager:
             self._in_deadband   = False
             self._reset_track_filter()
             self._tilt_saturated_logged = False
+            # Drop the smoothed-target memory too — the next engage
+            # will anchor on its first fresh observation.
+            self._smooth_target_az = None
+            self._smooth_target_el = None
 
         # Pan-saturation detection (symmetric with the tilt-saturated
         # logic above). Detect when the desired sp_pan would push the
