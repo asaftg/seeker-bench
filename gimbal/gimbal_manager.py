@@ -1524,8 +1524,25 @@ class GimbalManager:
                                 self._smooth_target_el = (
                                     (1.0 - a) * self._smooth_target_el
                                     + a * float(trk_world_el))
-                            sp_pan_pred  = self._smooth_target_az  + ff_az_deg
-                            sp_tilt_pred = self._smooth_target_el + ff_el_deg
+                            # D-on-encoder-velocity brake. The absolute-
+                            # target setpoint above hands the controller a
+                            # static target which it slews to at full slew
+                            # rate (120 dps) — servo momentum then carries
+                            # it past on arrival. Subtracting kd × actual
+                            # angular velocity from the setpoint pulls the
+                            # commanded position BEHIND the true target by
+                            # an amount proportional to how fast the gimbal
+                            # is currently moving. As the gimbal decelerates
+                            # near target (encoder velocity drops), the brake
+                            # shrinks and the commanded position converges
+                            # to the true target. Result: smooth approach,
+                            # no overshoot.
+                            sp_pan_pred  = (self._smooth_target_az
+                                             + ff_az_deg
+                                             - self._kd_track * meas_dpan_dps)
+                            sp_tilt_pred = (self._smooth_target_el
+                                             + ff_el_deg
+                                             - self._kd_track * meas_dtilt_dps)
                         else:
                             # Legacy delta-from-current closed-loop.
                             # Kept as a fallback when world coords
