@@ -99,7 +99,13 @@ classifier:
   # thermal imagery than a fine-tuned model.
   classifier_hv_enabled: true
   classifier_hv_model: models/seeker_thermal_hv.pt
-  classifier_hv_conf: 0.55           # higher = fewer FPs on warm chips/ceiling lights
+  # 2026-05-03: lowered 0.55 → 0.45 to catch flickering marginal-distance
+  # targets. Operator complaint: bboxes flicker when target is at the
+  # edge of detectability (conf hovering around threshold). Lower floor
+  # accepts more low-conf detections; ByteTrack persistence and fusion
+  # cross-sensor matching filter out the noise downstream. Bump back to
+  # 0.55 if false positives on warm chips / ceiling lights become an issue.
+  classifier_hv_conf: 0.45
   classifier_hv_classes: [person, vehicle]
   # Reject tiny h/v detections — a real person/car at bench range is
   # much bigger than a hand-sized warm patch. Tune up if too conservative.
@@ -365,7 +371,11 @@ eo:
     # EO currently forces COCO fallback (person/car/truck/bus/motorcycle)
     # until a dedicated EO model exists. TODO: train EO drone detector.
     model: models/yolov8n.pt
-    conf_threshold: 0.45
+    # 2026-05-03: lowered 0.45 → 0.35 alongside the thermal HV classifier
+    # bump to catch marginal-distance targets that flicker at the conf
+    # threshold. Same trade-off — ByteTrack + fusion filter the noise
+    # downstream.
+    conf_threshold: 0.35
     classes: [person, vehicle]
     include_drone: false        # TODO: enable after EO drone fine-tune
     # imgsz: 832 matches the resolution seeker_eo_v3.pt was trained at
