@@ -418,6 +418,26 @@ class EOManager:
         # classifier ticks so overlays don't flicker.
         self._last_dets: list[dict] = []
 
+        # MOSSE correlation tracker pool — runs at frame rate to keep
+        # bboxes alive between YOLO ticks. ByteTrack's Kalman coast
+        # only handles motion; MOSSE handles APPEARANCE-based tracking,
+        # i.e. when YOLO's confidence dies due to motion blur during a
+        # gimbal slew but the target is still visibly there. See
+        # vision/mosse_tracker.py for algorithm. Disabled by default
+        # while the integration matures; flip the YAML knob to enable.
+        from vision.correlation_tracker_set import (
+            CorrelationTrackerSet, CorrelationTrackerSetConfig)
+        ct_cfg = (cfg.get("eo", {}).get("correlation_tracker") or {})
+        self._mosse_pool = CorrelationTrackerSet(
+            CorrelationTrackerSetConfig(
+                enabled=bool(ct_cfg.get("enabled", False)),
+                psr_lost=float(ct_cfg.get("psr_lost", 7.0)),
+                lost_frames=int(ct_cfg.get("lost_frames", 5)),
+                learning_rate=float(ct_cfg.get("learning_rate", 0.125)),
+                sigma=float(ct_cfg.get("sigma", 2.0)),
+            )
+        )
+
         # Optical-pose-feedback state. Used to detect when the published
         # gimbal pose advances WITHOUT the camera physically moving (lazy
         # servo deadband ate the PWM, or a stuck servo). Phase correlation
@@ -466,6 +486,12 @@ class EOManager:
         self._cls_in_pending: Optional[tuple[int, np.ndarray]] = None
         self._cls_out_lock = threading.Lock()
         self._cls_out_dets: list[dict] = []
+        # One-shot signal: True the first publish-tick that reads a
+        # fresh classifier result (worker just finished). Process
+        # thread consumes/clears it. Lets the MOSSE pool distinguish
+        # "reseed on YOLO ground truth" from "interpolate between
+        # ticks" without burning a sequence number.
+        self._cls_out_dets_fresh_flag: bool = False
         self._cls_out_fid: int = -1
 
         # Source lifecycle lock. Held during set_device / set_exposure_ext
@@ -1179,6 +1205,7 @@ class EOManager:
             with self._cls_out_lock:
                 self._cls_out_dets = dets
                 self._cls_out_fid = fid
+                self._cls_out_dets_fresh_flag = True
         log.info("EOManager classify thread stopped")
 
     # ───────────────────────── pipeline ──────────────────────────────
@@ -1337,6 +1364,46 @@ class EOManager:
         # the same coasting behaviour the synchronous path used to do.
         with self._cls_out_lock:
             self._last_dets = list(self._cls_out_dets)
+            # Note whether THIS tick produced fresh classifier output
+            # (so MOSSE can reseed on it instead of just running update).
+            fresh_dets_this_tick = bool(self._cls_out_dets_fresh_flag)
+            self._cls_out_dets_fresh_flag = False
+
+        # ── Frame-rate MOSSE pool ────────────────────────────────
+        # When YOLO is throttled (or its confidence drops during a
+        # gimbal slew), `_last_dets` carries STALE bboxes from N frames
+        # ago. The pool runs MOSSE on each ByteTrack ID every frame to
+        # provide fresh, frame-rate per-target bboxes. On classifier
+        # ticks: reseed each tracker on the new YOLO bbox (kills drift).
+        # Between classifier ticks: tracker output replaces the stale
+        # bbox in _last_dets. ByteTrack ID, conf, and class are
+        # preserved — only the bbox is corrected by MOSSE.
+        if self._mosse_pool.enabled and self._last_dets:
+            from vision.correlation_tracker_set import DetectorHit
+            if fresh_dets_this_tick:
+                hits = []
+                for d in self._last_dets:
+                    raw_tid = d.get("track_id")
+                    if raw_tid is None or int(raw_tid) < 0:
+                        continue
+                    bx, by, bw, bh = d["bbox"]
+                    hits.append(DetectorHit(
+                        track_id=int(raw_tid),
+                        bbox_xywh=(int(bx), int(by), int(bw), int(bh)),
+                    ))
+                pool_out = self._mosse_pool.on_detector_tick(
+                    frame, hits, self._frame_id)
+            else:
+                pool_out = self._mosse_pool.on_frame(frame, self._frame_id)
+            # Override stale bboxes with MOSSE's frame-rate output.
+            # IDs the pool dropped (lost streak) silently leave
+            # _last_dets untouched — fusion's max_misses handles them.
+            for d in self._last_dets:
+                tid = d.get("track_id")
+                if tid is None or int(tid) < 0:
+                    continue
+                if int(tid) in pool_out.bboxes:
+                    d["bbox"] = pool_out.bboxes[int(tid)]
 
         # 2. Republish last detection list every frame so overlays hold
         #    steady between YOLO ticks. ByteTrack's internal Kalman

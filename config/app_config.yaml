@@ -366,6 +366,30 @@ eo:
     logitech_c920:   { hfov_deg: 70.4, vfov_deg: 43.3 }   # 78° DFOV @ 16:9
     generic_60:      { hfov_deg: 60.0, vfov_deg: 36.9 }   # typical laptop cam
 
+  # MOSSE per-track correlation tracker (vision/mosse_tracker.py).
+  # Runs at frame rate alongside YOLO/ByteTrack to keep bboxes alive
+  # between classifier ticks (which may be throttled below frame rate)
+  # AND when YOLO confidence drops during gimbal slews due to motion
+  # blur. ByteTrack handles ID continuity via Kalman; MOSSE handles
+  # APPEARANCE-based bbox tracking.
+  #
+  # Set enabled=false to ship without MOSSE (legacy ByteTrack-only
+  # path). When enabled, the pool reseeds each ByteTrack ID on every
+  # fresh classifier output (so YOLO ground truth corrects MOSSE drift)
+  # and updates bboxes in between.
+  #
+  # Compute budget on Jetson AGX Xavier (8 Carmel cores @ 2.26 GHz):
+  #   per-track per-frame: ~1-3 ms for a 100x100 ROI MOSSE update
+  #   typical scene (3-5 ByteTrack IDs at 30 Hz): ~100-300 ms/s = 1 core
+  #   throttling YOLO 30 Hz → 10 Hz (classify_interval_frames: 3) frees
+  #   ~70% of GPU; combined net is LOWER total compute, not higher.
+  correlation_tracker:
+    enabled: false              # flip true after live-bench validation
+    psr_lost: 7.0               # Bolme paper threshold; <7 = lost
+    lost_frames: 5              # consecutive lost ticks → prune ID
+    learning_rate: 0.125        # online filter blending; 0.05–0.20
+    sigma: 2.0                  # Gaussian peak width; 2.0 default
+
   classifier:
     enabled: true
     # EO currently forces COCO fallback (person/car/truck/bus/motorcycle)
