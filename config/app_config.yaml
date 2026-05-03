@@ -645,11 +645,14 @@ gimbal:
   # cur_pan advances anyway, gimbal_state lies. Operator-reported
   # symptom: "gimbal is lazy" / "doesn't move at all" on small
   # corrections in tracking number 4 + 5 recordings.
-  # 2026-05-03 V2 bump: tightened zero_band 0.50 → 0.25 so the
-  # controller commands earlier near center. ST3025's encoder + zero
-  # internal deadband makes this safe — small commands actually move
-  # the servo now, no need for the 0.5° guard band.
-  track_zero_band_deg: 0.25
+  # 2026-05-03 V2: tried 0.50 → 0.25 to command earlier near center,
+  # but `tracking 532026 try2.jsonl` showed visible shake — the
+  # closed-loop kept chasing sub-0.5° YOLO bbox jitter, the servo
+  # responded in stutter-y 0.09° discrete steps every ~0.5 s. Reverted
+  # to 0.50: ignore obs noise within ±0.5° of center. The proper next
+  # step is an I-term to drive that 0.5° steady-state error to zero
+  # without commanding micro-corrections every tick.
+  track_zero_band_deg: 0.50
   track_full_band_deg: 1.50
   track_min_step_deg: 0.05
 
