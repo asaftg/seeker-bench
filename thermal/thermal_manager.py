@@ -225,6 +225,30 @@ class ThermalManager:
         self._last_classifications = None  # cache between classifier runs
         self._last_hv_dets: list = []      # cached h/v full-frame detections
 
+        # MOSSE per-track correlation tracker for thermal HV ByteTrack
+        # IDs. Same architecture as EOManager: pool runs at frame rate,
+        # reseeds on every classifier tick, fills the gap between with
+        # appearance-based correlation. Operator complaint: bboxes
+        # vanish on thermal-engaged targets during fast slews / motion
+        # blur. ByteTrack's Kalman alone can't recover when YOLO drops
+        # detections entirely.
+        # Caveats vs EO: thermal targets often smaller (10-30 px) and
+        # less internally textured (hot blobs without sharp edges) →
+        # MOSSE PSR is typically lower on thermal. Operator may need
+        # to drop psr_lost from 7 to 5 for thermal specifically.
+        from vision.correlation_tracker_set import (
+            CorrelationTrackerSet, CorrelationTrackerSetConfig)
+        ct_cfg = (cfg.get("thermal", {}).get("correlation_tracker") or {})
+        self._mosse_pool = CorrelationTrackerSet(
+            CorrelationTrackerSetConfig(
+                enabled=bool(ct_cfg.get("enabled", False)),
+                psr_lost=float(ct_cfg.get("psr_lost", 5.0)),  # looser default
+                lost_frames=int(ct_cfg.get("lost_frames", 5)),
+                learning_rate=float(ct_cfg.get("learning_rate", 0.125)),
+                sigma=float(ct_cfg.get("sigma", 2.0)),
+            )
+        )
+
         # Latest-frame handoff from capture thread to process thread.
         # The capture thread drains the camera as fast as it can and
         # overwrites `_latest_frame`; the process thread wakes on each
@@ -680,6 +704,48 @@ class ThermalManager:
                     for d in hv_dets
                     if int(d.get("track_id", -1)) >= 0
                 ]
+                # Reseed the MOSSE pool on every fresh classifier
+                # output. YOLO ground truth corrects any drift the
+                # pool accumulated between classifier ticks.
+                if self._mosse_pool.enabled:
+                    from vision.correlation_tracker_set import DetectorHit
+                    hits = [
+                        DetectorHit(
+                            track_id=int(trk["id"]),
+                            bbox_xywh=tuple(int(v) for v in trk["bbox"]),
+                        )
+                        for trk in self._hv_tracks
+                    ]
+                    self._mosse_pool.on_detector_tick(
+                        display, hits, self._frame_id)
+            elif self._mosse_pool.enabled and self._hv_tracks:
+                # Between classifier ticks, run MOSSE on every active
+                # ByteTrack ID to update its bbox at FRAME RATE. ID,
+                # class, conf flow through unchanged from the last
+                # classifier output; only the bbox is corrected.
+                # Tracks the pool prunes (PSR < threshold for
+                # lost_frames) are removed from _hv_tracks so the
+                # downstream merge logic doesn't republish stale
+                # bboxes for vanished targets.
+                pool_out = self._mosse_pool.on_frame(
+                    display, self._frame_id)
+                kept = []
+                for trk in self._hv_tracks:
+                    tid = int(trk["id"])
+                    if tid in pool_out.bboxes:
+                        trk["bbox"] = tuple(int(v)
+                                             for v in pool_out.bboxes[tid])
+                        kept.append(trk)
+                    elif tid in pool_out.pruned:
+                        # Drop this track — pool says target is lost.
+                        continue
+                    else:
+                        # Pool didn't know about it (e.g. ID was
+                        # filtered out at reseed because bbox went
+                        # off-frame). Keep the stale entry; ByteTrack
+                        # may revive it on the next classifier tick.
+                        kept.append(trk)
+                self._hv_tracks = kept
 
             # Merge CONFIRMED h/v tracks into detections on EVERY frame
             # (not just classifier ticks) so overlays don't flicker.

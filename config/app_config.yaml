@@ -49,6 +49,24 @@ thermal:
       mid:    { hfov_deg: 18.75 }
       narrow: { hfov_deg: 12.5 }
 
+  # MOSSE per-track correlation tracker for thermal HV (ByteTrack)
+  # IDs. Same architecture as eo.correlation_tracker, mirrored on
+  # thermal frames. See vision/COMPUTE_BUDGET.md for sizing.
+  #
+  # Defaults differ from EO:
+  #   psr_lost: 5.0 (vs 7.0 EO) — thermal targets often have lower
+  #     internal texture (hot blobs without sharp edges); the
+  #     correlation response peaks aren't as sharp, so the Bolme
+  #     paper's 7.0 threshold prunes valid tracks. 5.0 is a
+  #     conservative starting value; tighten to 7 if false-track
+  #     drift becomes a problem.
+  correlation_tracker:
+    enabled: true
+    psr_lost: 5.0               # looser than EO; thermal has weaker peaks
+    lost_frames: 5
+    learning_rate: 0.125
+    sigma: 2.0
+
 heat_detector:
   # residual = frame - spatial_mean(frame)
   # threshold = median(residual) + k * 1.4826 * MAD(residual)
