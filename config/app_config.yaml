@@ -621,9 +621,17 @@ gimbal:
   # looks like "track does nothing" to the operator. Lower defaults
   # below trade a bit more residual servo activity for visibly
   # responsive tracking on close targets.
-  kp_track:    0.30           # was 0.15 — faster slew toward target
+  # 2026-05-03 V2 (Waveshare ST3025 + encoder) centering bump:
+  # encoder feedback removed the "lazy servo" risk, so we can push
+  # the gain harder and allow bigger per-tick steps without
+  # overshoot risk. Operator wanted faster centering; this is the
+  # quick, low-risk lever (3 knobs, no code change).
+  #   kp_track       0.30 → 0.50  (+67% control gain)
+  #   max_step_deg   2.0  → 3.0   (per-tick cap; ST3025 handles 3°/tick)
+  # If overshoot shows up, add a small D term (separate commit).
+  kp_track:    0.50
   deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
-  max_step_deg: 2.0           # per-tick setpoint cap (unchanged)
+  max_step_deg: 3.0           # was 2.0 — V2 servos can handle bigger steps
 
   # Soft-deadband band edges for the proportional control law. Below
   # `track_zero_band_deg` of error: zero command. Between zero_band and
@@ -637,7 +645,11 @@ gimbal:
   # cur_pan advances anyway, gimbal_state lies. Operator-reported
   # symptom: "gimbal is lazy" / "doesn't move at all" on small
   # corrections in tracking number 4 + 5 recordings.
-  track_zero_band_deg: 0.50
+  # 2026-05-03 V2 bump: tightened zero_band 0.50 → 0.25 so the
+  # controller commands earlier near center. ST3025's encoder + zero
+  # internal deadband makes this safe — small commands actually move
+  # the servo now, no need for the 0.5° guard band.
+  track_zero_band_deg: 0.25
   track_full_band_deg: 1.50
   track_min_step_deg: 0.05
 
