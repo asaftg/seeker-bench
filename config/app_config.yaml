@@ -384,7 +384,11 @@ eo:
   #   throttling YOLO 30 Hz → 10 Hz (classify_interval_frames: 3) frees
   #   ~70% of GPU; combined net is LOWER total compute, not higher.
   correlation_tracker:
-    enabled: false              # flip true after live-bench validation
+    # Activated 2026-05-03 at operator request. If false losses
+    # appear (bboxes pruned even when target is visible), lower
+    # psr_lost from 7.0 toward 5.0. If MOSSE drifts onto background
+    # between YOLO reseeds, raise psr_lost.
+    enabled: true
     psr_lost: 7.0               # Bolme paper threshold; <7 = lost
     lost_frames: 5              # consecutive lost ticks → prune ID
     learning_rate: 0.125        # online filter blending; 0.05–0.20
