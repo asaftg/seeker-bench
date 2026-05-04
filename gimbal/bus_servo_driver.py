@@ -88,10 +88,17 @@ REG_PRESENT_TEMP = 0x3F
 REG_PRESENT_STATUS = 0x41
 
 # Adapter (A) shows up on Windows as a USB-CDC port; the WCH CH343 chip
-# inside is the most common variant.
+# inside is the most common variant. Different production batches ship
+# with different USB-to-serial chipsets, so we keep a permissive list
+# rather than locking to one VID/PID. Add new entries when a fresh
+# adapter shows up on the bench — the discovery script is:
+#   python -c "from serial.tools import list_ports; \
+#              [print(f'{p.device} VID={p.vid:#06x} PID={p.pid:#06x} \
+#              desc={p.description!r}') for p in list_ports.comports() if p.vid]"
 WAVESHARE_VID_PID_HINTS: Tuple[Tuple[int, int], ...] = (
     (0x1A86, 0x55D3),  # WCH CH343 (Adapter A typical VID/PID)
     (0x1A86, 0x7523),  # CH340 fallback (older Waveshare variants)
+    (0x09CB, 0x4007),  # bench unit observed 2026-05-04 — "USB Serial Device"
 )
 
 DEFAULT_BAUD = 1_000_000
