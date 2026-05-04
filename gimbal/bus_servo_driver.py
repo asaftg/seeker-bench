@@ -98,7 +98,12 @@ REG_PRESENT_STATUS = 0x41
 WAVESHARE_VID_PID_HINTS: Tuple[Tuple[int, int], ...] = (
     (0x1A86, 0x55D3),  # WCH CH343 (Adapter A typical VID/PID)
     (0x1A86, 0x7523),  # CH340 fallback (older Waveshare variants)
-    (0x09CB, 0x4007),  # bench unit observed 2026-05-04 — "USB Serial Device"
+    # NOTE: do NOT add VID 0x09CB here — that's Leopard Imaging, the
+    # vendor of the IMX568 EO camera. Their USB-3 module exposes a
+    # control-channel CDC ACM serial port on interface MI_02 alongside
+    # the UVC video endpoints. Matching it as a "Waveshare adapter"
+    # would let the gimbal driver write servo packets onto the EO
+    # camera's control channel.
 )
 
 DEFAULT_BAUD = 1_000_000
