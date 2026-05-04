@@ -61,6 +61,16 @@ class CorrelationTrackerSetConfig:
     # Gaussian peak sigma in the target response. Bigger = more
     # tolerance to small misalignments. 2.0 is the textbook default.
     sigma: float = 2.0
+    # Cap the FFT working size per axis. Pure-numpy FFT cost scales
+    # ~O(W*H*log(W*H)). A close-range vehicle in EO can fill a
+    # 300×200 bbox; without a cap each tracker eats 30+ ms per
+    # update and the publisher loop falls below 10 Hz. We resize
+    # the patch to fit inside this dim before the FFT and scale the
+    # peak position back to frame coords. 96 keeps EO at frame
+    # rate even with multiple close targets; raise to 128 if a
+    # particular scene has identity ambiguity from too-coarse
+    # patches.
+    max_patch_dim: int = 96
 
 
 @dataclass
@@ -148,6 +158,7 @@ class CorrelationTrackerSet:
                         learning_rate=self._cfg.learning_rate,
                         sigma=self._cfg.sigma,
                         psr_lost=self._cfg.psr_lost,
+                        max_patch_dim=self._cfg.max_patch_dim,
                     )
                     self._tracks[h.track_id] = _TrackEntry(
                         tracker=t,

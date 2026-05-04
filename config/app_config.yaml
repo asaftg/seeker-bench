@@ -66,6 +66,14 @@ thermal:
     lost_frames: 5
     learning_rate: 0.125
     sigma: 2.0
+    # Cap the FFT working size per axis. Pure-numpy FFT cost scales
+    # ~O(W*H*log(W*H)). A close-range vehicle bbox in EO/thermal can
+    # be 300x200 pixels; without this cap each tracker eats 30+ ms
+    # per update and the publisher loop falls below 10 Hz when a
+    # close target locks. The bbox returned to fusion is still in
+    # frame coords. 96 keeps both sensors at frame rate; raise to
+    # 128 if patch-coarseness causes identity drift.
+    max_patch_dim: 96
 
 heat_detector:
   # residual = frame - spatial_mean(frame)
@@ -411,6 +419,14 @@ eo:
     lost_frames: 5              # consecutive lost ticks → prune ID
     learning_rate: 0.125        # online filter blending; 0.05–0.20
     sigma: 2.0                  # Gaussian peak width; 2.0 default
+    # Cap the FFT working size per axis. Pure-numpy FFT cost is
+    # O(W*H*log(W*H)); a close-range vehicle filling a 300×200
+    # bbox in EO without this cap drove the publish loop down to
+    # 2-5 Hz when a fused track locked. We resize the patch into
+    # this cap before the FFT and scale the peak position back to
+    # frame coords. 96 keeps EO at frame rate; raise to 128 if
+    # patch-coarseness causes identity drift on small fast targets.
+    max_patch_dim: 96
 
   classifier:
     enabled: true

@@ -128,6 +128,25 @@ def _crop_patch(frame: np.ndarray,
     return frame[y0:y1, x0:x1]
 
 
+def _work_dims(box_w: int, box_h: int, max_dim: int) -> Tuple[int, int]:
+    """Map a frame-coord bbox (box_w × box_h) to the FFT working size,
+    capped at `max_dim` per axis. Preserves aspect ratio. Snapped to
+    even lengths because numpy's FFT prefers even-length axes (small
+    perf bump from radix-2). When the bbox is already <= max_dim, we
+    return it unchanged so small targets pay zero scaling cost.
+    """
+    longest = max(box_w, box_h)
+    if longest <= max_dim:
+        return int(box_w), int(box_h)
+    scale = float(longest) / float(max_dim)
+    ww = max(8, int(round(box_w / scale)))
+    hh = max(8, int(round(box_h / scale)))
+    # Snap to even lengths.
+    ww -= ww % 2
+    hh -= hh % 2
+    return ww, hh
+
+
 def _peak_psr(response: np.ndarray) -> Tuple[Tuple[int, int], float]:
     """Find the peak of the correlation response and compute PSR.
     PSR = (peak - mean(sidelobe)) / std(sidelobe), where sidelobe is
@@ -173,6 +192,7 @@ class MosseTracker:
                  sigma: float = 2.0,
                  psr_lost: float = PSR_LOST_DEFAULT,
                  n_warps: int = 8,
+                 max_patch_dim: int = 96,
                  rng_seed: Optional[int] = None) -> None:
         if frame.ndim == 3:
             frame = self._to_gray(frame)
@@ -180,17 +200,29 @@ class MosseTracker:
         # Snap to even sizes — FFT prefers even-length axes.
         w = max(8, w - (w % 2))
         h = max(8, h - (h % 2))
-        self._w, self._h = int(w), int(h)
-        self._cx = float(x) + self._w / 2.0
-        self._cy = float(y) + self._h / 2.0
+        # Frame-coord bbox dims (used for cropping the patch from the frame)
+        # are decoupled from the FFT working dims. Big bboxes (close-range
+        # vehicle) get downsampled to work-size before the FFT — without
+        # this cap, a 300×200 close target ran 4 native FFTs per update at
+        # ~10–20 ms each, dragging EO from 22 Hz to 2–5 Hz when the target
+        # entered a fused lock. The bbox returned to callers is always in
+        # frame coords.
+        self._box_w, self._box_h = int(w), int(h)
+        ww, hh = _work_dims(self._box_w, self._box_h, int(max_patch_dim))
+        self._w, self._h = ww, hh
+        self._scale_x = self._box_w / float(self._w)
+        self._scale_y = self._box_h / float(self._h)
+        self._cx = float(x) + self._box_w / 2.0
+        self._cy = float(y) + self._box_h / 2.0
         self._lr = float(learning_rate)
         self._sigma = float(sigma)
         self._psr_lost = float(psr_lost)
+        self._max_patch_dim = int(max_patch_dim)
         self._rng = np.random.default_rng(rng_seed)
         self._g = _gaussian_2d(self._h, self._w, self._sigma)
         G = np.fft.fft2(self._g)
         # Train the initial filter on the seed patch + warps.
-        patch = _crop_patch(frame, self._cx, self._cy, self._w, self._h)
+        patch = self._crop_to_work(frame)
         if patch is None:
             raise ValueError("seed bbox extends outside frame")
         # Numerator = sum_i G * conj(X_i); Denominator = sum_i X_i * conj(X_i)
@@ -211,7 +243,7 @@ class MosseTracker:
         """
         if frame.ndim == 3:
             frame = self._to_gray(frame)
-        patch = _crop_patch(frame, self._cx, self._cy, self._w, self._h)
+        patch = self._crop_to_work(frame)
         if patch is None:
             # Walked off the edge. Caller should drop this tracker.
             return MosseUpdate(self._current_bbox(), 0.0, False)
@@ -226,16 +258,17 @@ class MosseTracker:
         # empirically on synthetic frames in test_mosse_tracker.)
         R = np.real(np.fft.ifft2(H * X))
         (py, px), psr = _peak_psr(R)
-        # Sub-pixel translation from peak position.
-        dx = float(px) - (self._w - 1) / 2.0
-        dy = float(py) - (self._h - 1) / 2.0
-        self._cx += dx
-        self._cy += dy
+        # Peak position is in WORK-pixel coords. Convert sub-pixel
+        # translation back to FRAME-pixel coords using the per-axis
+        # scale ratios so the centroid update is in the right space.
+        dx_work = float(px) - (self._w - 1) / 2.0
+        dy_work = float(py) - (self._h - 1) / 2.0
+        self._cx += dx_work * self._scale_x
+        self._cy += dy_work * self._scale_y
         locked = psr >= self._psr_lost
         if locked:
             # Online filter update at this new center.
-            new_patch = _crop_patch(frame, self._cx, self._cy,
-                                     self._w, self._h)
+            new_patch = self._crop_to_work(frame)
             if new_patch is not None:
                 X_new = np.fft.fft2(_preprocess(new_patch))
                 G = np.fft.fft2(self._g)
@@ -258,12 +291,20 @@ class MosseTracker:
         x, y, w, h = bbox_xywh
         w = max(8, w - (w % 2))
         h = max(8, h - (h % 2))
-        self._w, self._h = int(w), int(h)
-        self._cx = float(x) + self._w / 2.0
-        self._cy = float(y) + self._h / 2.0
-        self._g = _gaussian_2d(self._h, self._w, self._sigma)
+        self._box_w, self._box_h = int(w), int(h)
+        ww, hh = _work_dims(self._box_w, self._box_h, self._max_patch_dim)
+        # If the work-size changed (target growing/shrinking across the
+        # cap boundary) we have to rebuild g, H_num, H_den at the new
+        # array shape. Common case: same shape — keep the buffers.
+        if (ww, hh) != (self._w, self._h):
+            self._w, self._h = ww, hh
+            self._g = _gaussian_2d(self._h, self._w, self._sigma)
+        self._scale_x = self._box_w / float(self._w)
+        self._scale_y = self._box_h / float(self._h)
+        self._cx = float(x) + self._box_w / 2.0
+        self._cy = float(y) + self._box_h / 2.0
         G = np.fft.fft2(self._g)
-        patch = _crop_patch(frame, self._cx, self._cy, self._w, self._h)
+        patch = self._crop_to_work(frame)
         if patch is None:
             raise ValueError("reseed bbox extends outside frame")
         num = np.zeros((self._h, self._w), dtype=np.complex128)
@@ -282,9 +323,37 @@ class MosseTracker:
 
     # ── helpers ───────────────────────────────────────────────────
     def _current_bbox(self) -> Tuple[int, int, int, int]:
-        x0 = int(round(self._cx - self._w / 2.0))
-        y0 = int(round(self._cy - self._h / 2.0))
-        return (x0, y0, self._w, self._h)
+        # Bbox is reported in FRAME coords (using box_w/box_h),
+        # not work coords. Centroid lives in frame coords too.
+        x0 = int(round(self._cx - self._box_w / 2.0))
+        y0 = int(round(self._cy - self._box_h / 2.0))
+        return (x0, y0, self._box_w, self._box_h)
+
+    def _crop_to_work(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Crop a box_w × box_h patch from `frame` centered on
+        (cx, cy), then downsample to the FFT working size. Returns
+        None if the bbox extends outside the frame. When the bbox
+        is already at or below the max work dim, this collapses to
+        a plain crop (no resize cost)."""
+        patch = _crop_patch(frame, self._cx, self._cy,
+                            self._box_w, self._box_h)
+        if patch is None:
+            return None
+        if (self._box_w, self._box_h) == (self._w, self._h):
+            return patch
+        # cv2.resize takes (w, h). INTER_AREA is the right choice for
+        # downsampling (anti-aliased). Local import to keep this module
+        # importable in environments without cv2 — falls back to the
+        # equivalent uint8 stride decimation below.
+        try:
+            import cv2  # type: ignore
+            return cv2.resize(patch, (self._w, self._h),
+                              interpolation=cv2.INTER_AREA)
+        except Exception:
+            # Pure-numpy fallback: stride-decimate, lossy but functional.
+            ys = np.linspace(0, patch.shape[0] - 1, self._h).astype(np.int32)
+            xs = np.linspace(0, patch.shape[1] - 1, self._w).astype(np.int32)
+            return patch[ys[:, None], xs[None, :]]
 
     @staticmethod
     def _to_gray(frame: np.ndarray) -> np.ndarray:

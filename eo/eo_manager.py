@@ -435,6 +435,7 @@ class EOManager:
                 lost_frames=int(ct_cfg.get("lost_frames", 5)),
                 learning_rate=float(ct_cfg.get("learning_rate", 0.125)),
                 sigma=float(ct_cfg.get("sigma", 2.0)),
+                max_patch_dim=int(ct_cfg.get("max_patch_dim", 96)),
             )
         )
 
