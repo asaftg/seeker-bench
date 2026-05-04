@@ -207,6 +207,12 @@ class _Track:
     # no streak / misses accounting (never needs a real detection), no
     # classifier pass. Lives until user clears or OF loses lock entirely.
     synthetic: bool = False
+    # Counter for synthetic late-sample retry throttle. When a synthetic
+    # track is seeded without a frame, the predict loop tries to grab OF
+    # features each tick. If the bbox interior has no good features (flat
+    # region), this would retry every frame and flood the log. We only
+    # retry every ~30 ticks and stop logging once we've already failed.
+    of_late_attempts: int = 0
 
 
 @dataclass
@@ -431,15 +437,33 @@ class DetectionTracker:
             # start working from THIS tick forward. Without this the
             # track would coast at v=0 forever and the gimbal would
             # slew the scene out from under a frozen bbox.
+            #
+            # Throttle: a flat-region bbox (uniform asphalt, sky) will
+            # never yield good features. Retry only every ~30 ticks
+            # (~0.5 s @ 60 Hz) and log at most twice per track (first
+            # attempt + first success). Without this, the loop would
+            # flood the log at frame rate forever.
             if (trk.synthetic and trk.of_pts is None
-                    and agc8 is not None and _HAS_CV2):
-                trk.of_pts = _sample_features(agc8, trk.det.bbox,
-                                              self.cfg.of_max_features)
-                log.info(
-                    "synthetic track id=%d: late-sampled %d OF features",
-                    trk.id,
-                    0 if trk.of_pts is None else len(trk.of_pts),
-                )
+                    and agc8 is not None and _HAS_CV2
+                    and (trk.of_late_attempts == 0
+                         or trk.of_late_attempts % 30 == 0)):
+                pts = _sample_features(agc8, trk.det.bbox,
+                                       self.cfg.of_max_features)
+                if pts is not None and len(pts) > 0:
+                    trk.of_pts = pts
+                    log.info(
+                        "synthetic track id=%d: late-sampled %d OF features",
+                        trk.id, len(pts),
+                    )
+                elif trk.of_late_attempts == 0:
+                    log.info(
+                        "synthetic track id=%d: late-sample found 0 features "
+                        "(flat region) — throttling retry to 0.5 Hz",
+                        trk.id,
+                    )
+                trk.of_late_attempts += 1
+            elif trk.synthetic and trk.of_pts is None:
+                trk.of_late_attempts += 1
             px, py = trk.kf.predict()
             predicted.append((px, py))
             # Shift bbox to predicted position. EMA later replaces this
