@@ -770,6 +770,12 @@ class GimbalManager:
         self._connected = False
         # Counter for consecutive write failures (auto-reconnect logic).
         self._consec_write_fail = 0
+        # Reconnect cooldown. _command_now runs at 60 Hz; without this,
+        # every disconnected tick called driver.open() which produced a
+        # warning log on systems with no Waveshare adapter — at 60 Hz the
+        # log queue contention dragged thermal/EO publish rates from
+        # 19-22 Hz down to ~6-9 Hz. Retry at most once every 5 s.
+        self._next_reconnect_ts: float = 0.0
         # V2 only: last successful measured pose. Used as the published
         # pan/tilt and as the fallback when an encoder read times out so
         # the bus doesn't flap between measured and stale-commanded on a
@@ -2235,8 +2241,14 @@ class GimbalManager:
         # commanded pan moved -15 -> -27.6, but thermal LK reported
         # zero scene shift.
         if not self._connected:
-            # Try to re-open the port. Cheap when there's no Maestro
-            # plugged in (returns False fast).
+            # Throttle reconnect attempts. Without the gate this fires
+            # at the 60 Hz tick rate, and driver.open() logs a warning
+            # each time it can't find the adapter — tens of writes/sec
+            # on the global logger queue stalls thermal/EO publishers.
+            now = time.time()
+            if now < self._next_reconnect_ts:
+                return
+            self._next_reconnect_ts = now + 5.0  # try again in 5 s
             self._connected = self._driver.open()
             if not self._connected:
                 return

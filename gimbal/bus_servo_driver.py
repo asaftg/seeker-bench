@@ -135,6 +135,11 @@ class BusServoDriver:
         # noticeable inside the manager's 16 ms tick.
         self._min_packet_gap_s = float(min_packet_gap_s)
         self._last_bus_t = 0.0
+        # Warn at most once per process when no adapter is found. Callers
+        # may invoke open() in a hot reconnect loop; without this, the
+        # warning floods the global logger queue and stalls publisher
+        # threads.
+        self._missing_warned = False
 
     # ── discovery ───────────────────────────────────────────────
 
@@ -178,10 +183,21 @@ class BusServoDriver:
         if port is None:
             hits = self.list_candidate_ports()
             if not hits:
-                log.warning("No Waveshare bus-servo adapter found on any COM port")
+                if not self._missing_warned:
+                    log.warning(
+                        "No Waveshare bus-servo adapter found on any COM "
+                        "port — gimbal disconnected. Subsequent reconnect "
+                        "attempts will be silent."
+                    )
+                    self._missing_warned = True
+                else:
+                    log.debug("No Waveshare bus-servo adapter (retry)")
                 return False
             port, desc = hits[0]
             log.info("Bus-servo adapter auto-detected on %s (%s)", port, desc)
+            # Adapter has reappeared since the last warning — clear the
+            # one-shot so a future disconnect logs again.
+            self._missing_warned = False
 
         try:
             # rtscts/dsrdtr off + DTR/RTS deasserted at open: some adapter
