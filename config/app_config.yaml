@@ -108,7 +108,16 @@ classifier:
   model_path: models/yolov8n.pt
   trained_model_path: models/seeker_thermal.pt   # preferred if exists
   conf_threshold: 0.40          # higher = fewer false DRONE labels; lower = catches faint drones
-  classify_interval_frames: auto  # auto | int. auto = 1 on GPU, 6 on CPU (~5Hz on laptop).
+  # YOLO inference cadence. Thermal capture is 60 Hz. Running YOLO on
+  # every frame consumed ~half the per-tick budget AND contended for
+  # GPU with the EO YOLO, dragging thermal publish rate to ~14 Hz.
+  # MOSSE (vision/correlation_tracker_set.py) keeps bboxes alive at
+  # frame rate between YOLO ticks, so we can throttle YOLO to every
+  # 3rd captured frame (= 20 Hz YOLO) without losing per-frame target
+  # persistence. This matches vision/COMPUTE_BUDGET.md's recommended
+  # design point: "throttling YOLO 30 Hz → 10 Hz is the biggest lever
+  # in this whole picture."
+  classify_interval_frames: 3   # auto | int. 3 → 20 Hz YOLO at 60 Hz capture.
   roi_padding_px: 16
   # Model class-index → TargetClass mapping.
   # For the fine-tuned seeker_thermal.pt trained on thermal drone
