@@ -57,6 +57,10 @@ if not errorlevel 1 (
     exit /b 1
 )
 
+REM ── EO sensor (IMX568) is back online on the bench (deserializer
+REM    fixed 2026-05-04). Default launch enables the EO pipeline.
+REM    To bring up without EO (e.g. EO disconnected for maintenance),
+REM    pass --no-eo on the command line: START_SEEKER.bat --no-eo
 echo  Launching Seeker...
 echo.
 python main.py %*
