@@ -1523,29 +1523,39 @@ class EOManager:
                         and bus_pan is not None and bus_tilt is not None
                         and self._prev_bus_pan is not None
                         and self._prev_bus_tilt is not None):
-                    # phaseCorrelate returns (dx, dy) of CURR relative
-                    # to PREV (positive dx = image moved right).
-                    # Camera motion is opposite the image content motion.
-                    sh = cv2.phaseCorrelate(self._prev_frame_small,
-                                             small_gray)
-                    dx_px, dy_px = sh[0]
-                    nh, nw = small_gray.shape
-                    # Downsampled FOV → deg/px on the small image.
-                    deg_per_px_h = self._hfov / float(nw)
-                    deg_per_px_v = self._vfov / float(nh)
-                    # Camera pan-right shifts content left, so dpan = -dx*deg/px.
-                    # Camera tilt-up shifts content down, so dtilt = +dy*deg/px.
-                    dpan_optical = -float(dx_px) * deg_per_px_h
-                    dtilt_optical = float(dy_px) * deg_per_px_v
                     bus_dpan = bus_pan - self._prev_bus_pan
                     bus_dtilt = bus_tilt - self._prev_bus_tilt
-                    # Reject BUS updates that aren't backed by optics.
+                    # phaseCorrelate is ~3 ms per call on a 256-wide
+                    # downsample. The override below only fires when
+                    # |bus_d*| > bus_motion_min_deg, so on a static
+                    # gimbal (the common case) the phaseCorrelate
+                    # output is computed and discarded. Skip it when
+                    # neither axis crossed the motion gate. We still
+                    # update self._prev_frame_small below so the very
+                    # next frame after motion-start has a fresh prev.
                     if (abs(bus_dpan) > self._bus_motion_min_deg
-                            and abs(dpan_optical) < self._optical_confirm_deg):
-                        gimbal_pan_at_capture = self._prev_bus_pan
-                    if (abs(bus_dtilt) > self._bus_motion_min_deg
-                            and abs(dtilt_optical) < self._optical_confirm_deg):
-                        gimbal_tilt_at_capture = self._prev_bus_tilt
+                            or abs(bus_dtilt) > self._bus_motion_min_deg):
+                        # phaseCorrelate returns (dx, dy) of CURR relative
+                        # to PREV (positive dx = image moved right).
+                        # Camera motion is opposite the image content motion.
+                        sh = cv2.phaseCorrelate(self._prev_frame_small,
+                                                 small_gray)
+                        dx_px, dy_px = sh[0]
+                        nh, nw = small_gray.shape
+                        # Downsampled FOV → deg/px on the small image.
+                        deg_per_px_h = self._hfov / float(nw)
+                        deg_per_px_v = self._vfov / float(nh)
+                        # Camera pan-right shifts content left, so dpan = -dx*deg/px.
+                        # Camera tilt-up shifts content down, so dtilt = +dy*deg/px.
+                        dpan_optical = -float(dx_px) * deg_per_px_h
+                        dtilt_optical = float(dy_px) * deg_per_px_v
+                        # Reject BUS updates that aren't backed by optics.
+                        if (abs(bus_dpan) > self._bus_motion_min_deg
+                                and abs(dpan_optical) < self._optical_confirm_deg):
+                            gimbal_pan_at_capture = self._prev_bus_pan
+                        if (abs(bus_dtilt) > self._bus_motion_min_deg
+                                and abs(dtilt_optical) < self._optical_confirm_deg):
+                            gimbal_tilt_at_capture = self._prev_bus_tilt
 
                 self._prev_frame_small = small_gray
                 # Remember what we ACCEPTED as the bus pose so the next

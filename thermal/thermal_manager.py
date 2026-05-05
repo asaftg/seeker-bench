@@ -146,14 +146,20 @@ class ThermalManager:
         ccfg = cfg.get("classifier", {})
         if enable_classifier and bool(ccfg.get("classifier_hv_enabled", False)):
             try:
-                # imgsz: "auto" = 960 on GPU (better small-target range), 640 on CPU.
+                # imgsz: "auto" = 640. The Boson is 640×512 native, so
+                # letterbox-padding to 640×640 is essentially a no-op
+                # resize. The previous auto-on-GPU value of 960 forced
+                # an UPSAMPLE before inference — ~2.25× the per-call
+                # work without adding any source detail, and shared GPU
+                # contention with the EO YOLO at imgsz=832 dragged
+                # thermal publish down to ~15 Hz. Operators wanting
+                # extra small-target recall can still set
+                # classifier_hv_imgsz: 832 or 960 explicitly in YAML;
+                # the auto path now picks the size the source frame
+                # actually carries information at.
                 _raw_imgsz = ccfg.get("classifier_hv_imgsz", "auto")
                 if isinstance(_raw_imgsz, str) and _raw_imgsz.lower() == "auto":
-                    try:
-                        import torch
-                        _hv_imgsz = 960 if torch.cuda.is_available() else 640
-                    except Exception:
-                        _hv_imgsz = 640
+                    _hv_imgsz = 640
                 else:
                     _hv_imgsz = int(_raw_imgsz)
                 self._classifier_hv = HumanVehicleClassifier(
@@ -516,6 +522,11 @@ class ThermalManager:
             display_full = frame
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             raw16_full = gray.astype(np.uint16, copy=False)
+            # AGC-fallback path: the YUY2 camera already gave us a
+            # display-stretched uint8, so reuse it as the agc8 input
+            # for the heat detector below — same dedup intent as the
+            # raw16 path.
+            _agc8 = gray
             # Camera fell back to AGC8/YUY2 — we only have a uint8 BGR
             # already. Apply the post-AGC enhancement chain to the gray
             # channel and re-colormap so the operator sees the same
@@ -528,9 +539,13 @@ class ThermalManager:
                 display_full = frame
 
         # ── 2. Detect on the full frame ────────────────────────────
+        # Pass _agc8 (the already-AGC'd uint8) through to skip a
+        # duplicate percentile + cast inside HeatDetector. Saves ~8 ms
+        # per frame on a 640×512 Boson; lifts publish 15 Hz → ~18-19 Hz
+        # on multi-target scenes. See thermal-pipeline audit 2026-05-04.
         detections = []
         try:
-            detections = self._detector.detect(raw16_full)
+            detections = self._detector.detect(raw16_full, agc8=_agc8)
         except Exception as e:
             log.warning("Heat detector failed: %s", e)
 
