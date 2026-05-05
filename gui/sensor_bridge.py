@@ -726,13 +726,39 @@ def fused_to_wire(
     e_hfov = ef.hfov_deg if ef is not None else 11.05
     e_vfov = ef.vfov_deg if ef is not None else 9.23
 
+    # Per-panel pose-at-capture, for re-projecting world-frame tracks into
+    # each frame's actual viewing angle. Without this the fused bbox lags
+    # the image during a fast slew: fusion stamps trk.az_deg using
+    # `cur_pan` at fusion-publish time (15 Hz tick), but the EO frame
+    # being drawn was captured at an OLDER pose, and the thermal frame
+    # at yet a third pose. At a 50 °/s slew the per-tick lag works out
+    # to ~3° on EO (HFOV 11°) → ~170 px offset on the 1236-wide canvas,
+    # which the operator perceives as "losing the target." When the
+    # track carries world_az_deg / world_el_deg AND the panel frame
+    # carries gimbal_*_at_capture, we project off (world − pose_at_capture)
+    # so the bbox lands on the image's actual viewing angle.
+    e_pan_cap = getattr(ef, "gimbal_pan_at_capture", None) if ef is not None else None
+    e_tilt_cap = getattr(ef, "gimbal_tilt_at_capture", None) if ef is not None else None
+    t_pan_cap = getattr(tf, "gimbal_pan_at_capture", None) if tf is not None else None
+    t_tilt_cap = getattr(tf, "gimbal_tilt_at_capture", None) if tf is not None else None
+
     out: list[Dict[str, Any]] = []
     for trk in tracks:
         if not isinstance(trk, FusedTrack):
             continue
-        # Thermal projection — subtract bias to land in thermal's raw frame
-        thr_az = trk.az_deg - float(thermal_az_bias_deg)
-        thr_el = trk.el_deg - float(thermal_el_bias_deg)
+        wa = getattr(trk, "world_az_deg", None)
+        we = getattr(trk, "world_el_deg", None)
+        # Thermal projection — pose-sync to the thermal frame's
+        # capture pose if both world angles + thermal pose-at-capture
+        # are available; fall back to the legacy (camera-frame az_deg
+        # at fusion-publish-pose) path when world fusion is off or
+        # the thermal frame predates the pose stamp.
+        if wa is not None and we is not None and t_pan_cap is not None and t_tilt_cap is not None:
+            thr_az = wa - float(t_pan_cap) - float(thermal_az_bias_deg)
+            thr_el = we - float(t_tilt_cap) - float(thermal_el_bias_deg)
+        else:
+            thr_az = trk.az_deg - float(thermal_az_bias_deg)
+            thr_el = trk.el_deg - float(thermal_el_bias_deg)
         bt = None
         if t_w and t_h and angular_bbox_visible(
             thr_az, thr_el, trk.ang_w_deg, trk.ang_h_deg, t_hfov, t_vfov
@@ -743,13 +769,20 @@ def fused_to_wire(
             )
             if w > 0 and h > 0:
                 bt = {"x": x, "y": y, "w": w, "h": h}
-        # EO projection — EO is ground truth, no bias correction
+        # EO projection — EO is ground truth, no bias correction.
+        # Same pose-sync pattern as thermal above.
+        if wa is not None and we is not None and e_pan_cap is not None and e_tilt_cap is not None:
+            eo_az = wa - float(e_pan_cap)
+            eo_el = we - float(e_tilt_cap)
+        else:
+            eo_az = trk.az_deg
+            eo_el = trk.el_deg
         be = None
         if e_w and e_h and angular_bbox_visible(
-            trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg, e_hfov, e_vfov
+            eo_az, eo_el, trk.ang_w_deg, trk.ang_h_deg, e_hfov, e_vfov
         ):
             x, y, w, h = angular_to_bbox(
-                trk.az_deg, trk.el_deg, trk.ang_w_deg, trk.ang_h_deg,
+                eo_az, eo_el, trk.ang_w_deg, trk.ang_h_deg,
                 e_w, e_h, e_hfov, e_vfov,
             )
             if w > 0 and h > 0:
