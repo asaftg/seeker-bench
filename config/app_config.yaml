@@ -63,7 +63,18 @@ thermal:
   correlation_tracker:
     enabled: true
     psr_lost: 5.0               # looser than EO; thermal has weaker peaks
-    lost_frames: 5
+    # 2026-05-04: 5 → 15 after the night recording showed engaged
+    # tracks dropping during fast slews. Mechanism: motion blur kills
+    # YOLO confidence so HV ByteTrack stops emitting fresh detections
+    # for ~0.5-1 s. With lost_frames=5 (~83 ms at 60 Hz capture) the
+    # MOSSE pool prunes the per-target tracker before YOLO recovers,
+    # and the fused track loses its last observation source from
+    # thermal. lost_frames=15 (~250 ms) lets MOSSE keep the bbox
+    # alive across a typical slew, so when YOLO recovers on the
+    # other side the same ByteTrack ID gets reseeded — the lock
+    # survives. 15 is conservative; bump to 30 if a particular scene
+    # still drops bboxes mid-slew.
+    lost_frames: 15
     learning_rate: 0.125
     sigma: 2.0
     # Cap the FFT working size per axis. Pure-numpy FFT cost scales
@@ -425,7 +436,12 @@ eo:
     # between YOLO reseeds, raise psr_lost.
     enabled: true
     psr_lost: 7.0               # Bolme paper threshold; <7 = lost
-    lost_frames: 5              # consecutive lost ticks → prune ID
+    # 2026-05-04: 5 → 12 (≈480 ms at 25 Hz EO) so MOSSE coasts EO
+    # ByteTrack IDs across fast-slew motion-blur dips, mirroring the
+    # bigger thermal bump. EO thinner than thermal (12 vs 15 frames)
+    # because the EO ByteTrack Kalman has its own coast — they
+    # combine multiplicatively for slew survival.
+    lost_frames: 12             # consecutive lost ticks → prune ID
     learning_rate: 0.125        # online filter blending; 0.05–0.20
     sigma: 2.0                  # Gaussian peak width; 2.0 default
     # Cap the FFT working size per axis. Pure-numpy FFT cost is
@@ -446,7 +462,15 @@ eo:
     # bump to catch marginal-distance targets that flicker at the conf
     # threshold. Same trade-off — ByteTrack + fusion filter the noise
     # downstream.
-    conf_threshold: 0.35
+    # 2026-05-04: 0.35 → 0.25 after the night recording showed two
+    # engaged tracks lost during legitimate fast slews. Mechanism: night
+    # EO scenes have low SNR, YOLO confidence sits close to threshold,
+    # motion blur on slew briefly pushes it below, ByteTrack drops the
+    # ID, fusion runs out of observations on that sensor → engaged
+    # track grace expires before the slew completes. 0.25 keeps the
+    # detection stream alive through brief blur dips. Raise back to
+    # 0.35 for daylight if false-positives become noisy.
+    conf_threshold: 0.25
     classes: [person, vehicle]
     include_drone: false        # TODO: enable after EO drone fine-tune
     # imgsz: 832 matches the resolution seeker_eo_v3.pt was trained at
@@ -819,6 +843,29 @@ gimbal:
   # while still allowing 0.3 s of lead-aided convergence on a
   # genuinely fresh track.
   track_no_obs_lead_zero_after_s: 0.30
+  # Hysteresis ratio for the predictor's settled gate. With a single
+  # threshold at gimbal_settled_dps and a noisy gimbal_dps signal,
+  # the gate flipped at ~4 Hz on `night tracking a bit flickery.jsonl`
+  # track #6, producing 20 settled<->unsettled transitions in 5 s
+  # which the operator perceives as flicker. Hysteresis flips OUT of
+  # settled at gimbal_settled_dps but only flips BACK to settled when
+  # gimbal_dps drops below settled_dps × this ratio. 1.0 = legacy
+  # (no hysteresis); 0.6 collapses ~95% of the transient flips
+  # without slowing the legitimate slew/settle transitions.
+  track_settled_hysteresis_ratio: 0.6
+
+  # How many consecutive fusion ticks the engaged track can be missing
+  # from the fused-tracks list before the gimbal drops the lock and
+  # returns to manual. Fusion runs at 15 Hz, so ticks×~67ms.
+  # 2026-05-04: bumped 20 → 60 (1.3 s → 4 s) after the night recording
+  # showed two separate engaged tracks lost via `track_grace_expired`
+  # at miss_ticks=20 — both during legitimate fast slews where motion
+  # blur briefly pushed YOLO confidence below threshold and the
+  # thermal heat-detector lost cohesion in the same window. 4 s of
+  # grace lets MOSSE keep the per-sensor ID alive long enough for
+  # YOLO/heat to re-acquire on the other side of the slew, without
+  # holding a truly-dead lock so long that the operator notices.
+  track_grace_ticks: 60
 
   # ── Optical residual correction (Stage A diagnostic + Stage B closed-loop)
   #
