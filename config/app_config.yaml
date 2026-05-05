@@ -867,6 +867,28 @@ gimbal:
   # holding a truly-dead lock so long that the operator notices.
   track_grace_ticks: 60
 
+  # Tracking-mode slew rate cap (deg/sec). Applied to the controller's
+  # per-tick step ONLY when an engaged fused track is active; manual
+  # dpad / HOME slews keep the broader gimbal.controller.{pan,tilt}_
+  # slew_deg_per_s limits.
+  #
+  # Motion-blur math (why this matters):
+  #   * EO IMX568, 11.05° HFOV across 1236 display px → 112 px/°.
+  #     At 25 Hz capture (40 ms frame), 25 dps = 1.0° = 112 px of
+  #     blur. YOLOv8n's recall on 100+ px of motion blur drops off
+  #     a cliff — operator-reported `gimbal moves too fast loses
+  #     bbs.jsonl` shows engaged tracks dying mid-slew at 25-37 dps.
+  #   * 18 dps × 40 ms = 0.72° ≈ 80 px of blur. YOLO recovers.
+  #   * Thermal Boson is essentially blur-immune at this rate
+  #     (60 Hz × 0.4° = 7 px on the 640 px @ 37° wide preset).
+  #
+  # Trade-off: at 18 dps a 30° re-acquisition takes ~1.7 s instead
+  # of ~1 s. The right call when operator's primary complaint is
+  # "lock dies during slew" rather than "acquisition feels slow."
+  # Set 0 to disable the cap entirely (legacy behaviour); raise
+  # toward 30 if mid-slew lock loss stops happening on your scenes.
+  track_slew_cap_dps: 18.0
+
   # ── Optical residual correction (Stage A diagnostic + Stage B closed-loop)
   #
   # Stage A is always on: when a synthetic-target lock is active, the

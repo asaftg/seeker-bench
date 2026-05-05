@@ -572,6 +572,21 @@ class GimbalManager:
         # gimbal.track_settled_hysteresis_ratio for the rationale.
         self._track_settled_hysteresis_ratio: float = float(
             gcfg.get("track_settled_hysteresis_ratio", 0.6))
+        # Tracking-mode slew cap. When the manager is ENGAGED on a
+        # fused track, the controller's per-tick step is clamped to
+        # this dps regardless of how big d_pan_cl + ff_az_deg is. The
+        # default 18 dps lands EO motion blur at ~0.7° per 40 ms
+        # exposure (~80 px on the 1236-wide display), which YOLO
+        # comfortably recovers from. Without this cap the V2 servo's
+        # native ~35-40 dps mechanical max produces ~1.4° / 160 px
+        # of EO blur per frame and YOLO loses the bbox mid-slew —
+        # operator-reported in `gimbal moves too fast loses bbs.jsonl`.
+        # 0 or negative disables (legacy behaviour: only the broader
+        # `gimbal.controller.pan_slew_deg_per_s` limit applies).
+        # Manual dpad / HOME slews are NOT capped — they don't run
+        # through this branch.
+        self._track_slew_cap_dps: float = float(
+            gcfg.get("track_slew_cap_dps", 18.0))
 
         # Phase 3 — confidence gate for the velocity feed-forward in
         # the closed-loop fused-track tick branch. Only apply
@@ -1794,8 +1809,19 @@ class GimbalManager:
                     pass
                 self._pan_saturated_logged = False
 
-        # Slew + clamp
-        cmd_pan, cmd_tilt = self._controller.step(sp_pan, sp_tilt)
+        # Slew + clamp.
+        # When ENGAGED on a fused track, cap the per-tick slew at
+        # _track_slew_cap_dps so EO motion blur stays within YOLO's
+        # recoverability envelope. Manual dpad / HOME / synth-target
+        # paths fall through with slew_cap_dps=None (no extra cap).
+        # tracked_id is held under self._lock; read it once.
+        with self._lock:
+            _engaged = (self._tracked_id is not None)
+        slew_cap = self._track_slew_cap_dps if _engaged else None
+        if slew_cap is not None and slew_cap <= 0:
+            slew_cap = None
+        cmd_pan, cmd_tilt = self._controller.step(
+            sp_pan, sp_tilt, slew_cap_dps=slew_cap)
         self._command_now(cmd_pan, cmd_tilt)
 
         # Recover the SERVO'S ACTUAL-LAST-WRITTEN pose from the Maestro

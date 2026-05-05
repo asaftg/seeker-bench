@@ -107,8 +107,21 @@ class GimbalController:
         return max(self.limits.tilt_min_deg, min(self.limits.tilt_max_deg, float(v)))
 
     def step(self, setpoint_pan: float, setpoint_tilt: float,
-             now: float | None = None) -> Tuple[float, float]:
+             now: float | None = None,
+             slew_cap_dps: float | None = None) -> Tuple[float, float]:
         """Advance one tick toward the setpoint under slew/limit rules.
+
+        ``slew_cap_dps`` (optional) caps the per-tick step to a
+        tighter rate than ``limits.{pan,tilt}_slew_deg_per_s``. The
+        effective limit per axis is ``min(limits.*_slew_deg_per_s,
+        slew_cap_dps)``. Use case: when the gimbal_manager is
+        ENGAGED on a fused track, slewing too fast causes EO motion
+        blur that kills YOLO recall — ~1° per 40 ms frame at 25 dps
+        on the IMX568 lens (11° HFOV / 1236 px) is ~112 px of blur,
+        more than the model can recover. The manager passes a
+        tracking-mode cap (~15-20 dps) here so chase movements stay
+        within blur recoverability while manual dpad / HOME slews
+        keep the full 120 dps responsiveness.
 
         Returns the (pan_deg, tilt_deg) that should be commanded
         this tick (and caches them for next call).
@@ -121,8 +134,13 @@ class GimbalController:
         tgt_pan  = self._clamp_pan(setpoint_pan)
         tgt_tilt = self._clamp_tilt(setpoint_tilt)
 
-        max_dpan  = self.limits.pan_slew_deg_per_s  * dt
-        max_dtilt = self.limits.tilt_slew_deg_per_s * dt
+        pan_dps_limit  = self.limits.pan_slew_deg_per_s
+        tilt_dps_limit = self.limits.tilt_slew_deg_per_s
+        if slew_cap_dps is not None and slew_cap_dps > 0:
+            pan_dps_limit  = min(pan_dps_limit,  float(slew_cap_dps))
+            tilt_dps_limit = min(tilt_dps_limit, float(slew_cap_dps))
+        max_dpan  = pan_dps_limit  * dt
+        max_dtilt = tilt_dps_limit * dt
 
         dp = tgt_pan  - self._last_pan
         dt_deg = tgt_tilt - self._last_tilt
