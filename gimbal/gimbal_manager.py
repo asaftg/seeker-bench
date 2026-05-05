@@ -952,17 +952,56 @@ class GimbalManager:
 
     def set_track_target(self, track_id: Optional[int]) -> None:
         with self._lock:
+            prev_id = self._tracked_id
             if track_id is None:
                 self._tracked_id = None
                 log.info("Fused track lock cleared → manual")
-            else:
-                try:
-                    self._tracked_id = int(track_id)
-                    # Fused lock takes priority over any heat lock.
-                    self._tracked_heat_id = None
-                    log.info("Fused track lock engaged on #%d", self._tracked_id)
-                except (TypeError, ValueError):
-                    log.warning("Bad track_id: %r", track_id)
+                return
+            try:
+                new_id = int(track_id)
+            except (TypeError, ValueError):
+                log.warning("Bad track_id: %r", track_id)
+                return
+            # Switching from one target to another (or engaging while
+            # a previous lock was still alive with tracked_id never
+            # passing through None) must reset ALL predictor and
+            # closed-loop state. Without this, the prior track's
+            # world_az_dot leaks into the new engagement and the
+            # predictor's lookahead computes
+            #     shift_az = lead_time × world_az_dot_inherited
+            # at the very first tick — producing a 2°+ initial
+            # setpoint error and the visible "aggressive at engage"
+            # burst plus the bb-flicker on switch documented in
+            # `still too aggresive i guess.jsonl` track #7 (entered
+            # the predictor stream with world_az_dot=-6.93 dps before
+            # ANY obs of #7 had been processed).
+            #
+            # The legacy reset path in _tick fires only when the else
+            # branch (tracked_id is None) runs — i.e. between two
+            # engagements that go through release. A direct switch
+            # never hits that branch, so the reset never fired.
+            if new_id != prev_id:
+                self._track_world_az = None
+                self._track_world_el = None
+                self._track_world_az_dot = 0.0
+                self._track_world_el_dot = 0.0
+                self._track_world_last_t = None
+                self._track_obs_count = 0
+                self._cur_pan_prev = None
+                self._cur_tilt_prev = None
+                self._cur_pose_prev_t = None
+                self._predictor_state.reset()
+                self._last_settled_state = None
+                self._smooth_target_az = None
+                self._smooth_target_el = None
+                self._last_sp_pan = None
+                self._last_sp_tilt = None
+                self._last_track_ts = None
+                self._last_fused_track_hits = None
+            self._tracked_id = new_id
+            # Fused lock takes priority over any heat lock.
+            self._tracked_heat_id = None
+            log.info("Fused track lock engaged on #%d", self._tracked_id)
 
     def set_track_heat(self, heat_id: Optional[int]) -> None:
         """Lock the gimbal onto a raw heat-blob tracker ID (dev-mode path).
