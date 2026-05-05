@@ -1483,8 +1483,22 @@ class GimbalManager:
                         # (transit at 36 dps, then bounce-back at 0.6°
                         # amplitude before settling). kd=0 (legacy
                         # pure-P) is still selectable via YAML.
-                        d_pan_cl  -= self._kd_track * meas_dpan_dps
-                        d_tilt_cl -= self._kd_track * meas_dtilt_dps
+                        # Per-axis "centered" gate: the brake is only
+                        # meaningful during APPROACH. When |err| <
+                        # zero_band the kp output is already zero
+                        # (deadband), so subtracting kd×velocity
+                        # would make the brake the dominant force on
+                        # sp inside the deadband — driving the
+                        # arrival-bounce documented in the absolute-
+                        # target branch above. Same semantics here.
+                        kd_brake_az_legacy = self._kd_track * meas_dpan_dps
+                        kd_brake_el_legacy = self._kd_track * meas_dtilt_dps
+                        if abs(az_in) < self._track_zero_band_deg:
+                            kd_brake_az_legacy = 0.0
+                        if abs(el_in) < self._track_zero_band_deg:
+                            kd_brake_el_legacy = 0.0
+                        d_pan_cl  -= kd_brake_az_legacy
+                        d_tilt_cl -= kd_brake_el_legacy
                         if abs(d_pan_cl)  < self._track_min_step_deg:
                             d_pan_cl  = 0.0
                         if abs(d_tilt_cl) < self._track_min_step_deg:
@@ -1550,6 +1564,34 @@ class GimbalManager:
                             ff_az_deg = 0.0
                         if abs(el_in) < self._track_zero_band_deg:
                             ff_el_deg = 0.0
+                        # Per-axis "centered" gate on the kd brake. The
+                        # absolute-target setpoint below subtracts
+                        # kd × encoder_velocity from the commanded
+                        # position so the gimbal decelerates while
+                        # APPROACHING the target. That intent is sound
+                        # during chase but pathological inside the
+                        # deadband: when |err| < zero_band the kp
+                        # output is already zero, so the kd term
+                        # becomes the dominant force on sp. With
+                        # kd=0.02 and slew-cap-bound velocities of
+                        # ~18 dps, the brake shifts sp by ~0.36°
+                        # against motion — comparable to zero_band
+                        # (0.5°). The gimbal arrives near target with
+                        # velocity, the brake pushes sp PAST target
+                        # in the opposite direction, gimbal reverses,
+                        # brake flips, gimbal reverses again. Visible
+                        # in `gimbal too aggresive 2.jsonl` track #137
+                        # at t=6.59-6.97s as a +17 → -8.6 dps velocity
+                        # reversal within 100 ms. Per-axis gate so a
+                        # target moving fast in one axis but centered
+                        # in the other gets the brake on the chasing
+                        # axis only.
+                        kd_brake_az = self._kd_track * meas_dpan_dps
+                        kd_brake_el = self._kd_track * meas_dtilt_dps
+                        if abs(az_in) < self._track_zero_band_deg:
+                            kd_brake_az = 0.0
+                        if abs(el_in) < self._track_zero_band_deg:
+                            kd_brake_el = 0.0
                         if (self._track_use_absolute_target
                                 and trk_world_az is not None
                                 and trk_world_el is not None):
@@ -1588,10 +1630,10 @@ class GimbalManager:
                             # no overshoot.
                             sp_pan_pred  = (self._smooth_target_az
                                              + ff_az_deg
-                                             - self._kd_track * meas_dpan_dps)
+                                             - kd_brake_az)
                             sp_tilt_pred = (self._smooth_target_el
                                              + ff_el_deg
-                                             - self._kd_track * meas_dtilt_dps)
+                                             - kd_brake_el)
                         else:
                             # Legacy delta-from-current closed-loop.
                             # Kept as a fallback when world coords
