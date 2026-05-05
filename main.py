@@ -23,6 +23,7 @@ import uvicorn
 
 from common.config import load_config
 from common.frame_bus import BUS
+from common.frames import Topic
 from common.logging_setup import configure, get_logger
 from eo.eo_manager import EOManager
 from fusion.fusion_manager import FusionManager
@@ -52,16 +53,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-radar", action="store_true", help="Disable radar (AWR2944P)")
     p.add_argument(
         "--radar-firmware",
-        choices=["demoDDM", "studio", "studio-py"],
-        default="studio",
-        help="Radar firmware backend. 'demoDDM' (legacy) uses the SDK demo "
-             "firmware; chip emits TLV + LVDS but halts after 30-90s by "
-             "design. 'studio' (current production path) drives TI's mmW "
-             "Studio GUI which downloads the radar-only firmware and runs "
-             "continuous LVDS streaming -- Windows-only. 'studio-py' (Phase "
-             "2, in development) replaces Studio with a pure-Python "
-             "mmwavelink client over pyserial -- Jetson-portable. "
-             "See radar_dca/mmwave_commands.py + mmwavelink_proto.py.",
+        choices=["demoDDM"],
+        default="demoDDM",
+        help="Radar firmware backend. Single supported mode: chip runs "
+             "TI's mmw_demoDDM (or our patched fork). Chip emits TLV "
+             "(humans/vehicles via on-chip CFAR) AND raw ADC over LVDS "
+             "(host PMM for drones) simultaneously. Other modes (studio, "
+             "studio-py, external) deprecated -- they bypassed the TLV "
+             "consumer and broke human/vehicle detection.",
     )
     p.add_argument("--host", default=None, help="GUI bind host")
     p.add_argument("--port", type=int, default=None, help="GUI bind port")
@@ -260,19 +259,12 @@ def main() -> int:
                 az_bias_deg=float(_ext.get("az_bias_deg", 0.0)),
                 el_bias_deg=float(_ext.get("el_bias_deg", 0.0)),
             )
-            # In demoDDM firmware mode the RadarManager owns the chip
-            # via UART CLI (cfg push, sensorStart, TLV consumer). In
-            # Studio firmware mode the chip is driven by mmW Studio's
-            # mmwavelink path — there's no TLV and we MUST NOT push
-            # CLI cfg over the same UART (would race Studio).
-            if args.radar_firmware in ("studio", "studio-py"):
-                log.info("%s firmware mode: skipping RadarManager.start() "
-                         "(no TLV path -- chip is driven by mmW Studio Lua "
-                         "bring-up + DCA UDP, OR by Phase 2 Python mmwavelink "
-                         "client). RadarManager instance kept for set_tuning() "
-                         "compatibility only.", args.radar_firmware)
-            else:
-                radar.start()
+            # demoDDM mode: RadarManager owns the chip via UART CLI
+            # (cfg push, sensorStart, TLV consumer producing the
+            # humans/vehicles target list on Topic.RADAR). Always start
+            # it -- skipping this is what broke detection in the prior
+            # external/studio modes.
+            radar.start()
             # Phase 3: build the composite that wraps RadarManager + the
             # DCA1000 raw-ADC pipeline. The composite owns mode dispatch
             # (Stock / A/G / A/A) and the raw-ADC consumer. RadarManager
@@ -317,20 +309,24 @@ def main() -> int:
                             "falling back to hard-coded defaults", e,
                         )
                         _dims = dims_from_cfg()
+                    # New DCAPipeline owns its own per-mode defaults; the
+                    # composite calls set_mode/set_params after start() to
+                    # activate the operator's saved knobs from radar_modes.json.
+                    #
+                    # pmm_only=True: in hybrid demoDDM mode the chip's
+                    # on-chip CFAR provides humans/vehicles via TLV
+                    # (RadarManager + Topic.RADAR). DCAPipeline only
+                    # needs to do PMM for drones on raw ADC -- skipping
+                    # Stage 3 (Doppler FFT) + Stage 4 (CFAR/AoA) +
+                    # tracker frees CPU and avoids the host-side
+                    # AoA-without-DDMA-unfold bug.
                     _dca_pipeline = DCAPipeline(
                         listener=_dca_listener,
                         dims=_dims,
-                        pmm_band_low_hz=50.0,
-                        pmm_band_high_hz=500.0,
-                        # 18 dB default per pmm_detector docstring.
-                        # Earlier values (6 dB, 12 dB) tracked the
-                        # post-Hann-guard noise floor — see the
-                        # detector's threshold_db docstring for the
-                        # 2026-04-29 drill-test analysis.
-                        pmm_threshold_db=18.0,
                         profile_name="awr2944p_unified",
                         max_range_m=float(radar_cfg.get("max_range_m", 250.0)),
                         az_half_deg=float(radar_cfg.get("az_half_deg", 60.0)),
+                        pmm_only=True,
                     )
                 # Build composite. start() is idempotent; the inner
                 # RadarManager.start() above is also called inside, but
@@ -433,6 +429,10 @@ def main() -> int:
     # start() is a no-op). Lifecycle is driven by gui.app's WS handler
     # OR --auto-record below.
     rec_cfg = (cfg.get("recording") or {})
+    # demoDDM mode: humans/vehicles arrive on Topic.RADAR (TLV via
+    # RadarManager); drone PMM hits arrive on Topic.RADAR_AA (raw-ADC
+    # via DCAPipeline). Recorder writes BOTH as separate JSONL channels
+    # ("radar/frame" + "radar/aa_frame") -- see jsonl_recorder._channels_table.
     recorder = JSONLRecorder(
         BUS,
         output_dir=str(rec_cfg.get("output_dir", "./recordings")),

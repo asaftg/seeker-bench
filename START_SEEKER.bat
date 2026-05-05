@@ -61,7 +61,13 @@ REM ── EO sensor (IMX568) is back online on the bench (deserializer
 REM    fixed 2026-05-04). Default launch enables the EO pipeline.
 REM    To bring up without EO (e.g. EO disconnected for maintenance),
 REM    pass --no-eo on the command line: START_SEEKER.bat --no-eo
-echo  Launching Seeker...
+REM
+REM ── Radar firmware: stock TI mmw_demoDDM SDK (or our patched fork
+REM    of it once flashed). Chip emits TLV (UART -> on-chip CFAR ->
+REM    humans/vehicles via RadarManager) AND raw ADC over LVDS to
+REM    DCA1000 (-> host PMM scan for drones). Mode picker in the GUI
+REM    is a host-side display filter -- no chip reconfig.
+echo  Launching Seeker (radar-firmware=demoDDM)...
 echo.
 python main.py %*
 if errorlevel 1 (

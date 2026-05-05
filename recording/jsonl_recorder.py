@@ -43,13 +43,29 @@ log = logging.getLogger(__name__)
 # Adding a new channel is just one entry here. The encoder runs on the
 # recorder thread, so it must be cheap-or-decoupled (JPEG is cheap-ish
 # at q=92 — measured ~3-5 ms per 640×512 frame on the bench rig).
-def _channels_table(jpeg_quality: int) -> Dict[str, tuple[str, Callable]]:
+def _channels_table(
+    jpeg_quality: int, radar_topic: str = Topic.RADAR,
+) -> Dict[str, tuple[str, Callable]]:
+    """Build the channel→(topic, encoder) table.
+
+    Two radar channels are recorded in parallel:
+      * "radar/frame"    ← Topic.RADAR    — TLV humans/vehicles from
+                                            on-chip CFAR (RadarManager)
+      * "radar/aa_frame" ← Topic.RADAR_AA — host PMM drone hits from
+                                            raw ADC (DCAPipeline)
+
+    radar_topic remains parameterized for back-compat with callers that
+    used to remap "radar/frame" onto Topic.RADAR_AA in deprecated
+    studio/external firmware modes; new code uses the default
+    (Topic.RADAR) and the second channel handles AA.
+    """
     return {
-        "thermal/frame":  (Topic.THERMAL, lambda f: encoders.encode_thermal(f, jpeg_quality)),
-        "eo/frame":       (Topic.EO,      lambda f: encoders.encode_eo(f, jpeg_quality)),
-        "radar/frame":    (Topic.RADAR,   encoders.encode_radar),
-        "gimbal/state":   (Topic.GIMBAL,  encoders.encode_gimbal),
-        "fusion/tracks":  (Topic.FUSED,   encoders.encode_fused),
+        "thermal/frame":  (Topic.THERMAL,  lambda f: encoders.encode_thermal(f, jpeg_quality)),
+        "eo/frame":       (Topic.EO,       lambda f: encoders.encode_eo(f, jpeg_quality)),
+        "radar/frame":    (radar_topic,    encoders.encode_radar),
+        "radar/aa_frame": (Topic.RADAR_AA, encoders.encode_radar),
+        "gimbal/state":   (Topic.GIMBAL,   encoders.encode_gimbal),
+        "fusion/tracks":  (Topic.FUSED,    encoders.encode_fused),
     }
 
 
@@ -60,11 +76,13 @@ class JSONLRecorder:
         output_dir: str = "recordings",
         jpeg_quality: int = 92,
         channel_enable: Optional[Dict[str, bool]] = None,
+        radar_topic: str = Topic.RADAR,
     ) -> None:
         self._bus = bus
         self._output_dir = output_dir
         self._jpeg_quality = int(jpeg_quality)
         self._channel_enable = channel_enable or {}
+        self._radar_topic = str(radar_topic)
 
         # Active-session state — None when not recording
         self._fh = None  # type: Optional[Any]
@@ -126,7 +144,7 @@ class JSONLRecorder:
         self._unsubscribe_events = events_subscribe(self._on_event)
 
         # Spawn one thread per enabled channel.
-        table = _channels_table(self._jpeg_quality)
+        table = _channels_table(self._jpeg_quality, radar_topic=self._radar_topic)
         self._threads = []
         for ch_name, (topic, encoder) in table.items():
             if self._channel_enable.get(ch_name, True) is False:
