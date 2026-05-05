@@ -368,6 +368,25 @@ def radar_to_wire(
                     "misses": int(t.misses),
                     "class": "drone" if t.source == "pmm" else "radar_detection",
                 })
+            # ALSO forward A/G CFAR detections (range/azimuth points)
+            # so the operator sees the raw radar picture, not just
+            # clustered drone targets. Previously this branch ignored
+            # ``radar_aa_frame.detections`` and the GUI was empty even
+            # when the pipeline was producing 15+ valid CFAR hits per
+            # frame — fixed 2026-05-04.
+            aa_points = []
+            for d in radar_aa_frame.detections[:max_points]:
+                aa_points.append({
+                    "x": round(d.x_m, 3),
+                    "y": round(d.y_m, 3),
+                    "z": round(d.z_m, 3),
+                    "v": round(d.doppler_mps, 2),
+                    "snr": round(float(d.snr_db), 1),
+                    "r": round(d.range_m, 2),
+                    "az": round(d.az_deg, 1),
+                    "el": round(d.el_deg, 1),
+                    "tid": int(d.target_id),
+                })
             return {
                 "connected": True,    # raw-ADC IS connected
                 "frame_id": radar_aa_frame.frame_id,
@@ -375,9 +394,9 @@ def radar_to_wire(
                 "profile": radar_aa_frame.profile or "awr2944p_unified",
                 "max_range_m": radar_aa_frame.max_range_m,
                 "fov_half_deg": radar_aa_frame.fov_half_deg,
-                "num_points": 0,
+                "num_points": len(aa_points),
                 "num_targets": len(aa_targets),
-                "points": [],
+                "points": aa_points,
                 "targets": aa_targets,
                 "detections": [],
             }
@@ -879,6 +898,12 @@ def build_ws_message(
     # Gimbal state — prefer the real GimbalManager state published on
     # the bus. Fall back to a disconnected stub so the GUI never sees
     # missing fields.
+    def _bbox_to_dict(bb):
+        if bb is None:
+            return None
+        return {"x": int(bb.x), "y": int(bb.y),
+                "w": int(bb.w), "h": int(bb.h)}
+
     if isinstance(gstate, GimbalState):
         gimbal_payload = {
             "pan": round(float(gstate.pan_deg), 2),
@@ -889,6 +914,13 @@ def build_ws_message(
             "target_pan":  round(float(gstate.target_pan_deg), 2),
             "target_tilt": round(float(gstate.target_tilt_deg), 2),
             "error": gstate.error,
+            # Lock-mode fields (gimbal.lock_mode in YAML). The GUI
+            # uses lock_state to decide GREEN (active) vs AMBER
+            # (coasting) and lock_bbox_{eo,thermal} as the bbox to
+            # draw. None when lock mode is disabled or no engagement.
+            "lock_state": getattr(gstate, "lock_state", "off"),
+            "lock_bbox_eo": _bbox_to_dict(getattr(gstate, "lock_bbox_eo", None)),
+            "lock_bbox_thermal": _bbox_to_dict(getattr(gstate, "lock_bbox_thermal", None)),
         }
     else:
         gimbal_payload = {
@@ -900,6 +932,9 @@ def build_ws_message(
             "target_pan": 0.0,
             "target_tilt": 0.0,
             "error": None,
+            "lock_state": "off",
+            "lock_bbox_eo": None,
+            "lock_bbox_thermal": None,
         }
 
     # EO gets its own JPEG quality knob — a 2K mono sensor with a real

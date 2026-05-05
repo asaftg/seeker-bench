@@ -210,10 +210,15 @@ export class EOView {
     }
   }
 
-  update(eo, mainTargetId = null, fused = [], radarTargets = []) {
+  update(eo, mainTargetId = null, fused = [], radarTargets = [], lock = null) {
     this._mainTargetId = mainTargetId;
     this._lastFused = fused || [];
     this._lastRadarTargets = radarTargets || [];
+    // Lock-mode: persistent operator-engaged tracker output. Rendered
+    // with priority over the projected fused-track bbox (so transient
+    // YOLO/heat/fusion dropouts don't blink the box). null when lock
+    // mode is off or no engagement is active.
+    this._lock = (lock && lock.bbox_eo) ? lock : null;
     // Three states for the overlay scrim:
     //   1. Hard disconnect (camera unplugged / open failed) → red
     //      "EO · DISCONNECTED" — alarming on purpose.
@@ -402,6 +407,40 @@ export class EOView {
       this.ctx.fillRect(lx, ly, tw + padX * 2, labelH);
       this.ctx.fillStyle = "#ff5cd5";
       this.ctx.fillText(label, lx + padX, ly + labelH - padY - 1);
+      this.ctx.restore();
+    }
+
+    // Lock-mode bbox: drawn LAST so it sits on top of every overlay
+    // (other than the rubber-band, which is interactive). Solid green
+    // at 4 px when ACTIVE, dashed amber at 4 px when COASTING — the
+    // amber tells the operator the appearance match is weak and the
+    // coast window is running, so a hard release may follow if the
+    // target doesn't reappear. Includes a "LOCK" label.
+    if (this._lock && this._lock.bbox_eo) {
+      const bb = this._lock.bbox_eo;
+      const px = dx + bb.x * scale;
+      const py = dy + bb.y * scale;
+      const pw = bb.w * scale;
+      const ph = bb.h * scale;
+      const coasting = this._lock.state === "coasting";
+      this.ctx.save();
+      this.ctx.lineWidth = 4;
+      this.ctx.strokeStyle = coasting ? "#ffb000" : "#00e676";
+      if (coasting) this.ctx.setLineDash([10, 6]);
+      this.ctx.strokeRect(px, py, pw, ph);
+      this.ctx.restore();
+      // Label
+      this.ctx.save();
+      this.ctx.font = "bold 12px ui-monospace, Menlo, monospace";
+      const labelText = coasting ? "LOCK · COAST" : "LOCK";
+      const labelW = this.ctx.measureText(labelText).width + 12;
+      const labelH = 18;
+      const labelX = px;
+      const labelY = Math.max(0, py - labelH);
+      this.ctx.fillStyle = coasting ? "#ffb000" : "#00e676";
+      this.ctx.fillRect(labelX, labelY, labelW, labelH);
+      this.ctx.fillStyle = "#000";
+      this.ctx.fillText(labelText, labelX + 6, labelY + labelH - 5);
       this.ctx.restore();
     }
 

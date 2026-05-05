@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from algorithms import track_predictor
 from common.config import load_config
@@ -63,6 +63,26 @@ def _clip(v: float, lim: float) -> float:
     if v >  lim: return  lim
     if v < -lim: return -lim
     return v
+
+
+def _bbox_iou(a: Tuple[int, int, int, int],
+              b: Tuple[int, int, int, int]) -> float:
+    """Intersection-over-union of two (x, y, w, h) bboxes.
+    Used by the lock-mode auto-reseed gate to decide whether a fresh
+    fused observation matches the current lock bbox closely enough
+    to refresh the appearance template."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1 = max(ax, bx); iy1 = max(ay, by)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return float(inter) / float(union)
 
 
 def _deadband(az: float, el: float, band_deg: float) -> tuple[float, float]:
@@ -819,6 +839,34 @@ class GimbalManager:
         self._smooth_target_az: Optional[float] = None
         self._smooth_target_el: Optional[float] = None
 
+        # ── Lock mode (vision/lock_tracker.py) ──────────────────────
+        # Kill switch: gimbal.lock_mode.enabled in YAML. When False,
+        # lock-mode code paths are no-ops and behaviour is byte-
+        # equivalent to the good-baseline-v1 tag.
+        from vision.lock_tracker import LockTracker, LockTrackerConfig
+        lm_cfg = (gcfg.get("lock_mode") or {})
+        self._lock_mode_enabled: bool = bool(lm_cfg.get("enabled", True))
+        lt_cfg = LockTrackerConfig(
+            psr_lost=float(lm_cfg.get("psr_lost", 5.0)),
+            lost_frames=int(lm_cfg.get("lost_frames", 5)),
+            coast_window_s=float(lm_cfg.get("coast_window_s", 3.0)),
+            learning_rate=float(lm_cfg.get("learning_rate", 0.125)),
+            sigma=float(lm_cfg.get("sigma", 2.0)),
+            max_patch_dim=int(lm_cfg.get("max_patch_dim", 96)),
+        )
+        self._lock_eo = LockTracker(lt_cfg)
+        self._lock_thermal = LockTracker(lt_cfg)
+        # Engagement metadata captured at seed time so auto-reseed
+        # can match new fused tracks back to the same target.
+        self._lock_target_id: Optional[int] = None
+        self._lock_target_class: Optional[str] = None
+        self._lock_seed_pending: bool = False
+        # Auto-reseed gates (YAML-configurable).
+        self._lock_reseed_iou_min: float = float(
+            lm_cfg.get("reseed_iou_min", 0.20))
+        self._lock_reseed_min_period_s: float = float(
+            lm_cfg.get("reseed_min_period_s", 0.30))
+
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
         self._manual_tilt = home_tilt
@@ -998,6 +1046,17 @@ class GimbalManager:
                 self._last_sp_tilt = None
                 self._last_track_ts = None
                 self._last_fused_track_hits = None
+                # Lock mode: clear previous lock state and arm a
+                # seed-pending flag. The actual seed happens on the
+                # NEXT _tick once we have fresh EO + thermal frames
+                # plus the fused track's bbox_eo / bbox_thermal
+                # projections to anchor the MOSSE patches on.
+                if self._lock_mode_enabled:
+                    self._lock_eo.release()
+                    self._lock_thermal.release()
+                    self._lock_target_id = new_id
+                    self._lock_target_class = None  # filled when seeding
+                    self._lock_seed_pending = True
             self._tracked_id = new_id
             # Fused lock takes priority over any heat lock.
             self._tracked_heat_id = None
@@ -1811,6 +1870,15 @@ class GimbalManager:
                 sp_pan, sp_tilt = self._controller.current
         else:
             self._track_miss = 0
+            # Lock mode: operator dropped the lock OR grace expired.
+            # Release the per-sensor lock trackers so the GUI stops
+            # rendering the lock bbox.
+            if self._lock_mode_enabled:
+                self._lock_eo.release()
+                self._lock_thermal.release()
+                self._lock_target_id = None
+                self._lock_target_class = None
+                self._lock_seed_pending = False
             # Not tracking — flush cached setpoints so next engage
             # starts fresh against whatever the new target's error is.
             self._last_track_ts = None
@@ -1938,6 +2006,16 @@ class GimbalManager:
             actual_tilt = (self._tilt_cal.us_to_angle(last_us_tilt)
                             if last_us_tilt is not None else cmd_tilt)
 
+        # Lock-mode tick: seed-on-pending, per-frame MOSSE update,
+        # auto-reseed from matching fused observations. No-op when
+        # gimbal.lock_mode.enabled=false in YAML, or when no track
+        # is engaged.
+        try:
+            lock_bbox_eo, lock_bbox_thermal, lock_state_str = self._lock_mode_tick()
+        except Exception:
+            log.exception("lock_mode_tick failed; emitting empty lock state")
+            lock_bbox_eo, lock_bbox_thermal, lock_state_str = None, None, "off"
+
         # Publish state. `tracked_target_id` carries whichever lock is
         # live — fused id if that's set, else the heat id. The GUI only
         # uses this for display, and the two namespaces don't collide
@@ -1957,8 +2035,208 @@ class GimbalManager:
             synth_world_el_deg=self._synth_world_el_deg,
             target_resid_az_deg=self._latest_target_resid_az,
             target_resid_el_deg=self._latest_target_resid_el,
+            lock_state=lock_state_str,
+            lock_bbox_eo=lock_bbox_eo,
+            lock_bbox_thermal=lock_bbox_thermal,
         )
         BUS.publish(Topic.GIMBAL, state)
+
+    def _lock_mode_tick(self) -> Tuple[Optional["BBox"], Optional["BBox"], str]:
+        """Run one lock-mode tick: seed-on-pending, per-frame update,
+        auto-reseed from a matching fused observation. Returns
+        ``(lock_bbox_eo, lock_bbox_thermal, lock_state)`` for publish
+        on GimbalState. When lock mode is disabled OR not engaged,
+        returns ``(None, None, "off")``.
+
+        The two sensor locks have independent state machines —
+        thermal can be COASTING while EO is ACTIVE, or vice versa.
+        The published lock_state is the WORST of the two (most
+        conservative for the GUI's amber/green decision).
+        """
+        from common.frames import BBox
+        if not self._lock_mode_enabled or self._tracked_id is None:
+            return None, None, "off"
+
+        now = time.time()
+        ef = BUS.get_latest(Topic.EO)
+        tf = BUS.get_latest(Topic.THERMAL)
+        ef_ok = (isinstance(ef, EOFrame) and ef.connected
+                  and ef.bgr is not None)
+        tf_ok = (isinstance(tf, ThermalFrame) and tf.connected
+                  and tf.agc8 is not None)
+
+        # ── Seed-pending: latch the engagement bbox from the fused
+        # track on the first tick after operator engagement.
+        if self._lock_seed_pending:
+            fused = BUS.get_latest(Topic.FUSED) or []
+            target = next((t for t in fused
+                            if getattr(t, "id", None) == self._lock_target_id),
+                           None)
+            if target is None:
+                # Fused track gone (race between engage and tick) —
+                # leave seed pending, retry next tick within grace.
+                pass
+            else:
+                self._lock_target_class = getattr(
+                    getattr(target, "target_class", None), "value", None)
+                # Compute per-sensor bboxes from the fused track's
+                # world angles + each frame's pose-at-capture, same
+                # as gui.sensor_bridge.fused_to_wire does.
+                seeded_any = False
+                if ef_ok:
+                    bbox_eo = self._fused_to_eo_bbox(target, ef)
+                    if bbox_eo is not None:
+                        if self._lock_eo.seed(ef.bgr, bbox_eo, now=now):
+                            seeded_any = True
+                if tf_ok:
+                    bbox_th = self._fused_to_thermal_bbox(target, tf)
+                    if bbox_th is not None:
+                        if self._lock_thermal.seed(tf.agc8, bbox_th, now=now):
+                            seeded_any = True
+                if seeded_any:
+                    self._lock_seed_pending = False
+
+        # ── Per-frame lock updates.
+        eo_upd = (self._lock_eo.update(ef.bgr, now=now)
+                   if (ef_ok and self._lock_eo.is_active) else None)
+        th_upd = (self._lock_thermal.update(tf.agc8, now=now)
+                   if (tf_ok and self._lock_thermal.is_active) else None)
+
+        # ── Auto-reseed: if a fused track lands within our search
+        # gate AND class matches AND IoU with current lock bbox is
+        # above the threshold, reseed to refresh the appearance
+        # template. Throttled by reseed_min_period_s.
+        fused = BUS.get_latest(Topic.FUSED) or []
+        for trk in fused:
+            tcls = getattr(getattr(trk, "target_class", None), "value", None)
+            if (self._lock_target_class is not None
+                    and tcls is not None
+                    and tcls != self._lock_target_class):
+                continue
+            if (ef_ok and eo_upd is not None and eo_upd.bbox_xywh is not None
+                    and self._lock_eo.time_since_reseed(now=now)
+                        >= self._lock_reseed_min_period_s):
+                bbox_eo = self._fused_to_eo_bbox(trk, ef)
+                if bbox_eo is not None and _bbox_iou(
+                        bbox_eo, eo_upd.bbox_xywh) >= self._lock_reseed_iou_min:
+                    self._lock_eo.reseed(ef.bgr, bbox_eo, now=now)
+            if (tf_ok and th_upd is not None and th_upd.bbox_xywh is not None
+                    and self._lock_thermal.time_since_reseed(now=now)
+                        >= self._lock_reseed_min_period_s):
+                bbox_th = self._fused_to_thermal_bbox(trk, tf)
+                if bbox_th is not None and _bbox_iou(
+                        bbox_th, th_upd.bbox_xywh) >= self._lock_reseed_iou_min:
+                    self._lock_thermal.reseed(tf.agc8, bbox_th, now=now)
+
+        # ── Compose published values.
+        def to_bbox(upd):
+            if upd is None or upd.bbox_xywh is None:
+                return None
+            x, y, w, h = upd.bbox_xywh
+            return BBox(x=int(x), y=int(y), w=int(w), h=int(h))
+
+        bbox_eo_pub = to_bbox(eo_upd)
+        bbox_th_pub = to_bbox(th_upd)
+
+        # State priority: HARD_RELEASED > COASTING > ACTIVE > OFF.
+        # We want the GUI to see "coasting" if EITHER sensor is
+        # coasting (so it goes amber), and "active" only when both
+        # are healthy.
+        from vision.lock_tracker import LockState
+        states = []
+        if eo_upd is not None: states.append(eo_upd.state)
+        if th_upd is not None: states.append(th_upd.state)
+        if not states:
+            lock_state = "off"
+        elif LockState.HARD_RELEASED in states:
+            lock_state = "released"
+            # Auto-clear on hard-release: drop the operator engagement.
+            with self._lock:
+                if self._tracked_id == self._lock_target_id:
+                    self._tracked_id = None
+            self._lock_eo.release()
+            self._lock_thermal.release()
+            self._lock_target_id = None
+            self._lock_target_class = None
+            self._lock_seed_pending = False
+            return None, None, "released"
+        elif LockState.COASTING in states:
+            lock_state = "coasting"
+        elif LockState.ACTIVE in states:
+            lock_state = "active"
+        else:
+            lock_state = "off"
+        return bbox_eo_pub, bbox_th_pub, lock_state
+
+    def _fused_to_eo_bbox(self, trk: Any,
+                           ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
+        """Project a fused track onto the EO image's pose-at-capture.
+        Mirrors gui.sensor_bridge.fused_to_wire's per-panel
+        re-projection so the lock seed lands on the same pixel
+        position the operator clicked on."""
+        from fusion.angular import angular_bbox_visible, angular_to_bbox
+        wa = getattr(trk, "world_az_deg", None)
+        we = getattr(trk, "world_el_deg", None)
+        e_pan = getattr(ef, "gimbal_pan_at_capture", None)
+        e_tilt = getattr(ef, "gimbal_tilt_at_capture", None)
+        if (wa is not None and we is not None
+                and e_pan is not None and e_tilt is not None):
+            az = wa - float(e_pan)
+            el = we - float(e_tilt)
+        else:
+            az = float(getattr(trk, "az_deg", 0.0))
+            el = float(getattr(trk, "el_deg", 0.0))
+        ang_w = float(getattr(trk, "ang_w_deg", 0.0))
+        ang_h = float(getattr(trk, "ang_h_deg", 0.0))
+        if ang_w <= 0 or ang_h <= 0:
+            return None
+        if ef.bgr is None:
+            return None
+        h, w = ef.bgr.shape[:2]
+        hfov = float(getattr(ef, "hfov_deg", 11.05))
+        vfov = float(getattr(ef, "vfov_deg", 9.23))
+        if not angular_bbox_visible(az, el, ang_w, ang_h, hfov, vfov):
+            return None
+        x, y, bw, bh = angular_to_bbox(az, el, ang_w, ang_h,
+                                         w, h, hfov, vfov)
+        if bw <= 0 or bh <= 0:
+            return None
+        return (int(x), int(y), int(bw), int(bh))
+
+    def _fused_to_thermal_bbox(self, trk: Any,
+                                 tf: "ThermalFrame") -> Optional[Tuple[int, int, int, int]]:
+        """Same as _fused_to_eo_bbox but for the thermal panel,
+        accounting for the thermal extrinsic bias."""
+        from fusion.angular import angular_bbox_visible, angular_to_bbox
+        wa = getattr(trk, "world_az_deg", None)
+        we = getattr(trk, "world_el_deg", None)
+        t_pan = getattr(tf, "gimbal_pan_at_capture", None)
+        t_tilt = getattr(tf, "gimbal_tilt_at_capture", None)
+        bias_az = float(getattr(self, "_thermal_az_bias_deg", 0.0))
+        bias_el = float(getattr(self, "_thermal_el_bias_deg", 0.0))
+        if (wa is not None and we is not None
+                and t_pan is not None and t_tilt is not None):
+            az = wa - float(t_pan) - bias_az
+            el = we - float(t_tilt) - bias_el
+        else:
+            az = float(getattr(trk, "az_deg", 0.0)) - bias_az
+            el = float(getattr(trk, "el_deg", 0.0)) - bias_el
+        ang_w = float(getattr(trk, "ang_w_deg", 0.0))
+        ang_h = float(getattr(trk, "ang_h_deg", 0.0))
+        if ang_w <= 0 or ang_h <= 0:
+            return None
+        if tf.agc8 is None:
+            return None
+        h, w = tf.agc8.shape[:2]
+        hfov = float(getattr(tf, "hfov_deg", 37.0))
+        vfov = float(getattr(tf, "vfov_deg", 30.0))
+        if not angular_bbox_visible(az, el, ang_w, ang_h, hfov, vfov):
+            return None
+        x, y, bw, bh = angular_to_bbox(az, el, ang_w, ang_h,
+                                         w, h, hfov, vfov)
+        if bw <= 0 or bh <= 0:
+            return None
+        return (int(x), int(y), int(bw), int(bh))
 
     def _resolve_heat_track(self, heat_id: int) -> Optional[_HeatObs]:
         """Look up the current az/el of a heat-blob tracker ID.

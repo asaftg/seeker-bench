@@ -116,6 +116,10 @@ let _replayActive     = false;    // true when the WS envelope arrives with `rep
 let _lastMainTargetId = null;
 let _lastFusedEO      = [];
 let _lastRadarForEO   = [];
+// Lock-mode cache — same pattern as _lastFusedEO so the binary EO
+// fast-path can keep rendering the lock bbox between shared-sensors
+// JSON ticks. {state, bbox_eo, bbox_thermal} or null when off.
+let _lastLock         = null;
 
 // Replay-mode UI: pulse a red REPLAY badge in the topbar and show
 // the playback clock so the user has a single visible time reference
@@ -1380,8 +1384,8 @@ function connect() {
             const blob = new Blob([jpegBytes], { type: "image/jpeg" });
             eo._blobUrl = URL.createObjectURL(blob);
           }
-          eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
-          if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO);
+          eoView.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO, _lastLock);
+          if (eoMini) eoMini.update(eo, _lastMainTargetId, _lastFusedEO, _lastRadarForEO, _lastLock);
           setPill("pill-eo", eo.connected ? "on" : "off", "EO");
           const eoHz = $("eo-hz");
           if (eoHz) eoHz.textContent = eo.connected ? (_eoFps.current + " Hz") : "— Hz";
@@ -1439,10 +1443,25 @@ function connect() {
     _lastFusedEO      = fusedEO;
     _lastRadarForEO   = radarForEO;
 
+    // ── Lock-mode overlay (gimbal.lock_mode in YAML) ──
+    // gimbal.lock_state is "off" | "active" | "coasting" | "released".
+    // gimbal.lock_bbox_eo / lock_bbox_thermal carry per-sensor pixel
+    // bboxes maintained by the persistent MOSSE tracker. When present,
+    // these take priority over the projected fused-track bbox so the
+    // operator's engaged target stays visually locked across YOLO /
+    // heat / fusion dropouts. The view classes look at the gimbal
+    // payload directly via the parameter we pass through below.
+    const gLock = (msg.gimbal && msg.gimbal.lock_state) ? {
+      state: msg.gimbal.lock_state,
+      bbox_eo: msg.gimbal.lock_bbox_eo || null,
+      bbox_thermal: msg.gimbal.lock_bbox_thermal || null,
+    } : null;
+    _lastLock = gLock;
+
     // ── Thermal panel ──
     const thermal = msg.thermal || {};
-    thermalView.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
-    if (thermalMini) thermalMini.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal);
+    thermalView.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal, gLock);
+    if (thermalMini) thermalMini.update(thermal, msg.main_target_id || null, fusedThermal, _devMode, radarForThermal, gLock);
     syncZoomButtons(thermal.zoom_preset);
 
     _tickFrameFps(_thFps, (msg.thermal && msg.thermal.frame_id));
@@ -1455,13 +1474,13 @@ function connect() {
 
     // ── EO panel ──
     const eo = msg.eo || {};
-    eoView.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
+    eoView.update(eo, msg.main_target_id || null, fusedEO, radarForEO, gLock);
     // DEV-tab EO mini — same payload, same overlays. This is what the
     // user watches while tuning the THERMAL AZ/EL extrinsic sliders:
     // a thermal bias shifts the green fused/projected box on the EO
     // image, and the mini shows the slide in real time so the user
     // can lock the box onto the actual target without leaving DEV.
-    if (eoMini) eoMini.update(eo, msg.main_target_id || null, fusedEO, radarForEO);
+    if (eoMini) eoMini.update(eo, msg.main_target_id || null, fusedEO, radarForEO, gLock);
     setPill("pill-eo", eo.connected ? "on" : "off", "EO");
     // NOTE: do NOT call _tickFrameFps for EO here — the shared
     // "sensors" message strips eo.jpeg_b64 and only refreshes EO

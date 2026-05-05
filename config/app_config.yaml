@@ -867,6 +867,33 @@ gimbal:
   # holding a truly-dead lock so long that the operator notices.
   track_grace_ticks: 60
 
+  # ── Lock mode (rock-solid persistent tracker) ──────────────────
+  #
+  # When the operator presses TRACK, spawn a dedicated per-sensor
+  # MOSSE tracker seeded from the engaged target's appearance.
+  # Updates every gimbal tick on the latest EO + thermal frames
+  # — survives YOLO/heat/fusion dropouts, ByteTrack ID swaps, brief
+  # occlusions. State machine: ACTIVE (PSR healthy, bbox green) →
+  # COASTING (PSR drops, bbox amber, watching for re-acquisition)
+  # → HARD_RELEASED (coast window expired, bbox cleared, return to
+  # manual). Auto-reseed when a fused track lands within
+  # `reseed_iou_min` of the lock bbox AND class matches.
+  #
+  # See vision/lock_tracker.py + GOOD_BASELINE.md for the design.
+  # SOFT REVERT: set enabled=false here and restart the bench. All
+  # lock-mode code paths are gated on this flag; legacy behaviour
+  # is byte-equivalent when disabled.
+  lock_mode:
+    enabled: true                # master switch — kill switch for revert
+    psr_lost: 5.0                # MOSSE PSR threshold below which we coast
+    lost_frames: 5               # consecutive sub-PSR frames → COASTING
+    coast_window_s: 3.0          # max time COASTING before HARD_RELEASED
+    reseed_iou_min: 0.20         # IoU(fused.bbox, lock.bbox) ≥ this → reseed
+    reseed_min_period_s: 0.30    # don't reseed faster than this even if obs allow
+    learning_rate: 0.125         # MOSSE online filter blending
+    sigma: 2.0                   # MOSSE Gaussian peak width
+    max_patch_dim: 96            # MOSSE FFT working size cap
+
   # Tracking-mode slew rate cap (deg/sec). Applied to the controller's
   # per-tick step ONLY when an engaged fused track is active; manual
   # dpad / HOME slews keep the broader gimbal.controller.{pan,tilt}_

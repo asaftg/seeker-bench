@@ -435,3 +435,17 @@ class GimbalState:
     # None when no LK measurement is available.
     target_resid_az_deg: Optional[float] = None
     target_resid_el_deg: Optional[float] = None
+    # Lock-mode tracker output (gimbal.lock_mode.enabled).
+    # When the operator presses TRACK on a fused track, gimbal_manager
+    # spawns a per-sensor MOSSE lock tracker seeded from that track's
+    # bbox content. The lock survives YOLO/heat/fusion dropouts —
+    # bbox is published every gimbal tick regardless of classifier
+    # state. None when lock mode is OFF (config disabled) or the
+    # operator hasn't engaged a track. See vision/lock_tracker.py
+    # for the state machine. lock_state is one of:
+    #   "off" / "active" / "coasting" / "released"
+    # GUI renders lock_bbox_eo / lock_bbox_thermal with priority over
+    # the projected fused-track bbox; "coasting" gets an amber edge.
+    lock_state: str = "off"
+    lock_bbox_eo: Optional["BBox"] = None
+    lock_bbox_thermal: Optional["BBox"] = None
