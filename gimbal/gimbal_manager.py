@@ -566,6 +566,12 @@ class GimbalManager:
         # genuinely fresh track.
         self._track_no_obs_lead_zero_after_s: float = float(
             gcfg.get("track_no_obs_lead_zero_after_s", 0.30))
+        # Hysteresis ratio for the predictor's settled gate. See
+        # PredictorParams.settled_hysteresis_ratio in
+        # algorithms/track_predictor.py and YAML
+        # gimbal.track_settled_hysteresis_ratio for the rationale.
+        self._track_settled_hysteresis_ratio: float = float(
+            gcfg.get("track_settled_hysteresis_ratio", 0.6))
 
         # Phase 3 — confidence gate for the velocity feed-forward in
         # the closed-loop fused-track tick branch. Only apply
@@ -1393,6 +1399,7 @@ class GimbalManager:
                     vel_clip_dps=self._track_vel_clip_dps,
                     vel_decay_halflife_s=self._track_vel_decay_halflife_s,
                     no_obs_lead_zero_after_s=self._track_no_obs_lead_zero_after_s,
+                    settled_hysteresis_ratio=self._track_settled_hysteresis_ratio,
                     tilt_saturated=tilt_sat_now,
                 )
                 # Prefer world-frame angles published directly by fusion
@@ -1507,6 +1514,27 @@ class GimbalManager:
                             cap = self._track_predict_cap_deg
                             ff_az_deg = max(-cap, min(cap, ff_az_deg))
                             ff_el_deg = max(-cap, min(cap, ff_el_deg))
+                        # Per-axis "centered" gate on the lookahead.
+                        # When the proportional output is already zero
+                        # (|err| < zero_band), the closed-loop is saying
+                        # "this axis is on target." Adding ff here just
+                        # feeds the predictor's velocity-estimate noise
+                        # into the setpoint: ~1-4 dps of jitter from
+                        # observation noise on a stationary target × 0.3 s
+                        # lead = 0.3-1.2° of unwanted setpoint motion
+                        # every tick. The controller chases that, the
+                        # settled gate flips ~4 Hz, the operator sees it
+                        # as "aggressive when centered" hunting (see
+                        # `night tracking a bit flickery.jsonl` track #6).
+                        # Per-axis decision so a target moving fast in
+                        # pan but centered in tilt still gets pan
+                        # lookahead. The lookahead re-engages cleanly
+                        # the moment |err| crosses zero_band — i.e.
+                        # when chasing actually pays off.
+                        if abs(az_in) < self._track_zero_band_deg:
+                            ff_az_deg = 0.0
+                        if abs(el_in) < self._track_zero_band_deg:
+                            ff_el_deg = 0.0
                         if (self._track_use_absolute_target
                                 and trk_world_az is not None
                                 and trk_world_el is not None):
