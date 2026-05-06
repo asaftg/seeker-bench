@@ -1418,19 +1418,33 @@ class EOManager:
                 tc = TargetClass(d["class"])
             except ValueError:
                 tc = TargetClass.UNKNOWN
-            # ByteTrack id sentinel cleanup (Phase A2): use None for
-            # "no confirmed id yet" rather than the magic value -1.
-            # Matches every other Optional[int] id field in the system
-            # (FusedTrack.eo_track_id, etc.). Skip unconfirmed dets so
-            # they don't flicker on the panel.
+            # ByteTrack id stamping: emit even unconfirmed detections
+            # (track_id None or -1) so the operator sees a bbox on
+            # the very first frame of re-acquisition instead of a
+            # 1-2 frame flicker while ByteTrack confirms.
+            #
+            # Wave 2 EO review of `lock test test.jsonl` traced the
+            # operator-perceived "track loss flicker" partly to this
+            # `continue` skipping every det whose tracker hadn't
+            # assigned an id yet. Downstream consumers (fusion,
+            # main-target sticky logic, lock-mode seed) all already
+            # tolerate `track_id is None` — the skip was over-strict.
+            #
+            # Detections without an id still get a usable bbox + class
+            # + confidence; fusion will assign a fresh fused-id via
+            # angular-IoU instead of waiting for the per-sensor
+            # tracker to converge.
             raw_tid = d.get("track_id")
+            tid_out: Optional[int]
             if raw_tid is None or int(raw_tid) < 0:
-                continue
+                tid_out = None
+            else:
+                tid_out = int(raw_tid)
             out_dets.append(EODetection(
                 bbox=BBox(x=int(bx), y=int(by), w=int(bw), h=int(bh)),
                 confidence=float(d["conf"]),
                 target_class=tc,
-                track_id=int(raw_tid),
+                track_id=tid_out,
             ))
 
         dev_idx = getattr(self._source, "device_index", None) if self._source else None

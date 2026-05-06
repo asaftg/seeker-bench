@@ -218,11 +218,30 @@ class HumanVehicleClassifier:
         """
         if self._model is None or image is None or image.size == 0:
             return []
+        # Resolve project-local bytetrack.yaml as an ABSOLUTE path so
+        # ultralytics doesn't silently fall back to its package
+        # default (new_track_thresh=0.25 → 3-4x ID churn at our
+        # YOLO conf gate). The file is committed at config/bytetrack
+        # .yaml; if missing we use the ultralytics default and log a
+        # warning rather than crashing.
+        if not hasattr(self, "_bytetrack_yaml_path"):
+            from pathlib import Path
+            project_yaml = (Path(__file__).resolve().parent.parent
+                              / "config" / "bytetrack.yaml")
+            if project_yaml.is_file():
+                self._bytetrack_yaml_path = str(project_yaml)
+                log.info("HV ByteTrack using project-local config: %s",
+                         self._bytetrack_yaml_path)
+            else:
+                self._bytetrack_yaml_path = "bytetrack.yaml"
+                log.warning("HV ByteTrack project-local yaml not found "
+                            "at %s — falling back to ultralytics default",
+                            project_yaml)
         try:
             results = self._model.track(
                 image,
                 persist=True,                  # keep tracker state across calls
-                tracker="bytetrack.yaml",      # shipped by ultralytics
+                tracker=self._bytetrack_yaml_path,
                 conf=self.conf_threshold,
                 imgsz=self.imgsz,
                 verbose=False,

@@ -1,0 +1,31 @@
+# Project-local ByteTrack config for the Seeker01 bench.
+#
+# Why this file exists:
+#   ultralytics' default `bytetrack.yaml` ships with new_track_thresh
+#   = track_high_thresh = 0.25, which collapses the two-stage gating
+#   that ByteTrack was designed for: at our YOLO conf=0.25, every
+#   borderline detection (low-conf bird, road sign, motion blur)
+#   qualifies to BIRTH a new track. Wave 2 EO audit of recordings/
+#   lock test test.jsonl and track worse.jsonl confirmed 3-4x
+#   ID churn (110 raw IDs minted vs 33 actually emitted) directly
+#   traceable to this.
+#
+# This config keeps the low conf=0.25 for ASSOCIATION (the whole
+# point — recover weak dets onto existing tracks) but raises the
+# birth threshold so weak dets can no longer spawn new IDs. Disables
+# fuse_score so the second-stage match cost isn't multiplied by
+# the (already low) detection score.
+#
+# Loaded via absolute path from thermal/classifier_hv.py — passing
+# just "bytetrack.yaml" to model.track() resolves from the
+# ultralytics package dir, which would silently use the default.
+
+tracker_type: bytetrack            # tracker type (yolo's bytetrack.yaml mode)
+track_high_thresh: 0.45            # tracks with conf >= here get matched first (was 0.25)
+track_low_thresh: 0.10             # tracks below this dropped entirely (was 0.10)
+new_track_thresh: 0.55             # MIN conf to BIRTH a new track (was 0.25 — main fix)
+track_buffer: 30                   # frames a lost track survives before deletion
+match_thresh: 0.8                  # IoU match threshold (kept ultralytics default)
+fuse_score: False                  # do NOT multiply IoU cost by detection score (was True)
+                                    # — stops weak matches from looking artificially attractive
+                                    # in the second-stage low-conf association pass
