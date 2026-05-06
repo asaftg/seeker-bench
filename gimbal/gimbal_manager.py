@@ -869,6 +869,20 @@ class GimbalManager:
         # replay can reconstruct the lock-state machine from the
         # event stream alone.
         self._lock_last_state_str: str = "off"
+        # Seed-pending timeout. Without this, if the engaged fused-id
+        # never appears in BUS.get_latest(Topic.FUSED) (engaged
+        # against a track that died between engage and the next
+        # fusion tick), seed_pending stays True forever and the
+        # lock state machine never advances. Recordings showed 4/7
+        # engagements with `lock_state="active"` published but zero
+        # `lock_seeded` events (track worse.jsonl) — the seed-pending
+        # path was the silent miss. We tag the wallclock when
+        # seed_pending was armed; if 2 s pass without a successful
+        # seed, abort and reset the state-machine string so the next
+        # engagement emits a clean transition.
+        self._lock_seed_pending_t0: Optional[float] = None
+        self._lock_seed_pending_timeout_s: float = float(
+            lm_cfg.get("seed_pending_timeout_s", 2.0))
         # Frame-id dedupe: skip MOSSE update() when the BUS-cached
         # frame is the same one we just processed. Gimbal tick runs
         # at ~35-60 Hz; EO at 17-25 Hz, thermal at 20-60 Hz. Without
@@ -1076,6 +1090,7 @@ class GimbalManager:
                     self._lock_target_id = new_id
                     self._lock_target_class = None  # filled when seeding
                     self._lock_seed_pending = True
+                    self._lock_seed_pending_t0 = time.time()
                     # Reset state-transition tracker + dedupe cache
                     # so the new engagement emits a clean `lock_seeded`
                     # event and runs a fresh MOSSE update on its first
@@ -1925,6 +1940,7 @@ class GimbalManager:
                     self._lock_target_id = None
                     self._lock_target_class = None
                     self._lock_seed_pending = False
+                    self._lock_seed_pending_t0 = None
                     # Reset the state-transition tracker so the NEXT
                     # engagement emits a clean `lock_seeded` event when
                     # off → active. Without this, the tracker keeps the
@@ -2138,6 +2154,30 @@ class GimbalManager:
         # ── Seed-pending: latch the engagement bbox from the fused
         # track on the first tick after operator engagement.
         if self._lock_seed_pending:
+            # Timeout: if seed_pending has been armed for too long
+            # without a successful seed (engaged track never appeared
+            # in fused, or per-sensor seed bbox kept failing
+            # validation), give up. Without this, _lock_last_state_str
+            # stays at "off" forever AFTER it transitions to "active"
+            # via the state-machine block below — but more importantly,
+            # the publish layer reports lock_state="off" forever and
+            # the operator sees no feedback.
+            if (self._lock_seed_pending_t0 is not None
+                    and (now - self._lock_seed_pending_t0)
+                        >= self._lock_seed_pending_timeout_s):
+                try:
+                    emit_event("lock_seed_timeout", {
+                        "tracked_id": self._lock_target_id,
+                        "elapsed_s": round(
+                            now - self._lock_seed_pending_t0, 3),
+                    })
+                except Exception:
+                    pass
+                self._lock_seed_pending = False
+                self._lock_seed_pending_t0 = None
+                # Reset state-string so next engagement re-emits the
+                # off→active transition cleanly.
+                self._lock_last_state_str = "off"
             fused = BUS.get_latest(Topic.FUSED) or []
             target = next((t for t in fused
                             if getattr(t, "id", None) == self._lock_target_id),
@@ -2182,6 +2222,7 @@ class GimbalManager:
                             seeded_any = True
                 if seeded_any:
                     self._lock_seed_pending = False
+                    self._lock_seed_pending_t0 = None
 
         # ── Per-frame lock updates.
         # Dedupe by frame_id: only run MOSSE when the BUS-cached
@@ -2325,6 +2366,8 @@ class GimbalManager:
             self._lock_target_id = None
             self._lock_target_class = None
             self._lock_seed_pending = False
+            self._lock_seed_pending_t0 = None
+            self._lock_last_state_str = "off"
             return None, None, "released"
         return bbox_eo_pub, bbox_th_pub, lock_state
 

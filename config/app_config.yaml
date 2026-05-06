@@ -910,6 +910,14 @@ gimbal:
     psr_lost: 5.0                # MOSSE PSR threshold below which we coast
     lost_frames: 5               # consecutive sub-PSR frames → COASTING
     coast_window_s: 3.0          # max time COASTING before HARD_RELEASED
+    # Seed-pending timeout (s). If the engaged fused-id never appears
+    # in BUS.get_latest(Topic.FUSED) within this window (operator
+    # engaged on a track that died between engage and the next fusion
+    # tick), abort seed_pending instead of leaving it set forever.
+    # Recordings/track worse.jsonl had 4/7 engagements with
+    # lock_state="active" published but zero lock_seeded events — the
+    # silent-miss path. Set 0 to disable timeout.
+    seed_pending_timeout_s: 2.0
     # v2 dropped reseed_iou_min — auto-reseed gates on ID equality
     # only, no IoU search. Kept here for backward-compat readers
     # but unused.
