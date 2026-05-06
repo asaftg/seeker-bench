@@ -2229,13 +2229,31 @@ class GimbalManager:
         # frame is actually new. Re-running on the same frame burns
         # CPU and produces noise (FFT peak landing 1 px apart on
         # identical input, plus the online learning-rate retraining
-        # the filter on the same patch). When dedupe hits, we
-        # republish the cached LockUpdate so the GUI sees a stable
-        # bbox between frames without doing any work.
+        # the filter on the same patch).
+        #
+        # When dedupe hits, we publish a POSE-SHIFTED version of the
+        # cached LockUpdate's bbox: the gimbal tick runs at 35-60 Hz
+        # while EO publishes at 17-25 Hz, so several gimbal ticks
+        # land on the same EO frame. Without the pose shift, the
+        # operator sees the lock bbox "freeze" at the cached frame's
+        # image-pixel coords during a slew (the camera has panned
+        # since the cached frame was captured, so the same image-px
+        # bbox would land off-target in the LATEST frame the GUI
+        # is about to render). The shift = (cur_pan - pan_at_cached_
+        # frame_capture) × pixels-per-degree gives an honest
+        # interpolation between real MOSSE updates. Wave 2 review of
+        # this morning's frame-id dedupe (commit 5670246) flagged
+        # the freeze as the "sluggish lock bbox" symptom.
+        cur_pan_now = float(getattr(self, "_last_measured_pan", 0.0)
+                              or self._controller.current[0])
+        cur_tilt_now = float(getattr(self, "_last_measured_tilt", 0.0)
+                              or self._controller.current[1])
         if ef_ok and self._lock_eo.is_active:
             ef_fid = getattr(ef, "frame_id", None)
             if ef_fid is not None and ef_fid == self._lock_last_eo_fid:
-                eo_upd = self._lock_last_eo_upd
+                eo_upd = self._pose_shift_lock_update(
+                    self._lock_last_eo_upd, ef,
+                    cur_pan_now, cur_tilt_now)
             else:
                 eo_upd = self._lock_eo.update(ef.bgr, now=now)
                 self._lock_last_eo_fid = ef_fid
@@ -2247,7 +2265,9 @@ class GimbalManager:
         if tf_ok and self._lock_thermal.is_active:
             tf_fid = getattr(tf, "frame_id", None)
             if tf_fid is not None and tf_fid == self._lock_last_th_fid:
-                th_upd = self._lock_last_th_upd
+                th_upd = self._pose_shift_lock_update(
+                    self._lock_last_th_upd, tf,
+                    cur_pan_now, cur_tilt_now)
             else:
                 th_upd = self._lock_thermal.update(tf.agc8, now=now)
                 self._lock_last_th_fid = tf_fid
@@ -2370,6 +2390,72 @@ class GimbalManager:
             self._lock_last_state_str = "off"
             return None, None, "released"
         return bbox_eo_pub, bbox_th_pub, lock_state
+
+    def _pose_shift_lock_update(self, upd, frame,
+                                  cur_pan_deg: float,
+                                  cur_tilt_deg: float):
+        """Pose-shift the cached LockUpdate's bbox so the operator
+        sees the lock follow the gimbal between real frame updates.
+
+        EO publishes at 17-25 Hz, gimbal at 35-60 Hz — between two
+        real EO frames the gimbal pose advances. The cached MOSSE
+        bbox is in IMAGE coords of the cached frame; rendering it
+        verbatim looks "frozen" because the GUI's overlay sits on
+        top of the latest gimbal pose. Compute the pose delta from
+        the cached frame's gimbal_*_at_capture to the current pose
+        and shift the bbox by (delta * px_per_deg) so the bracket
+        keeps tracking the target through the slew. When the next
+        real frame arrives, MOSSE re-anchors on actual image data
+        and any prediction error is corrected in one tick.
+
+        Returns a NEW LockUpdate instance with the shifted bbox so
+        we don't mutate the cached value.
+        """
+        if upd is None or upd.bbox_xywh is None or frame is None:
+            return upd
+        from vision.lock_tracker import LockUpdate
+        cap_pan = getattr(frame, "gimbal_pan_at_capture", None)
+        cap_tilt = getattr(frame, "gimbal_tilt_at_capture", None)
+        bgr_or_agc = getattr(frame, "bgr", None)
+        if bgr_or_agc is None:
+            bgr_or_agc = getattr(frame, "agc8", None)
+        if (cap_pan is None or cap_tilt is None
+                or bgr_or_agc is None):
+            return upd
+        h, w = bgr_or_agc.shape[:2]
+        hfov = float(getattr(frame, "hfov_deg", 0.0))
+        vfov = float(getattr(frame, "vfov_deg", 0.0))
+        if hfov <= 0 or vfov <= 0:
+            return upd
+        d_pan = float(cur_pan_deg) - float(cap_pan)
+        d_tilt = float(cur_tilt_deg) - float(cap_tilt)
+        # Skip if delta is sub-pixel — saves a copy and avoids
+        # introducing micro-jitter from float rounding.
+        px_per_deg_x = w / hfov
+        px_per_deg_y = h / vfov
+        # Sign convention: when the gimbal pans RIGHT (+pan), the
+        # scene shifts LEFT in the image → bbox.x decreases. Same
+        # for tilt: tilt UP (+tilt) → scene moves DOWN in image →
+        # bbox.y increases. Verified against
+        # eo/eo_manager.py:1490+ phase-correlate sign conventions.
+        dx = -d_pan * px_per_deg_x
+        dy = d_tilt * px_per_deg_y
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            return upd
+        x, y, bw, bh = upd.bbox_xywh
+        new_x = int(round(x + dx))
+        new_y = int(round(y + dy))
+        # Clamp to frame so a runaway slew can't push the bbox off
+        # screen (the brackets render correctly even when partially
+        # clipped, but a fully-off bbox vanishes).
+        new_x = max(-bw + 1, min(w - 1, new_x))
+        new_y = max(-bh + 1, min(h - 1, new_y))
+        return LockUpdate(
+            state=upd.state,
+            bbox_xywh=(new_x, new_y, int(bw), int(bh)),
+            psr=upd.psr,
+            coast_age_s=upd.coast_age_s,
+        )
 
     def _eo_detection_bbox(self, trk: Any,
                              ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
