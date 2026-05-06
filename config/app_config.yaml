@@ -884,7 +884,17 @@ gimbal:
   # lock-mode code paths are gated on this flag; legacy behaviour
   # is byte-equivalent when disabled.
   lock_mode:
-    enabled: true                # master switch — kill switch for revert
+    # 2026-05-05: SOFT-REVERTED to false at operator request after
+    # `recordings/lock poorly.jsonl` showed lock mode not behaving
+    # as expected (recording's gimbal/state contains no lock_state
+    # samples — bench may have been on stale code, or the recorder
+    # path wasn't serializing the new GimbalState fields). The lock
+    # mode code stays in the tree (vision/lock_tracker.py +
+    # gimbal_manager._lock_mode_tick) so we can iterate on it
+    # without re-introducing the regression on the live bench.
+    # To re-enable for a future test session: set this true and
+    # restart the bench.
+    enabled: false               # master switch — false = baseline behaviour
     psr_lost: 5.0                # MOSSE PSR threshold below which we coast
     lost_frames: 5               # consecutive sub-PSR frames → COASTING
     coast_window_s: 3.0          # max time COASTING before HARD_RELEASED
@@ -998,11 +1008,17 @@ gimbal:
     tilt_max_deg:  90.0
     # ST3025's brushless motor + 12-bit encoder can do >300 deg/s; these
     # caps protect against absurd setpoint jumps from tracking, not
-    # against the servo's physical capability. Symmetric for V2 — V1
-    # had tilt at half (60) because the hobby tilt servo couldn't keep
-    # up under load; that constraint is gone with the bus servos.
-    pan_slew_deg_per_s:  120.0
-    tilt_slew_deg_per_s: 120.0
+    # against the servo's physical capability.
+    # 2026-05-05: dropped 120 → 45 after operator reported "even the
+    # manual mode is really aggressive." 120 dps is enough to throw
+    # the bench around on a single dpad click — the servo physically
+    # delivers it. 45 dps takes ~1.5 s to slew 60° corner-to-corner
+    # on this rig, which is brisk but no longer abrupt. Manual dpad
+    # / WASD / HOME all use this limit; engaged tracking is further
+    # capped by gimbal.track_slew_cap_dps (default 18) so the chase
+    # path still respects the EO motion-blur envelope.
+    pan_slew_deg_per_s:  45.0
+    tilt_slew_deg_per_s: 45.0
 
   # Linear angle→µs calibration per servo.
   # Values reflect the actual mechanical/electrical envelope of THIS
