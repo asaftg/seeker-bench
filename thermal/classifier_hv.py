@@ -226,17 +226,38 @@ class HumanVehicleClassifier:
         # warning rather than crashing.
         if not hasattr(self, "_bytetrack_yaml_path"):
             from pathlib import Path
+            import hashlib
             project_yaml = (Path(__file__).resolve().parent.parent
                               / "config" / "bytetrack.yaml")
             if project_yaml.is_file():
                 self._bytetrack_yaml_path = str(project_yaml)
                 log.info("HV ByteTrack using project-local config: %s",
                          self._bytetrack_yaml_path)
+                _src = "project_local"
             else:
                 self._bytetrack_yaml_path = "bytetrack.yaml"
                 log.warning("HV ByteTrack project-local yaml not found "
                             "at %s — falling back to ultralytics default",
                             project_yaml)
+                _src = "ultralytics_default"
+            # Observability: emit one event per session so the
+            # resolved bytetrack.yaml is auditable from any recording.
+            # Includes a sha256 of the file content (when readable) so
+            # mid-session edits are visible too.
+            try:
+                if project_yaml.is_file():
+                    _sha = hashlib.sha256(
+                        project_yaml.read_bytes()).hexdigest()[:12]
+                else:
+                    _sha = None
+                from common.events import emit as _emit
+                _emit("bytetrack_yaml_resolved", {
+                    "source": _src,
+                    "path": self._bytetrack_yaml_path,
+                    "sha256_short": _sha,
+                })
+            except Exception:
+                pass
         try:
             results = self._model.track(
                 image,

@@ -2214,21 +2214,48 @@ class GimbalManager:
                 # 3-4x oversized patch then "tracks" the union of
                 # target + background, jumping wildly.
                 seeded_any = False
+                eo_src = "skip"
+                th_src = "skip"
                 if ef_ok:
-                    bbox_eo = (self._eo_detection_bbox(target, ef)
-                                or self._fused_to_eo_bbox(target, ef))
+                    bbox_eo_det = self._eo_detection_bbox(target, ef)
+                    if bbox_eo_det is not None:
+                        bbox_eo = bbox_eo_det
+                        eo_src = "eo_track_id"
+                    else:
+                        bbox_eo = self._fused_to_eo_bbox(target, ef)
+                        eo_src = "fused_angular" if bbox_eo else "no_bbox"
                     if bbox_eo is not None:
                         if self._lock_eo.seed(ef.bgr, bbox_eo, now=now):
                             seeded_any = True
                 if tf_ok:
-                    bbox_th = (self._thermal_detection_bbox(target, tf)
-                                or self._fused_to_thermal_bbox(target, tf))
+                    bbox_th_det = self._thermal_detection_bbox(target, tf)
+                    if bbox_th_det is not None:
+                        bbox_th = bbox_th_det
+                        th_src = "thermal_heat_id"
+                    else:
+                        bbox_th = self._fused_to_thermal_bbox(target, tf)
+                        th_src = "fused_angular" if bbox_th else "no_bbox"
                     if bbox_th is not None:
                         if self._lock_thermal.seed(tf.agc8, bbox_th, now=now):
                             seeded_any = True
                 if seeded_any:
                     self._lock_seed_pending = False
                     self._lock_seed_pending_t0 = None
+                    # Observability: record which seed-source path was
+                    # taken per sensor (eo_track_id / thermal_heat_id =
+                    # tight per-sensor classifier bbox, the fix from
+                    # commit 5670246; fused_angular = legacy projection
+                    # via FusedTrack.ang_w/h, which can be oversized
+                    # when radar contributes). Lets a future audit tell
+                    # whether the silent oversize-bbox bug regressed.
+                    try:
+                        emit_event("lock_seed_source", {
+                            "tracked_id": self._lock_target_id,
+                            "eo_source": eo_src,
+                            "thermal_source": th_src,
+                        })
+                    except Exception:
+                        pass
 
         # ── Per-frame lock updates.
         # Dedupe by frame_id: only run MOSSE when the BUS-cached

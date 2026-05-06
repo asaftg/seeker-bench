@@ -343,6 +343,24 @@ class FusionManager:
                 if dt_ms > self.temporal_gate_ms:
                     cross_pair_enabled = False
                     self._temporal_rejects += 1
+                    # Observability: emit one event per skipped pair,
+                    # rate-limited to once per second so a long sync
+                    # outage doesn't flood the recorder. The counter
+                    # in self._temporal_rejects is the cumulative
+                    # tally for batch summaries.
+                    _now = time.time()
+                    _last = getattr(self, "_temporal_evt_last_t", 0.0)
+                    if _now - _last >= 1.0:
+                        self._temporal_evt_last_t = _now
+                        try:
+                            from common.events import emit as _emit
+                            _emit("fusion_temporal_gate_reject", {
+                                "dt_ms": round(dt_ms, 1),
+                                "gate_ms": self.temporal_gate_ms,
+                                "cumulative_rejects": self._temporal_rejects,
+                            })
+                        except Exception:
+                            pass
         used_t = [False] * len(thermal_obs)
         # Cross-sensor association now uses angular IoU: two observations
         # of the same class with bbox overlap >= XSENSOR_IOU are the same

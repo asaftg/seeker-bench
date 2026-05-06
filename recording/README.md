@@ -130,6 +130,39 @@ Algorithm diagnostics (emitted by `gimbal_manager` per tick):
    shift_az, shift_el, sp_pan, sp_tilt}`
 - `track_settled_change{settled, gimbal_dps}`
 
+Lock-mode events (added 2026-05-05 for the lock-mode v2 audit):
+- `lock_seeded{tracked_id, from_state, to_state, psr_eo, psr_thermal}`
+- `lock_coasting_enter{...}`, `lock_active_resume{...}`
+- `lock_hard_released{...}`
+- `lock_state_change{...}` — generic catch-all for any
+  off→ACTIVE / coasting→OFF transition that doesn't match a named
+  event (use this to spot missed-event-vocabulary cases)
+- `lock_seed_timeout{tracked_id, elapsed_s}` — seed-pending exceeded
+  `gimbal.lock_mode.seed_pending_timeout_s` (T1.1)
+- `lock_seed_source{tracked_id, eo_source, thermal_source}` — per
+  successful seed, records which bbox-source path was taken
+  (`eo_track_id` / `thermal_heat_id` = tight per-sensor classifier
+  bbox; `fused_angular` = legacy projection via FusedTrack ang_w/h
+  which may be oversized when radar contributes; `no_bbox` /
+  `skip` = sensor wasn't usable). Lets a future audit detect
+  silent regression of the per-sensor seed path (commit 5670246).
+
+Fusion observability (added 2026-05-05):
+- `fusion_temporal_gate_reject{dt_ms, gate_ms, cumulative_rejects}`
+  — rate-limited to 1/s. Surfaces when EO↔thermal pairing is
+  skipped because the frame timestamps disagree by more than
+  `fusion.temporal_gate_ms` (T1.6). p95 skew on the bench was
+  48 ms — turn the gate down or fix the upstream pacing if you
+  see a steady stream of these.
+
+EO observability (added 2026-05-05):
+- `bytetrack_yaml_resolved{source, path, sha256_short}` — one-shot
+  at first call. `source` is `project_local` or
+  `ultralytics_default`. Lets the operator verify any recording
+  was using the tuned thresholds (T1.4) — the
+  `ultralytics_default` value means the project YAML was missing
+  and ID churn defaults are back in play.
+
 ## Recording
 
 From the GUI: click the REC pill in the top bar. A new file is created
