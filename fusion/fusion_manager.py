@@ -112,6 +112,20 @@ class FusionManager:
         # ~0.3 if radar bboxes routinely barely overlap.
         self.radar_containment_gate = float(
             fcfg.get("radar_containment_gate", 0.5))
+        # T2.7 Radar Doppler gate at the radar↔camera join.
+        # Wave 2 fusion review: an IoU-only join lets a stationary
+        # clutter return (|doppler|~0) absorb a moving EO/thermal
+        # target at the same angular bearing. Require |range_rate|
+        # >= radar_doppler_min_mps before a radar candidate can join
+        # a camera candidate. Standalone radar candidates (no camera
+        # match) are unaffected. Sign convention IS NOT verified
+        # against approaching/receding ground truth on this rig yet
+        # (per the no-guessing rule), so the magnitude gate is the
+        # only safe knob — it's symmetric on sign. Default 0 disables
+        # the gate; once verified, raise to 0.4 (matches the
+        # speed_min_mps clutter floor in radar/clustering.py).
+        self.radar_doppler_min_mps = float(
+            fcfg.get("radar_doppler_min_mps", 0.0))
         # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
         # When EO and thermal frame timestamps disagree by more than
         # this, skip the cross-sensor pairing for the current tick:
@@ -432,16 +446,27 @@ class FusionManager:
             radar_metric_gate = self.radar_iou_gate
         for r in radar_obs:
             best_i, best_score = -1, 0.0
-            for i in range(n_cam_cands):
-                if used_c[i]:
-                    continue
-                c = candidates[i]
-                score = radar_metric_fn(
-                    r["az"], r["el"], r["ang_w"], r["ang_h"],
-                    c["az"], c["el"], c["ang_w"], c["ang_h"],
-                )
-                if score > best_score:
-                    best_score, best_i = score, i
+            # T2.7 doppler gate: skip the camera-join attempt entirely
+            # if this radar return looks static (|range_rate| < min).
+            # The radar candidate still falls through to the standalone
+            # branch below (RADAR_TARGET sentinel); we just don't let
+            # it absorb a moving EO/thermal target here.
+            r_rate = abs(float(r.get("range_rate_mps", 0.0)))
+            if (self.radar_doppler_min_mps > 0
+                    and r_rate < self.radar_doppler_min_mps):
+                # Skip cam-join. Will append as standalone radar below.
+                pass
+            else:
+                for i in range(n_cam_cands):
+                    if used_c[i]:
+                        continue
+                    c = candidates[i]
+                    score = radar_metric_fn(
+                        r["az"], r["el"], r["ang_w"], r["ang_h"],
+                        c["az"], c["el"], c["ang_w"], c["ang_h"],
+                    )
+                    if score > best_score:
+                        best_score, best_i = score, i
             if best_i >= 0 and best_score >= radar_metric_gate:
                 c = candidates[best_i]
                 used_c[best_i] = True
@@ -686,6 +711,18 @@ class FusionManager:
             # Floor at 0.4° so a tiny cluster still gates against EO/thermal.
             ang_w = max(0.4, math.degrees(2.0 * math.atan2(t.size_x_m, slant)))
             ang_h = max(0.4, math.degrees(2.0 * math.atan2(t.size_z_m, slant)))
+            # Radial velocity (range-rate). Sign: positive = approaching
+            # the sensor (target's velocity vector projected onto the
+            # inverse-radial direction). RadarDetection.doppler_mps is
+            # signed by AWR firmware convention; here we recompute from
+            # the Kalman vel state to capture the cluster-tracker's
+            # smoothed estimate. T2.7 uses |range_rate| as a static-
+            # clutter gate at the radar↔camera join.
+            range_rate_mps = -(
+                (t.vel_x_mps * t.pos_x_m
+                 + t.vel_y_mps * t.pos_y_m
+                 + t.vel_z_mps * t.pos_z_m) / max(slant, 1e-6)
+            )
             out.append({
                 "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
                 "class": TargetClass.RADAR_TARGET.value,
@@ -693,6 +730,7 @@ class FusionManager:
                 # Radar Kalman tracker id from RadarClusterer — Phase
                 # B2 link, mirror of eo_track_id and thermal_heat_id.
                 "radar_tid": int(t.tid),
+                "range_rate_mps": float(range_rate_mps),
                 "_pose_pan": pose_pan,
                 "_pose_tilt": pose_tilt,
             })

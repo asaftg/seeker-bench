@@ -705,6 +705,17 @@ fusion:
   # radar_iou_gate above.
   radar_match_metric: containment   # "containment" | "iou"
   radar_containment_gate: 0.5       # used when radar_match_metric == "containment"
+  # T2.7 Radar Doppler gate at the radar↔camera join. When the radar
+  # candidate's |range_rate_mps| is below this floor, do not let it
+  # absorb a moving EO/thermal target (it likely is static clutter
+  # at that angular bearing). The radar candidate still publishes
+  # standalone as RADAR_TARGET. SIGN CONVENTION IS NOT YET VERIFIED
+  # against approaching/receding ground truth on this rig, so we
+  # only gate on MAGNITUDE here. Default 0 disables the gate;
+  # operator should record an approaching-vehicle clip, verify the
+  # sign of range_rate_mps in fused/tracks, then set to ~0.4 to
+  # match the speed_min_mps clutter floor.
+  radar_doppler_min_mps: 0.0
   # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
   # When the EO and thermal frame timestamps disagree by more than
   # this many milliseconds, fusion DOES NOT pair them on this tick:
