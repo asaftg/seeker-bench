@@ -246,6 +246,11 @@ export class ThermalView {
     // Synthetic user-seeded detections are peeled off first and drawn
     // with the dedicated magenta "USER TARGET" style; they never
     // participate in fused suppression.
+    // Solo render gate (see eo_view.js for the comment).
+    const soloEngaged = (this._lock && this._lock.solo_mode
+                          && this._lock.engaged_id != null)
+        ? this._lock.engaged_id : null;
+
     for (const det of this._lastDetections) {
       if (det && det.synthetic) {
         drawSyntheticTargetBox(this.ctx, det, scale, dx, dy);
@@ -258,6 +263,11 @@ export class ThermalView {
       const fusedId = (det.fused_id != null)
         ? det.fused_id
         : fusedIdForDet(det.bbox, this._lastFused, "bbox_thermal", 0.20, det);
+      // Solo: hide detections that don't belong to the engaged target.
+      if (soloEngaged != null
+          && (fusedId == null || Number(fusedId) !== soloEngaged)) {
+        continue;
+      }
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);
@@ -275,6 +285,8 @@ export class ThermalView {
         ? this._lock.target_id : null;
     for (const trk of this._lastFused) {
       if (lockedId != null && trk.id === lockedId) continue;
+      // Solo: hide non-engaged fused tracks entirely.
+      if (soloEngaged != null && trk.id !== soloEngaged) continue;
       const nSensors = (trk.sensors || []).length;
       const bbox = trk.bbox_thermal;
       if (!bbox) continue;

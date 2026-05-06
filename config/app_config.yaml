@@ -884,25 +884,36 @@ gimbal:
   # lock-mode code paths are gated on this flag; legacy behaviour
   # is byte-equivalent when disabled.
   lock_mode:
-    # 2026-05-05: SOFT-REVERTED to false at operator request after
-    # `recordings/lock poorly.jsonl` showed lock mode not behaving
-    # as expected (recording's gimbal/state contains no lock_state
-    # samples — bench may have been on stale code, or the recorder
-    # path wasn't serializing the new GimbalState fields). The lock
-    # mode code stays in the tree (vision/lock_tracker.py +
-    # gimbal_manager._lock_mode_tick) so we can iterate on it
-    # without re-introducing the regression on the live bench.
-    # To re-enable for a future test session: set this true and
-    # restart the bench.
-    enabled: false               # master switch — false = baseline behaviour
+    # 2026-05-05: re-enabled to test v2 (commit 46868c0) which
+    # replaced v1's IoU/class auto-reseed (the multi-target swap
+    # bug from `recordings/lock poorly.jsonl`) with strict-ID-match
+    # reseed. Recorder also now serializes lock_state so post-hoc
+    # debugging is possible.
+    # SOFT REVERT: set enabled=false here, restart. All lock-mode
+    # code paths gate on this flag.
+    enabled: true                # master switch
     psr_lost: 5.0                # MOSSE PSR threshold below which we coast
     lost_frames: 5               # consecutive sub-PSR frames → COASTING
     coast_window_s: 3.0          # max time COASTING before HARD_RELEASED
-    reseed_iou_min: 0.20         # IoU(fused.bbox, lock.bbox) ≥ this → reseed
+    # v2 dropped reseed_iou_min — auto-reseed gates on ID equality
+    # only, no IoU search. Kept here for backward-compat readers
+    # but unused.
+    reseed_iou_min: 0.20
     reseed_min_period_s: 0.30    # don't reseed faster than this even if obs allow
     learning_rate: 0.125         # MOSSE online filter blending
     sigma: 2.0                   # MOSSE Gaussian peak width
     max_patch_dim: 96            # MOSSE FFT working size cap
+    # Solo render mode (operator request 2026-05-05). When an
+    # engagement is active AND this is true, the GUI hides all
+    # red detection boxes and all non-engaged fused-track boxes
+    # on both EO and thermal panels. Only the engaged target
+    # remains visible — as lock-mode corner brackets (when lock
+    # is ACTIVE/COASTING) or as the projected fused-track box
+    # otherwise. Decluttering for "I want to focus on the one
+    # target I picked." Set false for full situational awareness
+    # while engaged. Independent of `enabled` above — solo can
+    # be useful even with lock mode off.
+    solo_mode: true
 
   # Tracking-mode slew rate cap (deg/sec). Applied to the controller's
   # per-tick step ONLY when an engaged fused track is active; manual

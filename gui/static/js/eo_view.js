@@ -337,6 +337,17 @@ export class EOView {
       this.ctx.drawImage(this.img, dx, dy, dw, dh);
     }
 
+    // Solo render gate. When the operator has engaged a target AND
+    // gimbal.lock_mode.solo_mode is on, we hide every non-engaged
+    // bbox: red detections that don't map to the engaged fused id,
+    // and fused tracks that aren't the engaged one. Only the
+    // engaged target shows. Per operator request 2026-05-05:
+    // "when I pick a target and 'lock' on it, we can have all
+    // other targets bbs disappear."
+    const soloEngaged = (this._lock && this._lock.solo_mode
+                          && this._lock.engaged_id != null)
+        ? this._lock.engaged_id : null;
+
     // Raw detections — suppressed only by 2+ sensor fused overlays.
     for (const det of this._lastDetections) {
       if (isSubsumedByFused(det.bbox, this._lastFused, "bbox_eo")) continue;
@@ -347,6 +358,11 @@ export class EOView {
       const fusedId = (det.fused_id != null)
         ? det.fused_id
         : fusedIdForDet(det.bbox, this._lastFused, "bbox_eo", 0.20, det);
+      // Solo: hide detections that don't belong to the engaged target.
+      if (soloEngaged != null
+          && (fusedId == null || Number(fusedId) !== soloEngaged)) {
+        continue;
+      }
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);
@@ -357,14 +373,15 @@ export class EOView {
     // v2: when lock mode is showing a lock_bbox_eo for the engaged
     // track, SUPPRESS the projected/fused green box for that exact
     // track id so the operator sees ONE green box (the lock), not
-    // two. Other fused tracks render normally. Without this gate
-    // the lock-mode and the regular fused rendering both painted
-    // green boxes for the same target — the v1 confusion bug.
+    // two. Other fused tracks render normally — UNLESS solo mode
+    // is on, in which case all non-engaged fused tracks are hidden.
     const lockedId = (this._lock && this._lock.bbox_eo
                        && this._lock.target_id != null)
         ? this._lock.target_id : null;
     for (const trk of this._lastFused) {
       if (lockedId != null && trk.id === lockedId) continue;
+      // Solo: hide non-engaged fused tracks entirely.
+      if (soloEngaged != null && trk.id !== soloEngaged) continue;
       const nSensors = (trk.sensors || []).length;
       const bbox = trk.bbox_eo;
       if (!bbox) continue;

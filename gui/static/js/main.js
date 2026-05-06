@@ -859,17 +859,18 @@ if (areaSlider) {
   // sliders. We now keep _MODE_LIVE fresh and refresh _MODE_SNAPSHOTS
   // on save, so a Stock→A/G→Stock round-trip restores Stock's
   // values instantly with no page reload.
-  let _MODE_LIVE      = { stock: null, ag: null, aa: null };
-  let _MODE_SNAPSHOTS = { stock: null, ag: null, aa: null };
-  let _CURRENT_MODE   = "stock";  // mirrors the radio group; outgoing mode on switch
+  // A/G mode removed 2026-05-05. Maps stay so saved configs that
+  // still carry an "ag" key load without crashing — but it's never
+  // used as a current mode and the radio is gone from the GUI.
+  let _MODE_LIVE      = { stock: null, aa: null };
+  let _MODE_SNAPSHOTS = { stock: null, aa: null };
+  let _CURRENT_MODE   = "stock";
 
   window.__hydrateRadarModes = (saved) => {
     if (!saved || typeof saved !== "object") return;
-    for (const m of ["stock", "ag", "aa"]) {
+    for (const m of ["stock", "aa"]) {
       if (saved[m] && typeof saved[m] === "object") {
         _MODE_SNAPSHOTS[m] = { ...saved[m] };
-        // Seed _MODE_LIVE too so the very first switch into this
-        // mode gets the saved values without a full page round-trip.
         _MODE_LIVE[m] = { ...saved[m] };
       }
     }
@@ -918,11 +919,7 @@ if (areaSlider) {
       const el = $(id); if (!el) continue;
       out[key] = Number(el.value);
     }
-    if (mode === "ag") {
-      for (const [k, spec] of Object.entries(_AG_CTRLS)) {
-        const v = _readCtrl(spec); if (v !== null) out[k] = v;
-      }
-    } else if (mode === "aa") {
+    if (mode === "aa") {
       for (const [k, spec] of Object.entries(_AA_CTRLS)) {
         const v = _readCtrl(spec); if (v !== null) out[k] = v;
       }
@@ -940,9 +937,8 @@ if (areaSlider) {
       const row = rows.find(r => r.id === id);
       if (lbl && row) lbl.textContent = row.fmt(row.int ? Math.round(v) : v);
     }
-    // Mode-specific knobs (A/G or A/A); harmless when the section is
-    // hidden — the value just sits there until the user reveals it.
-    for (const [k, spec] of Object.entries(_AG_CTRLS)) _writeCtrl(spec, snap[k]);
+    // Mode-specific knobs (A/A only — A/G removed 2026-05-05);
+    // harmless when the section is hidden.
     for (const [k, spec] of Object.entries(_AA_CTRLS)) _writeCtrl(spec, snap[k]);
   }
   function _applyMode(newMode) {
@@ -971,11 +967,7 @@ if (areaSlider) {
         if (snap[k] != null) tunePayload[k] = snap[k];
       }
       wsSend(tunePayload);
-      if (newMode === "ag") {
-        const ag = { command: "ag_tune" };
-        for (const k of Object.keys(_AG_CTRLS)) if (snap[k] != null) ag[k] = snap[k];
-        if (Object.keys(ag).length > 1) wsSend(ag);
-      } else if (newMode === "aa") {
+      if (newMode === "aa") {
         const aa = { command: "aa_tune" };
         for (const k of Object.keys(_AA_CTRLS)) if (snap[k] != null) aa[k] = snap[k];
         if (Object.keys(aa).length > 1) wsSend(aa);
@@ -983,11 +975,11 @@ if (areaSlider) {
     }
     const status = document.getElementById("radar-backend-status");
     if (status) {
-      status.textContent = newMode === "stock" ? "STOCK" : (newMode === "ag" ? "A/G" : "A/A");
+      status.textContent = newMode === "stock" ? "STOCK" : "A/A";
       status.style.color = "var(--cyan)";
     }
   }
-  for (const mode of ["stock", "ag", "aa"]) {
+  for (const mode of ["stock", "aa"]) {
     const el = document.getElementById("radar-backend-" + mode);
     if (el) el.addEventListener("change", () => { if (el.checked) _applyMode(mode); });
   }
@@ -1030,7 +1022,7 @@ if (areaSlider) {
     el.addEventListener("input",  onChange);
     el.addEventListener("change", onChange);
   }
-  for (const [k, spec] of Object.entries(_AG_CTRLS)) _wireModeStash("ag", k, spec);
+  // _AG_CTRLS is empty (A/G mode removed 2026-05-05).
   for (const [k, spec] of Object.entries(_AA_CTRLS)) _wireModeStash("aa", k, spec);
 
   // ───── A/G mode controls — paint label only at init; push to
@@ -1454,6 +1446,13 @@ function connect() {
       // duplicate fused-track green box for the engaged target.
       target_id: (msg.gimbal.lock_target_id != null
                    ? Number(msg.gimbal.lock_target_id) : null),
+      // Solo render flag. When true AND an engagement is active
+      // (msg.main_target_id != null), the view classes hide every
+      // non-engaged detection + non-engaged fused-track box — only
+      // the engaged target is rendered.
+      solo_mode: !!(msg.gimbal && msg.gimbal.lock_solo_mode),
+      engaged_id: (msg.main_target_id != null
+                    ? Number(msg.main_target_id) : null),
     } : null;
     _lastLock = gLock;
 

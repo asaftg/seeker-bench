@@ -13,8 +13,16 @@ from typing import Any, Dict, Optional
 
 import cv2
 
+from common.config import load_config
 from common.frame_bus import BUS
 from common.frames import EOFrame, FusedTrack, GimbalState, RadarFrame, ThermalFrame, Topic
+
+# Load lock-mode flags once at import. Cheap; YAML re-reads on bench
+# restart only. The flags travel on the gimbal payload to the GUI so
+# the JS can decide whether to apply solo-rendering.
+_LM_CFG = (load_config().get("gimbal", {}) or {}).get("lock_mode", {}) or {}
+_LOCK_ENABLED: bool = bool(_LM_CFG.get("enabled", False))
+_LOCK_SOLO_MODE: bool = bool(_LM_CFG.get("solo_mode", True))
 from fusion.angular import angular_bbox_visible, angular_to_bbox
 
 
@@ -922,6 +930,11 @@ def build_ws_message(
             "lock_bbox_eo": _bbox_to_dict(getattr(gstate, "lock_bbox_eo", None)),
             "lock_bbox_thermal": _bbox_to_dict(getattr(gstate, "lock_bbox_thermal", None)),
             "lock_target_id": getattr(gstate, "lock_target_id", None),
+            # Solo render flag (gimbal.lock_mode.solo_mode in YAML).
+            # When true AND tracked_target_id is set, the GUI hides
+            # all non-engaged red detection boxes + non-engaged
+            # fused-track boxes — only the engaged target shows.
+            "lock_solo_mode": _LOCK_SOLO_MODE,
         }
     else:
         gimbal_payload = {
@@ -937,6 +950,7 @@ def build_ws_message(
             "lock_bbox_eo": None,
             "lock_bbox_thermal": None,
             "lock_target_id": None,
+            "lock_solo_mode": _LOCK_SOLO_MODE,
         }
 
     # EO gets its own JPEG quality knob — a 2K mono sensor with a real
