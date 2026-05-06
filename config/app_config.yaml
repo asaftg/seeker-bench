@@ -734,9 +734,24 @@ gimbal:
   #   kp_track       0.30 → 0.50  (+67% control gain)
   #   max_step_deg   2.0  → 3.0   (per-tick cap; ST3025 handles 3°/tick)
   # If overshoot shows up, add a small D term (separate commit).
-  kp_track:    0.50
+  #
+  # 2026-05-05 human-tracking softening (recording `trying to lock.jsonl`,
+  # human #11 transit): on small jittery targets (humans @ 5-10 m → 30-
+  # 60 px wide bbox) the V2 0.50/3.0 combo chased bbox jitter at
+  # 13-15 dps actual gimbal velocity, hitting the 18 dps slew cap
+  # within 200 ms and forcing the settled gate to flip 4× in 0.5 s.
+  # Operator: "the gimbal is just too aggresive." Knocked the gain +
+  # per-tick cap back down without going all the way to V1 levels:
+  #   kp_track       0.50 → 0.35  (still +17 % vs V1, less reactive
+  #                                 to bbox jitter)
+  #   max_step_deg   3.0  → 2.0   (per-tick cap; halves peak per-tick
+  #                                 swing while keeping V1 ceiling)
+  # Slew cap also dropped from 18 → 12 in `track_slew_cap_dps` below.
+  # SOFT REVERT: bump these back to 0.50 / 3.0 if humans feel laggy
+  # to re-acquire — they revert byte-equivalent to the V2 baseline.
+  kp_track:    0.35
   deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
-  max_step_deg: 3.0           # was 2.0 — V2 servos can handle bigger steps
+  max_step_deg: 2.0           # was 3.0 — softened for jittery human targets
   # D term on MEASUREMENT (not error). Subtracts kd × encoder velocity
   # (dpose/dt) from the closed-loop proportional output. Brakes when the
   # gimbal is moving fast toward target → smooth deceleration → no
@@ -935,7 +950,16 @@ gimbal:
   # "lock dies during slew" rather than "acquisition feels slow."
   # Set 0 to disable the cap entirely (legacy behaviour); raise
   # toward 30 if mid-slew lock loss stops happening on your scenes.
-  track_slew_cap_dps: 18.0
+  #
+  # 2026-05-05: dropped 18 → 12 after `trying to lock.jsonl` showed
+  # the engaged-track chase saturating at 13-15 dps while pursuing a
+  # walking human; combined with bbox jitter, the chase oscillated
+  # the settled gate 4× in 0.5 s. 12 dps still tracks a 5 m walking
+  # human (~2 m/s × 0.2 rad/m ≈ 0.4 rad/s ≈ 23 dps tangentially —
+  # the rate ONLY matters for the chase-back-to-center after the
+  # operator lets the bbox drift to the edge of frame, not for
+  # holding a centered target where err < 1° → step ≪ 12 dps).
+  track_slew_cap_dps: 12.0
 
   # ── Optical residual correction (Stage A diagnostic + Stage B closed-loop)
   #

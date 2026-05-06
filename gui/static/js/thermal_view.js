@@ -268,6 +268,15 @@ export class ThermalView {
           && (fusedId == null || Number(fusedId) !== soloEngaged)) {
         continue;
       }
+      // Lock-bracket suppression: when a lock bbox is rendered for this
+      // target on this panel, skip the raw heat/classifier detection so
+      // the operator sees ONE engagement box (the lock corner brackets)
+      // not the brackets stacked on top of the orange/colored rectangle.
+      if (soloEngaged != null
+          && this._lock && this._lock.bbox_thermal
+          && fusedId != null && Number(fusedId) === soloEngaged) {
+        continue;
+      }
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);

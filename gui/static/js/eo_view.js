@@ -363,6 +363,15 @@ export class EOView {
           && (fusedId == null || Number(fusedId) !== soloEngaged)) {
         continue;
       }
+      // Lock-bracket suppression: when a lock bbox is rendered for this
+      // target on this panel, skip the raw YOLO/heat detection too so
+      // the operator sees ONE engagement box (the lock corner brackets)
+      // not the brackets stacked on top of the red classifier rectangle.
+      if (soloEngaged != null
+          && this._lock && this._lock.bbox_eo
+          && fusedId != null && Number(fusedId) === soloEngaged) {
+        continue;
+      }
       const isMain = this._mainTargetId != null &&
                      fusedId != null &&
                      String(fusedId) === String(this._mainTargetId);
