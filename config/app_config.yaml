@@ -399,6 +399,18 @@ eo:
   hfov_deg: 11.05
   vfov_deg: 9.23
 
+  # Pose-delta re-warp on stale classifier bboxes (T1.5, 2026-05-05).
+  # The async classifier returns bboxes 2-4 frames stale; at the
+  # rig's peak 64 dps slew (recordings/track worse.jsonl) that's
+  # 5-10 deg of misregistration between the bbox pixels and the
+  # publish-time gimbal pose. Without re-warp, fusion eats this
+  # offset and the lock-mode seed (which prefers per-sensor
+  # detection bbox) lands on the wrong patch during slews.
+  # Re-warps bboxes by (cur_pan - capture_pan) * px_per_deg
+  # before publishing the EOFrame. Set false to revert byte-
+  # equivalent (legacy publish-time pose stamping).
+  pose_delta_rewarp: true
+
   # Test mode: when running with a generic webcam in place of the real
   # IMX568 + 35mm lens, we need to tell fusion the *actual* FOV the
   # webcam sees — otherwise cross-sensor angular matching is broken.

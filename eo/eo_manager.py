@@ -256,6 +256,13 @@ class EOManager:
         self._stream_fps = float(ecfg.get("stream_fps", 20.0))
         self._hfov = float(ecfg.get("hfov_deg", 11.05))
         self._vfov = float(ecfg.get("vfov_deg", 9.23))
+        # Pose-delta re-warp (T1.5). The async classifier returns
+        # bboxes 2-4 frames stale; at 64 dps peak slew that's 5-10
+        # deg of misregistration vs the publish-time pose. Re-warp
+        # bboxes by (cur_pan - capture_pan) * px_per_deg before
+        # publish so fusion sees a consistent (bbox, pose) pair.
+        # Set false to revert byte-equivalent.
+        self._pose_delta_rewarp = bool(ecfg.get("pose_delta_rewarp", True))
 
         # Backend selector: "imx568" → real hardware path (native 2472×2064,
         # mono, percentile AGC, profile-switched exposure). "webcam" → the
@@ -484,7 +491,13 @@ class EOManager:
         # which already feeds it every other frame.
         self._cls_in_lock = threading.Lock()
         self._cls_in_cond = threading.Condition(self._cls_in_lock)
-        self._cls_in_pending: Optional[tuple[int, np.ndarray]] = None
+        # Queue carries (frame_id, frame, pose_at_queue) so the worker's
+        # output can be pose-stamped to the EXACT pose the gimbal had
+        # when the classified pixels were captured — not the publish-
+        # time pose, which is 2-4 frames newer at 17-19 FPS EO.
+        self._cls_in_pending: Optional[
+            tuple[int, np.ndarray, Optional[float], Optional[float]]
+        ] = None
         self._cls_out_lock = threading.Lock()
         self._cls_out_dets: list[dict] = []
         # One-shot signal: True the first publish-tick that reads a
@@ -494,6 +507,13 @@ class EOManager:
         # ticks" without burning a sequence number.
         self._cls_out_dets_fresh_flag: bool = False
         self._cls_out_fid: int = -1
+        # Gimbal pose at the time the classified frame was captured.
+        # Used by the publish path to re-warp stale bboxes by the
+        # pose delta (capture → publish-now). At peak slew 64 dps and
+        # 4-frame staleness at 17 FPS, the bbox is 5-10 deg off
+        # without this — Wave 2 EO finding.
+        self._cls_out_pan_at_capture: Optional[float] = None
+        self._cls_out_tilt_at_capture: Optional[float] = None
 
         # Source lifecycle lock. Held during set_device / set_exposure_ext
         # so the capture thread can't reopen mid-switch and spawn a
@@ -1187,7 +1207,7 @@ class EOManager:
                     self._cls_in_cond.wait(timeout=0.5)
                 if self._stop.is_set():
                     break
-                fid, frame = self._cls_in_pending
+                fid, frame, pan_at_capture, tilt_at_capture = self._cls_in_pending
                 self._cls_in_pending = None
             if self._classifier is None:
                 continue
@@ -1206,6 +1226,8 @@ class EOManager:
             with self._cls_out_lock:
                 self._cls_out_dets = dets
                 self._cls_out_fid = fid
+                self._cls_out_pan_at_capture = pan_at_capture
+                self._cls_out_tilt_at_capture = tilt_at_capture
                 self._cls_out_dets_fresh_flag = True
         log.info("EOManager classify thread stopped")
 
@@ -1358,7 +1380,15 @@ class EOManager:
                 # Single-slot: if a frame is still pending, drop it.
                 # The newer one is fresher and ByteTrack persist=True
                 # handles the gap. Notify wakes the worker.
-                self._cls_in_pending = (self._frame_id, frame)
+                # Capture the gimbal pose at queue-time alongside the
+                # frame so the classifier output can be pose-stamped
+                # to the EXACT pose the gimbal had when the
+                # classified pixels were captured (T1.5: pose-delta
+                # re-warp on stale bboxes).
+                self._cls_in_pending = (
+                    self._frame_id, frame,
+                    bus_pan, bus_tilt,
+                )
                 self._cls_in_cond.notify()
         # Publish the worker's latest result (or empty list before any
         # result has come back). Coasting between worker updates is
@@ -1369,6 +1399,49 @@ class EOManager:
             # (so MOSSE can reseed on it instead of just running update).
             fresh_dets_this_tick = bool(self._cls_out_dets_fresh_flag)
             self._cls_out_dets_fresh_flag = False
+            cls_pan_at_capture = self._cls_out_pan_at_capture
+            cls_tilt_at_capture = self._cls_out_tilt_at_capture
+
+        # ── Pose-delta re-warp on stale classifier bboxes ────────
+        # The classifier worker is async; its output is 2-4 frames
+        # stale at 17 FPS EO. Peak slew is 64 dps on this rig
+        # (recordings/track worse.jsonl), so a 4-frame stale bbox
+        # is up to 5-10 deg off the current pose — the bbox shows
+        # where the target WAS at capture time, not where it IS
+        # now. Fusion then mismatches by that offset.
+        #
+        # Wave 2 EO finding: re-warp bboxes by (cur_pan - cls_pan_
+        # at_capture) * px_per_deg before publish. The MOSSE pool
+        # then picks up the warped bbox and refines toward the
+        # actual target on the new frame.
+        #
+        # SOFT REVERT: set eo.pose_delta_rewarp: false in YAML.
+        if (self._pose_delta_rewarp
+                and bus_pan is not None and bus_tilt is not None
+                and cls_pan_at_capture is not None
+                and cls_tilt_at_capture is not None
+                and self._last_dets and frame is not None):
+            h, w = frame.shape[:2]
+            hfov = float(self._hfov)
+            vfov = float(self._vfov)
+            if hfov > 0 and vfov > 0:
+                d_pan = float(bus_pan) - float(cls_pan_at_capture)
+                d_tilt = float(bus_tilt) - float(cls_tilt_at_capture)
+                # Sign convention matches the lock-mode pose shift in
+                # gimbal_manager._pose_shift_lock_update: gimbal pans
+                # right (+pan) -> scene shifts LEFT in image -> bbox.x
+                # decreases. tilt up (+tilt) -> scene moves DOWN in
+                # image -> bbox.y increases.
+                px_per_deg_x = w / hfov
+                px_per_deg_y = h / vfov
+                dx = -d_pan * px_per_deg_x
+                dy = d_tilt * px_per_deg_y
+                if abs(dx) >= 0.5 or abs(dy) >= 0.5:
+                    for d in self._last_dets:
+                        bx, by, bw, bh = d["bbox"]
+                        new_x = max(0, min(w - 1, int(round(bx + dx))))
+                        new_y = max(0, min(h - 1, int(round(by + dy))))
+                        d["bbox"] = (new_x, new_y, int(bw), int(bh))
 
         # ── Frame-rate MOSSE pool ────────────────────────────────
         # When YOLO is throttled (or its confidence drops during a
