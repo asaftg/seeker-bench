@@ -694,6 +694,15 @@ fusion:
   # A more permissive IoU gate keeps radar associating with EO/thermal
   # tracks even when its bbox barely brushes the camera box.
   radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
+  # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
+  # When the EO and thermal frame timestamps disagree by more than
+  # this many milliseconds, fusion DOES NOT pair them on this tick:
+  # both go in as standalone candidates instead. Without the gate,
+  # a stale EO bbox can fuse with a fresh thermal bbox at different
+  # poses, producing an oversized fused angular extent. Wave 2
+  # measured p95 EO↔thermal skew at 48 ms on lock test test.jsonl;
+  # 33 ms is ~1 frame at 30 Hz EO. Set 0 to disable.
+  temporal_gate_ms: 33.0
 
 gimbal:
   # driver:

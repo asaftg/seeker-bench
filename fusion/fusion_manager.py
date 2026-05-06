@@ -96,6 +96,20 @@ class FusionManager:
         # the same target. Tunable via YAML; promote to DEV-tab slider
         # once we know the right operating range.
         self.radar_iou_gate = float(fcfg.get("radar_iou_gate", 0.05))
+        # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
+        # When EO and thermal frame timestamps disagree by more than
+        # this, skip the cross-sensor pairing for the current tick:
+        # treat each sensor's obs as standalone instead of pairing
+        # them. Without this, fusion silently joins a stale EO bbox
+        # to a fresh thermal bbox during slews — Wave 2 thermal
+        # finding showed p95 thermal-vs-EO timestamp skew of 48 ms
+        # on `lock test test.jsonl`, fusing across stale frames.
+        # 33 ms ~= 1 frame at 30 Hz EO. Set 0 to disable the gate
+        # (legacy behavior).
+        self.temporal_gate_ms = float(
+            fcfg.get("temporal_gate_ms", 33.0))
+        # Diagnostics counter — exposed via instrumentation later.
+        self._temporal_rejects = 0
         # Per-sensor grace window: how many fusion ticks a sensor can
         # miss a track before it's removed from the published `sensors`
         # list. Larger = more "sticky" (fewer green→red flickers from
@@ -280,6 +294,25 @@ class FusionManager:
         # a set of contributing sensors. These then match into the
         # persistent tracker.
         candidates: list[dict] = []
+        # Temporal gate: if EO and thermal frames are too far apart in
+        # wallclock, do not cross-pair this tick. Pose changes between
+        # the two captures could put the same target at different
+        # angular positions, and pairing them across that gap
+        # silently fattens fused angular extent. Skip pairing instead
+        # — both observations still become standalone candidates and
+        # the persistence tracker will associate them across ticks
+        # if they really are the same target.
+        cross_pair_enabled = True
+        if self.temporal_gate_ms > 0:
+            tf_ts = (float(getattr(tf, "timestamp", 0.0))
+                      if tf is not None else None)
+            ef_ts = (float(getattr(ef, "timestamp", 0.0))
+                      if ef is not None else None)
+            if tf_ts is not None and ef_ts is not None:
+                dt_ms = abs(tf_ts - ef_ts) * 1000.0
+                if dt_ms > self.temporal_gate_ms:
+                    cross_pair_enabled = False
+                    self._temporal_rejects += 1
         used_t = [False] * len(thermal_obs)
         # Cross-sensor association now uses angular IoU: two observations
         # of the same class with bbox overlap >= XSENSOR_IOU are the same
@@ -288,6 +321,21 @@ class FusionManager:
         # gates, because a small bbox inside a big bbox has IoU ≈ 0.
         XSENSOR_IOU = 0.15  # loose — FOV estimates & parallax can shift centers
         for e in eo_obs:
+            if not cross_pair_enabled:
+                # Skip the IoU-pair step; emit EO standalone. Thermal
+                # standalone fallback below handles thermal_obs.
+                candidates.append({
+                    "sensors": ["eo"],
+                    "primary": "eo",
+                    "class":   e["class"],
+                    "az":      e["az"],   "el":    e["el"],
+                    "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
+                    "conf":    e["conf"],
+                    "eo_track_id": e.get("eo_track_id"),
+                    "_pose_pan":  e.get("_pose_pan"),
+                    "_pose_tilt": e.get("_pose_tilt"),
+                })
+                continue
             best_i, best_iou = -1, 0.0
             for i, t in enumerate(thermal_obs):
                 if used_t[i] or t["class"] != e["class"]:
