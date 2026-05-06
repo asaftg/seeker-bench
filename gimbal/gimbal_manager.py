@@ -1076,6 +1076,16 @@ class GimbalManager:
                     self._lock_target_id = new_id
                     self._lock_target_class = None  # filled when seeding
                     self._lock_seed_pending = True
+                    # Reset state-transition tracker + dedupe cache
+                    # so the new engagement emits a clean `lock_seeded`
+                    # event and runs a fresh MOSSE update on its first
+                    # frame (mirrors the release-path reset in _tick's
+                    # else branch).
+                    self._lock_last_state_str = "off"
+                    self._lock_last_eo_fid = None
+                    self._lock_last_th_fid = None
+                    self._lock_last_eo_upd = None
+                    self._lock_last_th_upd = None
             self._tracked_id = new_id
             # Fused lock takes priority over any heat lock.
             self._tracked_heat_id = None
@@ -1915,6 +1925,25 @@ class GimbalManager:
                     self._lock_target_id = None
                     self._lock_target_class = None
                     self._lock_seed_pending = False
+                    # Reset the state-transition tracker so the NEXT
+                    # engagement emits a clean `lock_seeded` event when
+                    # off → active. Without this, the tracker keeps the
+                    # stale "active" / "coasting" string from the prior
+                    # engagement (because _lock_mode_tick early-returns
+                    # on tracked_id=None and never updates it). The
+                    # next engagement's off → active transition would
+                    # then read as active → active and emit nothing —
+                    # the silent miss seen in `track worse.jsonl`
+                    # (4 engagements, 0 lock_seeded events).
+                    self._lock_last_state_str = "off"
+                    # Also drop the dedupe-cache fids/upds so the
+                    # next engagement always runs a fresh MOSSE update
+                    # on its first frame, even if frame_id happens to
+                    # equal the last value seen pre-release.
+                    self._lock_last_eo_fid = None
+                    self._lock_last_th_fid = None
+                    self._lock_last_eo_upd = None
+                    self._lock_last_th_upd = None
             # Not tracking — flush cached setpoints so next engage
             # starts fresh against whatever the new target's error is.
             self._last_track_ts = None
@@ -2120,17 +2149,34 @@ class GimbalManager:
             else:
                 self._lock_target_class = getattr(
                     getattr(target, "target_class", None), "value", None)
-                # Compute per-sensor bboxes from the fused track's
-                # world angles + each frame's pose-at-capture, same
-                # as gui.sensor_bridge.fused_to_wire does.
+                # Seed bbox source priority:
+                #   1. The per-sensor detection that contributed to this
+                #      fused track (EOFrame.detections matching
+                #      target.eo_track_id; ThermalFrame.detections
+                #      matching target.thermal_heat_id). This is the
+                #      RAW classifier/heat-detector bbox tightly fit to
+                #      the visible target — what MOSSE wants.
+                #   2. Fall back to the angular reprojection
+                #      (_fused_to_eo_bbox) only when the sensor didn't
+                #      contribute (radar-only track) or the detection
+                #      lookup fails.
+                # Recording `track worse.jsonl` showed seeded bboxes
+                # 240×156 (target #3) and 190×420 (target #15) — way
+                # bigger than the visible humans because the fused
+                # angular extent (ang_w_deg/ang_h_deg) gets contaminated
+                # by radar's coarse cluster bbox. MOSSE seeded on a
+                # 3-4x oversized patch then "tracks" the union of
+                # target + background, jumping wildly.
                 seeded_any = False
                 if ef_ok:
-                    bbox_eo = self._fused_to_eo_bbox(target, ef)
+                    bbox_eo = (self._eo_detection_bbox(target, ef)
+                                or self._fused_to_eo_bbox(target, ef))
                     if bbox_eo is not None:
                         if self._lock_eo.seed(ef.bgr, bbox_eo, now=now):
                             seeded_any = True
                 if tf_ok:
-                    bbox_th = self._fused_to_thermal_bbox(target, tf)
+                    bbox_th = (self._thermal_detection_bbox(target, tf)
+                                or self._fused_to_thermal_bbox(target, tf))
                     if bbox_th is not None:
                         if self._lock_thermal.seed(tf.agc8, bbox_th, now=now):
                             seeded_any = True
@@ -2200,13 +2246,15 @@ class GimbalManager:
             if (ef_ok and self._lock_eo.is_active
                     and self._lock_eo.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
-                bbox_eo = self._fused_to_eo_bbox(target, ef)
+                bbox_eo = (self._eo_detection_bbox(target, ef)
+                            or self._fused_to_eo_bbox(target, ef))
                 if bbox_eo is not None:
                     self._lock_eo.reseed(ef.bgr, bbox_eo, now=now)
             if (tf_ok and self._lock_thermal.is_active
                     and self._lock_thermal.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
-                bbox_th = self._fused_to_thermal_bbox(target, tf)
+                bbox_th = (self._thermal_detection_bbox(target, tf)
+                            or self._fused_to_thermal_bbox(target, tf))
                 if bbox_th is not None:
                     self._lock_thermal.reseed(tf.agc8, bbox_th, now=now)
 
@@ -2279,6 +2327,49 @@ class GimbalManager:
             self._lock_seed_pending = False
             return None, None, "released"
         return bbox_eo_pub, bbox_th_pub, lock_state
+
+    def _eo_detection_bbox(self, trk: Any,
+                             ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
+        """Return the EO classifier's RAW bbox for the EO detection
+        that contributed to this fused track, or None if the fused
+        track has no EO contributor in this frame.
+
+        Why this exists: ``_fused_to_eo_bbox`` reprojects the fused
+        track's angular extent (ang_w_deg × ang_h_deg) into pixel
+        space. That extent is the cross-sensor union — for a track
+        with both EO and radar contributing, ang_w/h is dominated by
+        radar's coarse cluster span (~3°) instead of YOLO's tight
+        per-pixel bbox (~0.5°). MOSSE seeded on a 3-4× oversized
+        patch tracks the union of target + background and jumps
+        wildly. For seeding a per-sensor MOSSE, the right bbox is
+        the SENSOR'S OWN detection, not the fused projection.
+        """
+        eo_tid = getattr(trk, "eo_track_id", None)
+        if eo_tid is None:
+            return None
+        for det in getattr(ef, "detections", None) or []:
+            if getattr(det, "track_id", None) == eo_tid:
+                bb = det.bbox
+                if bb is None:
+                    return None
+                return (int(bb.x), int(bb.y), int(bb.w), int(bb.h))
+        return None
+
+    def _thermal_detection_bbox(self, trk: Any,
+                                  tf: "ThermalFrame") -> Optional[Tuple[int, int, int, int]]:
+        """Same as ``_eo_detection_bbox`` but for the thermal panel —
+        looks up the ThermalDetection whose ``track_id`` matches the
+        fused track's ``thermal_heat_id``."""
+        th_tid = getattr(trk, "thermal_heat_id", None)
+        if th_tid is None:
+            return None
+        for det in getattr(tf, "detections", None) or []:
+            if getattr(det, "track_id", None) == th_tid:
+                bb = det.bbox
+                if bb is None:
+                    return None
+                return (int(bb.x), int(bb.y), int(bb.w), int(bb.h))
+        return None
 
     def _fused_to_eo_bbox(self, trk: Any,
                            ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
