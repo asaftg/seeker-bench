@@ -869,6 +869,22 @@ class GimbalManager:
         # replay can reconstruct the lock-state machine from the
         # event stream alone.
         self._lock_last_state_str: str = "off"
+        # Frame-id dedupe: skip MOSSE update() when the BUS-cached
+        # frame is the same one we just processed. Gimbal tick runs
+        # at ~35-60 Hz; EO at 17-25 Hz, thermal at 20-60 Hz. Without
+        # dedupe, MOSSE re-runs on identical data 1-3 times per real
+        # frame, burning CPU on no-op work — visible in
+        # `recordings/lock test test.jsonl` as 15 FPS EO under load.
+        # Dedupe also keeps the published lock_bbox_* coordinates
+        # from "twitching" between identical-frame re-runs (the FFT
+        # peak can land 1 px apart on identical input due to
+        # learning-rate updates, which the operator sees as jitter).
+        self._lock_last_eo_fid: Optional[int] = None
+        self._lock_last_th_fid: Optional[int] = None
+        # Cached last-update so we publish a stable bbox between
+        # frames without re-running MOSSE.
+        self._lock_last_eo_upd = None
+        self._lock_last_th_upd = None
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -1876,12 +1892,29 @@ class GimbalManager:
             # Lock mode: operator dropped the lock OR grace expired.
             # Release the per-sensor lock trackers so the GUI stops
             # rendering the lock bbox.
+            #
+            # Race-fix 2026-05-05: re-acquire self._lock and re-check
+            # that no engagement happened between this tick's
+            # snapshot and now. Without this, the WS handler thread
+            # could call set_track_target(N) (which atomically arms
+            # _lock_target_id=N + _lock_seed_pending=True under the
+            # same lock) AFTER the tick took the snapshot — and this
+            # else branch would wipe the just-armed seed, so the
+            # next _lock_mode_tick saw _lock_target_id=None and
+            # quietly emitted `lock_state_change tracked_id=null
+            # active→off` instead of `lock_seeded`. Visible in
+            # `recordings/lock test test.jsonl`: 7 track_engaged
+            # events, only 1 lock_seeded — 6 of 7 engagements lost
+            # to this race.
             if self._lock_mode_enabled:
-                self._lock_eo.release()
-                self._lock_thermal.release()
-                self._lock_target_id = None
-                self._lock_target_class = None
-                self._lock_seed_pending = False
+                with self._lock:
+                    still_clear = (self._tracked_id is None)
+                if still_clear:
+                    self._lock_eo.release()
+                    self._lock_thermal.release()
+                    self._lock_target_id = None
+                    self._lock_target_class = None
+                    self._lock_seed_pending = False
             # Not tracking — flush cached setpoints so next engage
             # starts fresh against whatever the new target's error is.
             self._last_track_ts = None
@@ -2105,10 +2138,36 @@ class GimbalManager:
                     self._lock_seed_pending = False
 
         # ── Per-frame lock updates.
-        eo_upd = (self._lock_eo.update(ef.bgr, now=now)
-                   if (ef_ok and self._lock_eo.is_active) else None)
-        th_upd = (self._lock_thermal.update(tf.agc8, now=now)
-                   if (tf_ok and self._lock_thermal.is_active) else None)
+        # Dedupe by frame_id: only run MOSSE when the BUS-cached
+        # frame is actually new. Re-running on the same frame burns
+        # CPU and produces noise (FFT peak landing 1 px apart on
+        # identical input, plus the online learning-rate retraining
+        # the filter on the same patch). When dedupe hits, we
+        # republish the cached LockUpdate so the GUI sees a stable
+        # bbox between frames without doing any work.
+        if ef_ok and self._lock_eo.is_active:
+            ef_fid = getattr(ef, "frame_id", None)
+            if ef_fid is not None and ef_fid == self._lock_last_eo_fid:
+                eo_upd = self._lock_last_eo_upd
+            else:
+                eo_upd = self._lock_eo.update(ef.bgr, now=now)
+                self._lock_last_eo_fid = ef_fid
+                self._lock_last_eo_upd = eo_upd
+        else:
+            eo_upd = None
+            self._lock_last_eo_upd = None
+
+        if tf_ok and self._lock_thermal.is_active:
+            tf_fid = getattr(tf, "frame_id", None)
+            if tf_fid is not None and tf_fid == self._lock_last_th_fid:
+                th_upd = self._lock_last_th_upd
+            else:
+                th_upd = self._lock_thermal.update(tf.agc8, now=now)
+                self._lock_last_th_fid = tf_fid
+                self._lock_last_th_upd = th_upd
+        else:
+            th_upd = None
+            self._lock_last_th_upd = None
 
         # ── Auto-reseed (v2): STRICT ID-MATCH ONLY.
         #
