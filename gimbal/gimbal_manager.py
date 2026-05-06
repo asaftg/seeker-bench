@@ -864,6 +864,12 @@ class GimbalManager:
         self._lock_seed_pending: bool = False
         self._lock_reseed_min_period_s: float = float(
             lm_cfg.get("reseed_min_period_s", 0.30))
+        # PSR margin for auto-reseed gate. Reseed only when state is
+        # ACTIVE and last_psr >= psr_lost * margin. Default 1.5;
+        # set 0 to disable (legacy behavior — reseed any time
+        # is_active includes COASTING). See Wave 2 lock review.
+        self._lock_reseed_psr_margin: float = float(
+            lm_cfg.get("reseed_psr_margin", 1.5))
         # State-transition tracker for the JSONL recorder. We emit
         # one event per real transition (not per tick) so a future
         # replay can reconstruct the lock-state machine from the
@@ -2304,14 +2310,32 @@ class GimbalManager:
                 target = trk
                 break
         if target is not None:
-            if (ef_ok and self._lock_eo.is_active
+            # PSR + ACTIVE gate: require state == ACTIVE (not COASTING)
+            # AND last_psr above the safety margin before reseeding.
+            # Without this, auto-reseed fires DURING coasting recovery
+            # on a low-PSR frame, imprinting a partially-occluded
+            # patch as the new appearance template — visible in
+            # `lock test test.jsonl` engagement #57 with PSR resumes
+            # 5.91 / 6.38 (just above psr_lost=5.0). The 1.5x margin
+            # collapses ~95% of low-quality reseeds without
+            # weakening the legitimate refresh path on stable
+            # tracks (PSR routinely 30-60 there). Set the multiplier
+            # to 0 in YAML to disable the gate (legacy behavior).
+            from vision.lock_tracker import LockState
+            margin = float(self._lock_reseed_psr_margin)
+            def _ok_to_reseed(lt):
+                if margin <= 0:
+                    return lt.is_active
+                return (lt.state == LockState.ACTIVE
+                        and lt.last_psr >= lt.psr_lost * margin)
+            if (ef_ok and _ok_to_reseed(self._lock_eo)
                     and self._lock_eo.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
                 bbox_eo = (self._eo_detection_bbox(target, ef)
                             or self._fused_to_eo_bbox(target, ef))
                 if bbox_eo is not None:
                     self._lock_eo.reseed(ef.bgr, bbox_eo, now=now)
-            if (tf_ok and self._lock_thermal.is_active
+            if (tf_ok and _ok_to_reseed(self._lock_thermal)
                     and self._lock_thermal.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
                 bbox_th = (self._thermal_detection_bbox(target, tf)

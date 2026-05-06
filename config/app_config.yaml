@@ -923,6 +923,15 @@ gimbal:
     # but unused.
     reseed_iou_min: 0.20
     reseed_min_period_s: 0.30    # don't reseed faster than this even if obs allow
+    # PSR safety margin for auto-reseed. Auto-reseed only fires when
+    # state == ACTIVE (not COASTING) AND last_psr >= psr_lost*margin.
+    # Without this, recordings/lock test test.jsonl showed reseeds
+    # firing during low-PSR coast-recovery (PSR ~5.9, 6.4) which
+    # imprints a partially-occluded patch as the new template, then
+    # the next slew loses the lock immediately. 1.5 collapses ~95%
+    # of low-quality reseeds without weakening the legitimate path
+    # (stable tracks PSR routinely 30-60). Set 0 to disable the gate.
+    reseed_psr_margin: 1.5
     learning_rate: 0.125         # MOSSE online filter blending
     sigma: 2.0                   # MOSSE Gaussian peak width
     max_patch_dim: 96            # MOSSE FFT working size cap
