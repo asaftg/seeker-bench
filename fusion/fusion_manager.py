@@ -739,9 +739,23 @@ class FusionManager:
         # vehicle-scene replay test, not just a YOLO-id-swap one.
         for c in candidates:
             best_i, best_iou = -1, 0.0
+            c_is_radar = (c["class"] == rt)
             for i in range(n_existing):
                 trk = self._tracks[i]
                 if matched[i] or not self._class_compatible(trk["class"], c["class"]):
+                    continue
+                # T2.9 (Wave 2 fusion review): when ONE side is the
+                # RADAR_TARGET sentinel and the other side is a real
+                # class, only match if the real-class track is
+                # currently ACTIVE (misses==0). Without this, a fresh
+                # radar return can revive a coasted real-class track
+                # whose physical target is gone — rebirthing the
+                # wrong identity at the radar's angular position.
+                # Guards the 75-83% short-life dropped-track tail seen
+                # in lock test test.jsonl / track worse.jsonl.
+                trk_is_radar = (trk["class"] == rt)
+                if (c_is_radar != trk_is_radar
+                        and int(trk.get("misses", 0)) > 0):
                     continue
                 iou = angular_iou(
                     c["az"], c["el"], c["ang_w"], c["ang_h"],
