@@ -96,6 +96,22 @@ class FusionManager:
         # the same target. Tunable via YAML; promote to DEV-tab slider
         # once we know the right operating range.
         self.radar_iou_gate = float(fcfg.get("radar_iou_gate", 0.05))
+        # T2.8 Containment metric for radar↔camera matching.
+        # Pure IoU under-matches when a small camera bbox sits inside
+        # a big radar bbox (1deg-in-10deg = 0.01 IoU, never passes
+        # any reasonable gate). Containment = intersection/min(area)
+        # returns 1.0 in that case. Wave 2 radar review found this
+        # is the actual cause of poor radar↔camera association at
+        # long range, not the bbox-size threshold.
+        # Mode: "iou" (legacy) or "containment" (new default).
+        self.radar_match_metric = str(
+            fcfg.get("radar_match_metric", "containment")).lower()
+        # Containment gate — much higher than IoU because the metric
+        # is strictly larger. 0.5 = "small bbox is at least half
+        # inside the big one." Tune up for stricter assoc, down to
+        # ~0.3 if radar bboxes routinely barely overlap.
+        self.radar_containment_gate = float(
+            fcfg.get("radar_containment_gate", 0.5))
         # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
         # When EO and thermal frame timestamps disagree by more than
         # this, skip the cross-sensor pairing for the current tick:
@@ -405,19 +421,28 @@ class FusionManager:
         # are association targets here.
         n_cam_cands = len(candidates)
         used_c = [False] * n_cam_cands
+        # T2.8: pick metric + gate based on YAML. Default = containment
+        # (handles small-camera-in-big-radar correctly); legacy = iou.
+        if self.radar_match_metric == "containment":
+            from fusion.angular import angular_containment
+            radar_metric_fn = angular_containment
+            radar_metric_gate = self.radar_containment_gate
+        else:
+            radar_metric_fn = angular_iou
+            radar_metric_gate = self.radar_iou_gate
         for r in radar_obs:
-            best_i, best_iou = -1, 0.0
+            best_i, best_score = -1, 0.0
             for i in range(n_cam_cands):
                 if used_c[i]:
                     continue
                 c = candidates[i]
-                iou = angular_iou(
+                score = radar_metric_fn(
                     r["az"], r["el"], r["ang_w"], r["ang_h"],
                     c["az"], c["el"], c["ang_w"], c["ang_h"],
                 )
-                if iou > best_iou:
-                    best_iou, best_i = iou, i
-            if best_i >= 0 and best_iou >= self.radar_iou_gate:
+                if score > best_score:
+                    best_score, best_i = score, i
+            if best_i >= 0 and best_score >= radar_metric_gate:
                 c = candidates[best_i]
                 used_c[best_i] = True
                 if "radar" not in c["sensors"]:
