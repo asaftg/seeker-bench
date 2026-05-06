@@ -589,6 +589,19 @@ radar:
   # needs ≥2 neighbours to be a core point); frame-to-frame M-of-N
   # confirmation below kills the rare 2-point coincidence false positive.
   cluster_min_samples: 2
+  # T2.10 Range-aware DBSCAN cluster-size clamp (default OFF).
+  # The 1.5*std formulation in clustering.py turns a few-point
+  # cluster's noise into a 30-90 deg angular bbox via the atan2
+  # in fusion. Wave 2 radar measured ang_w max 97 deg.
+  # When enabled, the per-axis half-extent is clamped to
+  # min_size + size_per_meter_m * slant. Default 0 + 0.05 m/m
+  # gives 0.5 m at 10 m slant (3% angular at that range), 1.0 m
+  # at 20 m. NEEDS BENCH VALIDATION: extrinsics drift may
+  # currently masquerade as oversized cluster span; per Wave 3,
+  # extrinsic drift monitoring should land first. Default OFF.
+  range_aware_clamp: false
+  range_aware_min_size_m: 0.25
+  range_aware_size_per_meter_m: 0.05
 
   # Kalman tracker — stabilises bboxes through flicker and brief dropouts.
   # The clusterer runs a 6D constant-velocity Kalman filter per tracklet,

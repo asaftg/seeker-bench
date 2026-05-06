@@ -236,6 +236,13 @@ def main() -> int:
                 r_pos_m=float(_trk.get("r_pos_m", _defaults.r_pos_m)),
                 graveyard_ttl_s=float(_trk.get("graveyard_ttl_s", _defaults.graveyard_ttl_s)),
                 resurrect_radius_m=float(_trk.get("resurrect_radius_m", _defaults.resurrect_radius_m)),
+                range_aware_clamp=bool(radar_cfg.get(
+                    "range_aware_clamp", _defaults.range_aware_clamp)),
+                range_aware_min_size_m=float(radar_cfg.get(
+                    "range_aware_min_size_m", _defaults.range_aware_min_size_m)),
+                range_aware_size_per_meter_m=float(radar_cfg.get(
+                    "range_aware_size_per_meter_m",
+                    _defaults.range_aware_size_per_meter_m)),
             )
             _ext = (radar_cfg.get("extrinsic") or {})
             radar = RadarManager(
@@ -380,17 +387,18 @@ def main() -> int:
                                 cluster_eps_pos_m=stock_p.get("cluster_eps_pos_m"),
                                 cluster_min_samples=stock_p.get("cluster_min_samples"),
                             )
-                        if "ag" in _saved:
-                            radar.update_ag_params(**{
-                                k: _saved["ag"][k] for k in
-                                ("integrate_chirps","cfar_algo","cfar_threshold_db","capon_bf")
-                                if k in _saved["ag"]
-                            })
+                        # A/G mode currently has no host-side DSP knobs
+                        # to restore — it's a filter preset on Stock TLV
+                        # (see radar/composite_manager.py:_MODE_FILTERS).
+                        # The integrate_chirps/cfar_*/capon_bf fields
+                        # were removed 2026-05-05 (host CFAR pipeline
+                        # is skipped, chip-side CFAR can't be retuned
+                        # at runtime on this firmware).
                         if "aa" in _saved:
                             radar.update_aa_params(**{
                                 k: _saved["aa"][k] for k in
                                 ("pmm_band_low_hz","pmm_band_high_hz","pmm_threshold_db",
-                                 "pmm_slow_time_win","staggered_prf")
+                                 "pmm_slow_time_win")
                                 if k in _saved["aa"]
                             })
                         log.info("Restored saved per-mode radar config from %s", _saved_path)
