@@ -856,16 +856,19 @@ class GimbalManager:
         )
         self._lock_eo = LockTracker(lt_cfg)
         self._lock_thermal = LockTracker(lt_cfg)
-        # Engagement metadata captured at seed time so auto-reseed
-        # can match new fused tracks back to the same target.
+        # Engagement metadata captured at seed time. v2 uses ONLY
+        # `_lock_target_id` for the reseed gate; class is no longer
+        # checked (an ID match implies same physical target).
         self._lock_target_id: Optional[int] = None
         self._lock_target_class: Optional[str] = None
         self._lock_seed_pending: bool = False
-        # Auto-reseed gates (YAML-configurable).
-        self._lock_reseed_iou_min: float = float(
-            lm_cfg.get("reseed_iou_min", 0.20))
         self._lock_reseed_min_period_s: float = float(
             lm_cfg.get("reseed_min_period_s", 0.30))
+        # State-transition tracker for the JSONL recorder. We emit
+        # one event per real transition (not per tick) so a future
+        # replay can reconstruct the lock-state machine from the
+        # event stream alone.
+        self._lock_last_state_str: str = "off"
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -2015,6 +2018,10 @@ class GimbalManager:
         except Exception:
             log.exception("lock_mode_tick failed; emitting empty lock state")
             lock_bbox_eo, lock_bbox_thermal, lock_state_str = None, None, "off"
+        # Snapshot the current lock target id under the lock so the
+        # GUI knows which fused-track green box to suppress.
+        with self._lock:
+            lock_target_id_pub = self._lock_target_id
 
         # Publish state. `tracked_target_id` carries whichever lock is
         # live — fused id if that's set, else the heat id. The GUI only
@@ -2038,6 +2045,7 @@ class GimbalManager:
             lock_state=lock_state_str,
             lock_bbox_eo=lock_bbox_eo,
             lock_bbox_thermal=lock_bbox_thermal,
+            lock_target_id=lock_target_id_pub,
         )
         BUS.publish(Topic.GIMBAL, state)
 
@@ -2102,30 +2110,45 @@ class GimbalManager:
         th_upd = (self._lock_thermal.update(tf.agc8, now=now)
                    if (tf_ok and self._lock_thermal.is_active) else None)
 
-        # ── Auto-reseed: if a fused track lands within our search
-        # gate AND class matches AND IoU with current lock bbox is
-        # above the threshold, reseed to refresh the appearance
-        # template. Throttled by reseed_min_period_s.
+        # ── Auto-reseed (v2): STRICT ID-MATCH ONLY.
+        #
+        # v1 used (class match + IoU >= 0.20) to find a "matching"
+        # fused track and reseed onto it. In dense same-class scenes
+        # (5+ vehicles in `recordings/lock poorly.jsonl` at t≈9.6s)
+        # that gate fired on a different vehicle that briefly
+        # overlapped the lock bbox, swapping the lock identity to a
+        # passing target. Operator: "additional locked bbs that were
+        # mixing and confusing between targets on the yolo side."
+        #
+        # v2: only reseed when the fused-track stream contains a
+        # track with id == self._lock_target_id. The original ID
+        # assigned by fusion at engagement is the only thing that
+        # ever refreshes the appearance template. Drift onto a
+        # different physical target becomes structurally impossible
+        # because the only path to overwrite the template requires
+        # ID-equality with the engaged track. If fusion drops the
+        # engaged ID permanently (max_misses), the lock keeps
+        # COASTING on appearance MOSSE alone, then HARD_RELEASED at
+        # the coast window — operator clicks TRACK on a new ID for
+        # a fresh lock. Trade-off accepted per 2026-05-05 retro.
         fused = BUS.get_latest(Topic.FUSED) or []
+        target = None
         for trk in fused:
-            tcls = getattr(getattr(trk, "target_class", None), "value", None)
-            if (self._lock_target_class is not None
-                    and tcls is not None
-                    and tcls != self._lock_target_class):
-                continue
-            if (ef_ok and eo_upd is not None and eo_upd.bbox_xywh is not None
+            if getattr(trk, "id", None) == self._lock_target_id:
+                target = trk
+                break
+        if target is not None:
+            if (ef_ok and self._lock_eo.is_active
                     and self._lock_eo.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
-                bbox_eo = self._fused_to_eo_bbox(trk, ef)
-                if bbox_eo is not None and _bbox_iou(
-                        bbox_eo, eo_upd.bbox_xywh) >= self._lock_reseed_iou_min:
+                bbox_eo = self._fused_to_eo_bbox(target, ef)
+                if bbox_eo is not None:
                     self._lock_eo.reseed(ef.bgr, bbox_eo, now=now)
-            if (tf_ok and th_upd is not None and th_upd.bbox_xywh is not None
+            if (tf_ok and self._lock_thermal.is_active
                     and self._lock_thermal.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
-                bbox_th = self._fused_to_thermal_bbox(trk, tf)
-                if bbox_th is not None and _bbox_iou(
-                        bbox_th, th_upd.bbox_xywh) >= self._lock_reseed_iou_min:
+                bbox_th = self._fused_to_thermal_bbox(target, tf)
+                if bbox_th is not None:
                     self._lock_thermal.reseed(tf.agc8, bbox_th, now=now)
 
         # ── Compose published values.
@@ -2150,7 +2173,43 @@ class GimbalManager:
             lock_state = "off"
         elif LockState.HARD_RELEASED in states:
             lock_state = "released"
-            # Auto-clear on hard-release: drop the operator engagement.
+        elif LockState.COASTING in states:
+            lock_state = "coasting"
+        elif LockState.ACTIVE in states:
+            lock_state = "active"
+        else:
+            lock_state = "off"
+
+        # ── Emit per-transition events for replay-debug. One event
+        # per real edge in the state machine, never per-tick.
+        if lock_state != self._lock_last_state_str:
+            ev_payload = {
+                "tracked_id": self._lock_target_id,
+                "from_state": self._lock_last_state_str,
+                "to_state": lock_state,
+                "psr_eo": (round(float(eo_upd.psr), 2)
+                            if eo_upd is not None else None),
+                "psr_thermal": (round(float(th_upd.psr), 2)
+                                  if th_upd is not None else None),
+            }
+            event_name = {
+                ("off", "active"):       "lock_seeded",
+                ("active", "coasting"):  "lock_coasting_enter",
+                ("coasting", "active"):  "lock_active_resume",
+                ("coasting", "released"):"lock_hard_released",
+                ("active", "released"):  "lock_hard_released",
+            }.get((self._lock_last_state_str, lock_state),
+                  "lock_state_change")
+            try:
+                emit_event(event_name, ev_payload)
+            except Exception:
+                pass
+            self._lock_last_state_str = lock_state
+
+        # ── HARD_RELEASED side effects: drop engagement so gimbal
+        # returns to manual. Done after event emission so the
+        # transition is recorded.
+        if lock_state == "released":
             with self._lock:
                 if self._tracked_id == self._lock_target_id:
                     self._tracked_id = None
@@ -2160,12 +2219,6 @@ class GimbalManager:
             self._lock_target_class = None
             self._lock_seed_pending = False
             return None, None, "released"
-        elif LockState.COASTING in states:
-            lock_state = "coasting"
-        elif LockState.ACTIVE in states:
-            lock_state = "active"
-        else:
-            lock_state = "off"
         return bbox_eo_pub, bbox_th_pub, lock_state
 
     def _fused_to_eo_bbox(self, trk: Any,

@@ -352,6 +352,71 @@ export function drawRubberBand(ctx, x0, y0, x1, y1) {
 }
 
 // ---------------------------------------------------------------------------
+// Lock-mode v2 render helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Draw four corner brackets + a center crosshair at (x, y, w, h).
+ * Visually distinct from the solid/dashed rectangles used for fused
+ * and projected tracks so the operator can always tell at a glance
+ * which box is the engaged lock vs which is a regular detection.
+ *   color = "#00e676" (green) → ACTIVE
+ *   color = "#ffb000" (amber) → COASTING
+ *   dashed = true             → COASTING line style
+ */
+export function drawLockBrackets(ctx, x, y, w, h, color, dashed) {
+  ctx.save();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = color;
+  if (dashed) ctx.setLineDash([8, 4]);
+  // Bracket length: 1/4 of the shorter side (or 18 px floor).
+  const bl = Math.max(18, Math.min(w, h) * 0.25);
+  // Top-left
+  ctx.beginPath();
+  ctx.moveTo(x, y + bl); ctx.lineTo(x, y); ctx.lineTo(x + bl, y);
+  ctx.stroke();
+  // Top-right
+  ctx.beginPath();
+  ctx.moveTo(x + w - bl, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + bl);
+  ctx.stroke();
+  // Bottom-right
+  ctx.beginPath();
+  ctx.moveTo(x + w, y + h - bl); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - bl, y + h);
+  ctx.stroke();
+  // Bottom-left
+  ctx.beginPath();
+  ctx.moveTo(x + bl, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - bl);
+  ctx.stroke();
+  // Center crosshair — solid lines (always solid even when COASTING).
+  const cx = x + w / 2, cy = y + h / 2;
+  const ch = Math.max(8, Math.min(w, h) * 0.10);
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(cx - ch, cy); ctx.lineTo(cx + ch, cy);
+  ctx.moveTo(cx, cy - ch); ctx.lineTo(cx, cy + ch);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Filled-background label drawn just above (x, y) with the lock
+ * color. Mirrors _drawLabel but takes the color as an argument.
+ */
+export function drawLockLabel(ctx, x, y, color, text) {
+  ctx.save();
+  ctx.font = "bold 12px 'JetBrains Mono', ui-monospace, monospace";
+  const padX = 6, padY = 3;
+  const tw = ctx.measureText(text).width + padX * 2;
+  const th = 18;
+  const ly = Math.max(0, y - th - 1);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, ly, tw, th);
+  ctx.fillStyle = "#000";
+  ctx.fillText(text, x + padX, ly + th - padY - 2);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
 // Radar projected track (cyan dashed)
 // ---------------------------------------------------------------------------
 export function drawRadarBox(ctx, x, y, w, h, label) {

@@ -921,6 +921,7 @@ def build_ws_message(
             "lock_state": getattr(gstate, "lock_state", "off"),
             "lock_bbox_eo": _bbox_to_dict(getattr(gstate, "lock_bbox_eo", None)),
             "lock_bbox_thermal": _bbox_to_dict(getattr(gstate, "lock_bbox_thermal", None)),
+            "lock_target_id": getattr(gstate, "lock_target_id", None),
         }
     else:
         gimbal_payload = {
@@ -935,6 +936,7 @@ def build_ws_message(
             "lock_state": "off",
             "lock_bbox_eo": None,
             "lock_bbox_thermal": None,
+            "lock_target_id": None,
         }
 
     # EO gets its own JPEG quality knob — a 2K mono sensor with a real

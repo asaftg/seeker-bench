@@ -885,21 +885,17 @@ if (areaSlider) {
     cluster_eps_pos_m:   "radar-eps",
     cluster_min_samples: "radar-minpts",
   };
-  // A/G-only DSP knobs (revealed when mode=ag). Each entry is the
-  // payload key + DOM id + how to read its value.
-  const _AG_CTRLS = {
-    integrate_chirps:  { id: "ag-chirps",      type: "num"  },
-    cfar_algo:         { id: "ag-cfar-algo",   type: "str"  },
-    cfar_threshold_db: { id: "ag-cfar-thresh", type: "num"  },
-    capon_bf:          { id: "ag-capon",       type: "bool" },
-  };
+  // A/G mode currently exposes no DSP knobs — see HTML comment in
+  // the radar-mode-extra[data-mode="ag"] section. Empty so save/load
+  // skips the AG block instead of writing dead fields.
+  const _AG_CTRLS = {};
   // A/A-only PMM-classifier knobs (revealed when mode=aa).
+  // staggered_prf removed 2026-05-05: not implemented in detector.
   const _AA_CTRLS = {
     pmm_band_low_hz:   { id: "aa-pmm-low",      type: "num"  },
     pmm_band_high_hz:  { id: "aa-pmm-high",     type: "num"  },
     pmm_threshold_db:  { id: "aa-pmm-thresh",   type: "num"  },
     pmm_slow_time_win: { id: "aa-pmm-win",      type: "num"  },
-    staggered_prf:     { id: "aa-staggered-prf",type: "bool" },
   };
   function _readCtrl(spec) {
     const el = document.getElementById(spec.id);
@@ -1060,10 +1056,9 @@ if (areaSlider) {
     el.addEventListener("change", pushAndPaint);
     paintLabel();  // initial label only — no WS send at page load
   }
-  _wireModeControl("ag-chirps",      "ag_tune", "integrate_chirps",   v => v + " chirps");
-  _wireModeControl("ag-cfar-algo",   "ag_tune", "cfar_algo",          v => "");
-  _wireModeControl("ag-cfar-thresh", "ag_tune", "cfar_threshold_db",  v => v.toFixed(1) + " dB");
-  _wireModeControl("ag-capon",       "ag_tune", "capon_bf",           v => "");
+  // A/G DSP knobs removed 2026-05-05 — host CFAR pipeline is skipped
+  // (pmm_only=True) and chip-side CFAR can't be retuned at runtime.
+  // See HTML comment in radar-mode-extra[data-mode="ag"].
 
   // ── Dual-thumb PMM-band slider ────────────────────────────────────
   // The two `aa-pmm-low` / `aa-pmm-high` inputs share one track. We
@@ -1109,7 +1104,7 @@ if (areaSlider) {
   _wireModeControl("aa-pmm-high",    "aa_tune", "pmm_band_high_hz",   v => v.toFixed(0) + " Hz");
   _wireModeControl("aa-pmm-thresh",  "aa_tune", "pmm_threshold_db",   v => v.toFixed(1) + " dB");
   _wireModeControl("aa-pmm-win",     "aa_tune", "pmm_slow_time_win",  v => v + " chirps");
-  _wireModeControl("aa-staggered-prf","aa_tune","staggered_prf",      v => "");
+  // staggered_prf removed 2026-05-05 — not implemented in detector.
 
   // ───── SAVE CONFIG button — persist current slider values for the
   //       ACTIVE mode to disk. Each mode (Stock / A/G / A/A) has its
@@ -1455,6 +1450,10 @@ function connect() {
       state: msg.gimbal.lock_state,
       bbox_eo: msg.gimbal.lock_bbox_eo || null,
       bbox_thermal: msg.gimbal.lock_bbox_thermal || null,
+      // v2: target_id used by the view classes to suppress the
+      // duplicate fused-track green box for the engaged target.
+      target_id: (msg.gimbal.lock_target_id != null
+                   ? Number(msg.gimbal.lock_target_id) : null),
     } : null;
     _lastLock = gLock;
 

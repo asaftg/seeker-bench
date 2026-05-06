@@ -1,11 +1,17 @@
 # Good baseline — Seeker-01 working state 2026-05-05
 
-This file captures the **known-good** state of the bench at git tag
-`good-baseline-v1` (commit `59c4a4f`). The operator graded it
-better-than-7/10. The upcoming lock-mode tracker
-(`vision/lock_tracker.py`) is additive code — if it doesn't deliver
-the rock-solid behavior promised, this baseline is recoverable in
-two ways.
+This file captures the **known-good** revert chain for the lock-mode
+work. Three checkpoints exist on origin:
+
+| Tag | Commit | What it captures |
+|---|---|---|
+| `good-baseline-v1` | `59c4a4f` | Pre-lock-mode. Operator graded better than 7/10. All FPS / hunting / engagement-reset fixes shipped, no lock mode at all. |
+| `pre-lock-v2` | `d51c9be` | Lock mode v1 in the tree but DISABLED via YAML kill switch. Manual gimbal softened from 120 to 45 dps. Lock-mode v1 had multi-target swap bugs in dense scenes (recordings/lock poorly.jsonl). |
+| `lock-v2` | (this commit) | Lock mode v2: ID-only auto-reseed (no IoU/class search), GUI suppresses duplicate fused box for engaged ID, distinctive corner-bracket render with `LOCK #ID` label, recorder serializes lock fields, diagnostic events emitted. Default `enabled: false`. |
+
+The upcoming lock-mode tracker (`vision/lock_tracker.py`) is additive
+code — if it doesn't deliver the rock-solid behavior promised, the
+baseline is recoverable in two ways.
 
 ## How to revert
 

@@ -14,6 +14,8 @@ import {
   drawProjectedBox,
   drawRadarBox,
   drawRubberBand,
+  drawLockBrackets,
+  drawLockLabel,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -352,7 +354,17 @@ export class EOView {
     }
 
     // Fused overlay rules — mirror of thermal_view.
+    // v2: when lock mode is showing a lock_bbox_eo for the engaged
+    // track, SUPPRESS the projected/fused green box for that exact
+    // track id so the operator sees ONE green box (the lock), not
+    // two. Other fused tracks render normally. Without this gate
+    // the lock-mode and the regular fused rendering both painted
+    // green boxes for the same target — the v1 confusion bug.
+    const lockedId = (this._lock && this._lock.bbox_eo
+                       && this._lock.target_id != null)
+        ? this._lock.target_id : null;
     for (const trk of this._lastFused) {
+      if (lockedId != null && trk.id === lockedId) continue;
       const nSensors = (trk.sensors || []).length;
       const bbox = trk.bbox_eo;
       if (!bbox) continue;
@@ -410,12 +422,12 @@ export class EOView {
       this.ctx.restore();
     }
 
-    // Lock-mode bbox: drawn LAST so it sits on top of every overlay
-    // (other than the rubber-band, which is interactive). Solid green
-    // at 4 px when ACTIVE, dashed amber at 4 px when COASTING — the
-    // amber tells the operator the appearance match is weak and the
-    // coast window is running, so a hard release may follow if the
-    // target doesn't reappear. Includes a "LOCK" label.
+    // Lock-mode bbox (v2): corner brackets + center crosshair +
+    // "LOCK #ID" label. Visually distinct from the simple rectangles
+    // used for fused/projected tracks, so the operator can always
+    // tell at a glance which box is the engaged lock vs which is a
+    // raw classifier output. Solid green for ACTIVE, dashed amber
+    // for COASTING. Drawn last so it sits over all overlays.
     if (this._lock && this._lock.bbox_eo) {
       const bb = this._lock.bbox_eo;
       const px = dx + bb.x * scale;
@@ -423,25 +435,12 @@ export class EOView {
       const pw = bb.w * scale;
       const ph = bb.h * scale;
       const coasting = this._lock.state === "coasting";
-      this.ctx.save();
-      this.ctx.lineWidth = 4;
-      this.ctx.strokeStyle = coasting ? "#ffb000" : "#00e676";
-      if (coasting) this.ctx.setLineDash([10, 6]);
-      this.ctx.strokeRect(px, py, pw, ph);
-      this.ctx.restore();
-      // Label
-      this.ctx.save();
-      this.ctx.font = "bold 12px ui-monospace, Menlo, monospace";
-      const labelText = coasting ? "LOCK · COAST" : "LOCK";
-      const labelW = this.ctx.measureText(labelText).width + 12;
-      const labelH = 18;
-      const labelX = px;
-      const labelY = Math.max(0, py - labelH);
-      this.ctx.fillStyle = coasting ? "#ffb000" : "#00e676";
-      this.ctx.fillRect(labelX, labelY, labelW, labelH);
-      this.ctx.fillStyle = "#000";
-      this.ctx.fillText(labelText, labelX + 6, labelY + labelH - 5);
-      this.ctx.restore();
+      const color = coasting ? "#ffb000" : "#00e676";
+      drawLockBrackets(this.ctx, px, py, pw, ph, color, coasting);
+      const labelText = coasting
+        ? `LOCK · COAST #${this._lock.target_id ?? ""}`
+        : `LOCK #${this._lock.target_id ?? ""}`;
+      drawLockLabel(this.ctx, px, py, color, labelText);
     }
 
     // Rubber-band rectangle while the user is dragging in measure mode.

@@ -221,6 +221,10 @@ def encode_radar(rf: Optional[RadarFrame]) -> Optional[Dict[str, Any]]:
 def encode_gimbal(gs: Optional[GimbalState]) -> Optional[Dict[str, Any]]:
     if gs is None:
         return None
+    def _bbox_dict(bb):
+        if bb is None: return None
+        return {"x": int(bb.x), "y": int(bb.y),
+                "w": int(bb.w), "h": int(bb.h)}
     return {
         "timestamp": float(gs.timestamp),
         "connected": bool(gs.connected),
@@ -242,6 +246,15 @@ def encode_gimbal(gs: Optional[GimbalState]) -> Optional[Dict[str, Any]]:
                                  else float(gs.target_resid_az_deg)),
         "target_resid_el_deg": (None if gs.target_resid_el_deg is None
                                  else float(gs.target_resid_el_deg)),
+        # Lock-mode fields (gimbal.lock_mode in YAML). Recorded so a
+        # future replay can analyze the lock state machine offline.
+        # The lock-mode v1 retro (recordings/lock poorly.jsonl) was
+        # blocked because these fields weren't serialized — fix that
+        # now so v2 sessions are debuggable.
+        "lock_state": getattr(gs, "lock_state", "off"),
+        "lock_bbox_eo": _bbox_dict(getattr(gs, "lock_bbox_eo", None)),
+        "lock_bbox_thermal": _bbox_dict(getattr(gs, "lock_bbox_thermal", None)),
+        "lock_target_id": getattr(gs, "lock_target_id", None),
     }
 
 

@@ -449,3 +449,11 @@ class GimbalState:
     lock_state: str = "off"
     lock_bbox_eo: Optional["BBox"] = None
     lock_bbox_thermal: Optional["BBox"] = None
+    # Fused-track ID the lock is currently anchored on. The GUI uses
+    # this to SUPPRESS the projected fused-track green box for the
+    # engaged target — without this, the lock bbox and the fused-
+    # track box render simultaneously and the operator sees two
+    # boxes for what's logically one engagement (the v1 confusion
+    # documented in `recordings/lock poorly.jsonl` retro). None when
+    # lock mode is OFF.
+    lock_target_id: Optional[int] = None

@@ -11,6 +11,8 @@ import {
   drawSyntheticTargetBox,
   drawRubberBand,
   drawRadarBox,
+  drawLockBrackets,
+  drawLockLabel,
   isSubsumedByFused,
   fusedIdForDet,
 } from "./overlays.js";
@@ -267,7 +269,12 @@ export class ThermalView {
     //   =1 sensor   → nothing on the detecting panel (raw already drawn),
     //                 dashed class-colored box on the OTHER panel showing
     //                 the projected location ("another sensor says so").
+    // v2 lock-mode suppression: see eo_view.js for the rationale.
+    const lockedId = (this._lock && this._lock.bbox_thermal
+                       && this._lock.target_id != null)
+        ? this._lock.target_id : null;
     for (const trk of this._lastFused) {
+      if (lockedId != null && trk.id === lockedId) continue;
       const nSensors = (trk.sensors || []).length;
       const bbox = trk.bbox_thermal;
       if (!bbox) continue;
@@ -298,7 +305,8 @@ export class ThermalView {
       }
     }
 
-    // Lock-mode bbox: green/active or amber/coasting. See eo_view.js.
+    // Lock-mode bbox (v2): corner brackets + crosshair, ID label.
+    // See eo_view.js for the design rationale.
     if (this._lock && this._lock.bbox_thermal) {
       const bb = this._lock.bbox_thermal;
       const px = dx + bb.x * scale;
@@ -306,24 +314,12 @@ export class ThermalView {
       const pw = bb.w * scale;
       const ph = bb.h * scale;
       const coasting = this._lock.state === "coasting";
-      this.ctx.save();
-      this.ctx.lineWidth = 4;
-      this.ctx.strokeStyle = coasting ? "#ffb000" : "#00e676";
-      if (coasting) this.ctx.setLineDash([10, 6]);
-      this.ctx.strokeRect(px, py, pw, ph);
-      this.ctx.restore();
-      this.ctx.save();
-      this.ctx.font = "bold 12px ui-monospace, Menlo, monospace";
-      const labelText = coasting ? "LOCK · COAST" : "LOCK";
-      const labelW = this.ctx.measureText(labelText).width + 12;
-      const labelH = 18;
-      const labelX = px;
-      const labelY = Math.max(0, py - labelH);
-      this.ctx.fillStyle = coasting ? "#ffb000" : "#00e676";
-      this.ctx.fillRect(labelX, labelY, labelW, labelH);
-      this.ctx.fillStyle = "#000";
-      this.ctx.fillText(labelText, labelX + 6, labelY + labelH - 5);
-      this.ctx.restore();
+      const color = coasting ? "#ffb000" : "#00e676";
+      drawLockBrackets(this.ctx, px, py, pw, ph, color, coasting);
+      const labelText = coasting
+        ? `LOCK · COAST #${this._lock.target_id ?? ""}`
+        : `LOCK #${this._lock.target_id ?? ""}`;
+      drawLockLabel(this.ctx, px, py, color, labelText);
     }
 
     // Rubber-band rectangle while the user is dragging in draw mode.
