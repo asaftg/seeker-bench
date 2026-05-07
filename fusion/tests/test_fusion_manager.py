@@ -168,16 +168,19 @@ def test_t27_doppler_gate_on_blocks_static_radar_from_camjoin():
 # ─────────────────────── T1.6 Temporal gate ─────────────────────
 
 
-def test_t16_temporal_gate_default_33ms():
-    """Default temporal_gate_ms=33, ~1 frame at 30 Hz EO."""
+def test_t16_temporal_gate_default_disabled():
+    """Default temporal_gate_ms=0 (DISABLED) after the 2026-05-06
+    revert — `track not good 5620261.jsonl` showed median EO↔thermal
+    skew of 84 ms, so the original 33 ms gate fired 41 times in 45 s
+    and broke fusion. Re-enable cautiously at ~120 ms (catches
+    genuine sync outages without firing on natural async-capture
+    skew). See FusionManager.temporal_gate_ms YAML knob."""
     fm = FusionManager()
-    assert fm.temporal_gate_ms == 33.0
+    assert fm.temporal_gate_ms == 0.0  # disabled
 
 
-def test_t16_temporal_gate_disable_with_zero():
-    """Zero disables the gate — legacy unconditional pairing."""
+def test_t16_temporal_gate_can_be_enabled():
+    """Setting temporal_gate_ms > 0 re-enables the gate path."""
     fm = FusionManager()
-    fm.temporal_gate_ms = 0
-    # The gate path checks `if self.temporal_gate_ms > 0` — verify
-    # the truthiness signal is what _tick reads.
-    assert not (fm.temporal_gate_ms > 0)
+    fm.temporal_gate_ms = 120
+    assert fm.temporal_gate_ms > 0

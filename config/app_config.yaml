@@ -403,13 +403,21 @@ eo:
   # The async classifier returns bboxes 2-4 frames stale; at the
   # rig's peak 64 dps slew (recordings/track worse.jsonl) that's
   # 5-10 deg of misregistration between the bbox pixels and the
-  # publish-time gimbal pose. Without re-warp, fusion eats this
-  # offset and the lock-mode seed (which prefers per-sensor
-  # detection bbox) lands on the wrong patch during slews.
-  # Re-warps bboxes by (cur_pan - capture_pan) * px_per_deg
-  # before publishing the EOFrame. Set false to revert byte-
-  # equivalent (legacy publish-time pose stamping).
-  pose_delta_rewarp: true
+  # publish-time gimbal pose. Re-warps bboxes by (cur_pan -
+  # capture_pan) * px_per_deg before publishing the EOFrame.
+  #
+  # 2026-05-06 DISABLED after `track not good 5620261.jsonl`:
+  # tid=50 lock PSR_eo went 97 → 3.57 → 5.32 → 93 → 37 in 1 s of
+  # tracking. That flapping pattern is consistent with the rewarped
+  # YOLO bbox (used as the lock-seed bbox via per-sensor detection
+  # lookup) landing on a slightly off-target patch when the gimbal
+  # pose lookup vs bbox-publish-time race produces a wrong delta.
+  # The architecturally-correct fix is to address the MOSSE
+  # search-window collapse during slews (predict bbox center via
+  # pose delta IN THE LOCK-MODE TICK before MosseTracker.update),
+  # not to rewarp the YOLO bbox upstream. Re-enable cautiously
+  # only after the lock-mode predictor lands.
+  pose_delta_rewarp: false
 
   # Test mode: when running with a generic webcam in place of the real
   # IMX568 + 35mm lens, we need to tell fusion the *actual* FOV the
@@ -731,13 +739,24 @@ fusion:
   radar_doppler_min_mps: 0.0
   # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
   # When the EO and thermal frame timestamps disagree by more than
-  # this many milliseconds, fusion DOES NOT pair them on this tick:
-  # both go in as standalone candidates instead. Without the gate,
-  # a stale EO bbox can fuse with a fresh thermal bbox at different
-  # poses, producing an oversized fused angular extent. Wave 2
-  # measured p95 EO↔thermal skew at 48 ms on lock test test.jsonl;
-  # 33 ms is ~1 frame at 30 Hz EO. Set 0 to disable.
-  temporal_gate_ms: 33.0
+  # this many milliseconds, fusion DOES NOT pair them on this tick.
+  #
+  # 2026-05-06 disabled (set to 0) after `track not good 5620261.jsonl`:
+  # the audited p95 skew of 48 ms on `lock test test.jsonl` was NOT
+  # representative — operator's bench actually runs EO at 12-19 FPS
+  # and thermal at 10-22 FPS asynchronously, with median EO↔thermal
+  # skew of 84 ms (max 175 ms). At those rates the natural skew is
+  # 50-100 ms even with no upstream pacing problem; gating at 33 ms
+  # blocked 41 of ~45 fusion ticks per second of recording, killing
+  # cross-sensor pairing entirely and producing an explosion of
+  # standalone-radar / standalone-thermal candidates. Track births
+  # in 45 s went 20+, drops 32 — extreme churn.
+  #
+  # The right fix is upstream pacing (Tier 2 #11 + #12) so the
+  # rates match. Until then, leave the gate disabled. To re-enable
+  # cautiously, set to ~120 ms (catches genuine sync outages without
+  # firing on the natural skew).
+  temporal_gate_ms: 0.0
 
 gimbal:
   # driver:
@@ -988,6 +1007,19 @@ gimbal:
     # of low-quality reseeds without weakening the legitimate path
     # (stable tracks PSR routinely 30-60). Set 0 to disable the gate.
     reseed_psr_margin: 1.5
+    # Pose-shift cached LockUpdate during MOSSE dedupe (T1.2).
+    # Between true EO/thermal frames the gimbal pose advances; this
+    # shifts the cached bbox by (cur_pose - cached_frame.gimbal_*_at_
+    # capture) * px_per_deg so the bracket follows the gimbal.
+    # 2026-05-06 DEFAULT FALSE after `track not good 5620261.jsonl`
+    # showed PSR flapping consistent with bbox landing off-target
+    # during slews. The pose-shift is in image coords; the cached
+    # frame is also in image coords; mixing them races the GUI's
+    # next render against the current pose. The right fix is in the
+    # MOSSE update path (predict bbox center via pose delta before
+    # MosseTracker.update) — not at the dedupe layer. Re-enable
+    # cautiously after that lands.
+    pose_shift_dedupe: false
     learning_rate: 0.125         # MOSSE online filter blending
     sigma: 2.0                   # MOSSE Gaussian peak width
     max_patch_dim: 96            # MOSSE FFT working size cap

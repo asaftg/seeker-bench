@@ -870,6 +870,17 @@ class GimbalManager:
         # is_active includes COASTING). See Wave 2 lock review.
         self._lock_reseed_psr_margin: float = float(
             lm_cfg.get("reseed_psr_margin", 1.5))
+        # Pose-shift cached LockUpdate during MOSSE dedupe (T1.2).
+        # Between true frames, the gimbal pose advances; the cached
+        # bbox is shifted by px-per-deg * pose-delta so the bracket
+        # follows the gimbal between EO frames at 17 FPS. 2026-05-06
+        # default DISABLED after `track not good 5620261.jsonl`
+        # showed PSR flapping consistent with bbox landing off-target
+        # during slews; the architecturally-correct fix is in the
+        # MOSSE search-window predictor (pending). Set true to
+        # re-enable cautiously.
+        self._lock_pose_shift_dedupe: bool = bool(
+            lm_cfg.get("pose_shift_dedupe", False))
         # State-transition tracker for the JSONL recorder. We emit
         # one event per real transition (not per tick) so a future
         # replay can reconstruct the lock-state machine from the
@@ -2284,9 +2295,12 @@ class GimbalManager:
         if ef_ok and self._lock_eo.is_active:
             ef_fid = getattr(ef, "frame_id", None)
             if ef_fid is not None and ef_fid == self._lock_last_eo_fid:
-                eo_upd = self._pose_shift_lock_update(
-                    self._lock_last_eo_upd, ef,
-                    cur_pan_now, cur_tilt_now)
+                if self._lock_pose_shift_dedupe:
+                    eo_upd = self._pose_shift_lock_update(
+                        self._lock_last_eo_upd, ef,
+                        cur_pan_now, cur_tilt_now)
+                else:
+                    eo_upd = self._lock_last_eo_upd
             else:
                 eo_upd = self._lock_eo.update(ef.bgr, now=now)
                 self._lock_last_eo_fid = ef_fid
@@ -2298,9 +2312,12 @@ class GimbalManager:
         if tf_ok and self._lock_thermal.is_active:
             tf_fid = getattr(tf, "frame_id", None)
             if tf_fid is not None and tf_fid == self._lock_last_th_fid:
-                th_upd = self._pose_shift_lock_update(
-                    self._lock_last_th_upd, tf,
-                    cur_pan_now, cur_tilt_now)
+                if self._lock_pose_shift_dedupe:
+                    th_upd = self._pose_shift_lock_update(
+                        self._lock_last_th_upd, tf,
+                        cur_pan_now, cur_tilt_now)
+                else:
+                    th_upd = self._lock_last_th_upd
             else:
                 th_upd = self._lock_thermal.update(tf.agc8, now=now)
                 self._lock_last_th_fid = tf_fid
@@ -2380,24 +2397,54 @@ class GimbalManager:
         bbox_eo_pub = to_bbox(eo_upd)
         bbox_th_pub = to_bbox(th_upd)
 
-        # State priority: HARD_RELEASED > COASTING > ACTIVE > OFF.
-        # We want the GUI to see "coasting" if EITHER sensor is
-        # coasting (so it goes amber), and "active" only when both
-        # are healthy.
+        # State priority. The published lock_state drives the GUI
+        # bracket color AND the HARD_RELEASED side-effect that drops
+        # the engagement entirely (line 2470+). Two sensor states are
+        # combined per these rules:
+        #
+        # - "released" ONLY when EVERY healthy sensor is released.
+        #   If EO is ACTIVE/COASTING and thermal hits HARD_RELEASED
+        #   (coast window expired alone), we MUST NOT drop the
+        #   engagement — the operator's lock is alive on EO.
+        #   `track not good 5620261.jsonl` tid=54 hit this: psr_eo=91
+        #   (rock solid) but psr_th=2.61 → thermal hard-released →
+        #   pre-fix code dropped the whole engagement.
+        # - "coasting" if EITHER sensor is coasting (amber bracket).
+        # - "active" only when ALL contributing sensors are ACTIVE.
+        # - "off" if no sensor is producing usable updates.
         from vision.lock_tracker import LockState
         states = []
         if eo_upd is not None: states.append(eo_upd.state)
         if th_upd is not None: states.append(th_upd.state)
+        # Effective states for combination: drop HARD_RELEASED entries
+        # so a single-sensor coast-window expiry can't kill an
+        # engagement that's still alive on the other sensor. Track
+        # this so the per-sensor releases still trigger the
+        # individual LockTracker.release() inside the side-effect.
+        live_states = [s for s in states if s != LockState.HARD_RELEASED]
         if not states:
             lock_state = "off"
-        elif LockState.HARD_RELEASED in states:
+        elif not live_states:
+            # All contributing sensors hard-released → engagement dies.
             lock_state = "released"
-        elif LockState.COASTING in states:
+        elif LockState.COASTING in live_states:
             lock_state = "coasting"
-        elif LockState.ACTIVE in states:
+        elif LockState.ACTIVE in live_states:
             lock_state = "active"
         else:
             lock_state = "off"
+        # Side-effect: if exactly ONE sensor went HARD_RELEASED while
+        # the OTHER is still alive, release THAT sensor's tracker so
+        # we stop publishing its (released) bbox, but keep the
+        # engagement alive on the surviving sensor.
+        if (eo_upd is not None
+                and eo_upd.state == LockState.HARD_RELEASED
+                and lock_state != "released"):
+            self._lock_eo.release()
+        if (th_upd is not None
+                and th_upd.state == LockState.HARD_RELEASED
+                and lock_state != "released"):
+            self._lock_thermal.release()
 
         # ── Emit per-transition events for replay-debug. One event
         # per real edge in the state machine, never per-tick.
