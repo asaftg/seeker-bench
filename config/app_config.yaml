@@ -399,26 +399,6 @@ eo:
   hfov_deg: 11.05
   vfov_deg: 9.23
 
-  # Pose-delta re-warp on stale classifier bboxes (T1.5, 2026-05-05).
-  # The async classifier returns bboxes 2-4 frames stale; at the
-  # rig's peak 64 dps slew (recordings/track worse.jsonl) that's
-  # 5-10 deg of misregistration between the bbox pixels and the
-  # publish-time gimbal pose. Re-warps bboxes by (cur_pan -
-  # capture_pan) * px_per_deg before publishing the EOFrame.
-  #
-  # 2026-05-06 DISABLED after `track not good 5620261.jsonl`:
-  # tid=50 lock PSR_eo went 97 → 3.57 → 5.32 → 93 → 37 in 1 s of
-  # tracking. That flapping pattern is consistent with the rewarped
-  # YOLO bbox (used as the lock-seed bbox via per-sensor detection
-  # lookup) landing on a slightly off-target patch when the gimbal
-  # pose lookup vs bbox-publish-time race produces a wrong delta.
-  # The architecturally-correct fix is to address the MOSSE
-  # search-window collapse during slews (predict bbox center via
-  # pose delta IN THE LOCK-MODE TICK before MosseTracker.update),
-  # not to rewarp the YOLO bbox upstream. Re-enable cautiously
-  # only after the lock-mode predictor lands.
-  pose_delta_rewarp: false
-
   # Test mode: when running with a generic webcam in place of the real
   # IMX568 + 35mm lens, we need to tell fusion the *actual* FOV the
   # webcam sees — otherwise cross-sensor angular matching is broken.
@@ -597,19 +577,6 @@ radar:
   # needs ≥2 neighbours to be a core point); frame-to-frame M-of-N
   # confirmation below kills the rare 2-point coincidence false positive.
   cluster_min_samples: 2
-  # T2.10 Range-aware DBSCAN cluster-size clamp (default OFF).
-  # The 1.5*std formulation in clustering.py turns a few-point
-  # cluster's noise into a 30-90 deg angular bbox via the atan2
-  # in fusion. Wave 2 radar measured ang_w max 97 deg.
-  # When enabled, the per-axis half-extent is clamped to
-  # min_size + size_per_meter_m * slant. Default 0 + 0.05 m/m
-  # gives 0.5 m at 10 m slant (3% angular at that range), 1.0 m
-  # at 20 m. NEEDS BENCH VALIDATION: extrinsics drift may
-  # currently masquerade as oversized cluster span; per Wave 3,
-  # extrinsic drift monitoring should land first. Default OFF.
-  range_aware_clamp: false
-  range_aware_min_size_m: 0.25
-  range_aware_size_per_meter_m: 0.05
 
   # Kalman tracker — stabilises bboxes through flicker and brief dropouts.
   # The clusterer runs a 6D constant-velocity Kalman filter per tracklet,
@@ -714,49 +681,7 @@ fusion:
   # range, so they're coarser than EO/thermal pixel-detector boxes.
   # A more permissive IoU gate keeps radar associating with EO/thermal
   # tracks even when its bbox barely brushes the camera box.
-  radar_iou_gate: 0.05          # legacy IoU floor for radar↔(eo|thermal)
-  # T2.8 Radar↔camera matching metric. Pure IoU under-matches when a
-  # small camera bbox sits inside a big radar bbox (1°-in-10° = 0.01
-  # IoU, never passes). Containment = intersection/min(area) returns
-  # 1.0 in that case — tracks the operator's intuition ("the radar
-  # has the same target the camera sees") instead of an arbitrary
-  # union ratio. Wave 2 radar review identified this as the actual
-  # gap in long-range radar↔camera association, not the bbox-size
-  # threshold. Set "iou" to revert to the legacy metric using
-  # radar_iou_gate above.
-  radar_match_metric: containment   # "containment" | "iou"
-  radar_containment_gate: 0.5       # used when radar_match_metric == "containment"
-  # T2.7 Radar Doppler gate at the radar↔camera join. When the radar
-  # candidate's |range_rate_mps| is below this floor, do not let it
-  # absorb a moving EO/thermal target (it likely is static clutter
-  # at that angular bearing). The radar candidate still publishes
-  # standalone as RADAR_TARGET. SIGN CONVENTION IS NOT YET VERIFIED
-  # against approaching/receding ground truth on this rig, so we
-  # only gate on MAGNITUDE here. Default 0 disables the gate;
-  # operator should record an approaching-vehicle clip, verify the
-  # sign of range_rate_mps in fused/tracks, then set to ~0.4 to
-  # match the speed_min_mps clutter floor.
-  radar_doppler_min_mps: 0.0
-  # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
-  # When the EO and thermal frame timestamps disagree by more than
-  # this many milliseconds, fusion DOES NOT pair them on this tick.
-  #
-  # 2026-05-06 disabled (set to 0) after `track not good 5620261.jsonl`:
-  # the audited p95 skew of 48 ms on `lock test test.jsonl` was NOT
-  # representative — operator's bench actually runs EO at 12-19 FPS
-  # and thermal at 10-22 FPS asynchronously, with median EO↔thermal
-  # skew of 84 ms (max 175 ms). At those rates the natural skew is
-  # 50-100 ms even with no upstream pacing problem; gating at 33 ms
-  # blocked 41 of ~45 fusion ticks per second of recording, killing
-  # cross-sensor pairing entirely and producing an explosion of
-  # standalone-radar / standalone-thermal candidates. Track births
-  # in 45 s went 20+, drops 32 — extreme churn.
-  #
-  # The right fix is upstream pacing (Tier 2 #11 + #12) so the
-  # rates match. Until then, leave the gate disabled. To re-enable
-  # cautiously, set to ~120 ms (catches genuine sync outages without
-  # firing on the natural skew).
-  temporal_gate_ms: 0.0
+  radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
 
 gimbal:
   # driver:
@@ -809,24 +734,9 @@ gimbal:
   #   kp_track       0.30 → 0.50  (+67% control gain)
   #   max_step_deg   2.0  → 3.0   (per-tick cap; ST3025 handles 3°/tick)
   # If overshoot shows up, add a small D term (separate commit).
-  #
-  # 2026-05-05 human-tracking softening (recording `trying to lock.jsonl`,
-  # human #11 transit): on small jittery targets (humans @ 5-10 m → 30-
-  # 60 px wide bbox) the V2 0.50/3.0 combo chased bbox jitter at
-  # 13-15 dps actual gimbal velocity, hitting the 18 dps slew cap
-  # within 200 ms and forcing the settled gate to flip 4× in 0.5 s.
-  # Operator: "the gimbal is just too aggresive." Knocked the gain +
-  # per-tick cap back down without going all the way to V1 levels:
-  #   kp_track       0.50 → 0.35  (still +17 % vs V1, less reactive
-  #                                 to bbox jitter)
-  #   max_step_deg   3.0  → 2.0   (per-tick cap; halves peak per-tick
-  #                                 swing while keeping V1 ceiling)
-  # Slew cap also dropped from 18 → 12 in `track_slew_cap_dps` below.
-  # SOFT REVERT: bump these back to 0.50 / 3.0 if humans feel laggy
-  # to re-acquire — they revert byte-equivalent to the V2 baseline.
-  kp_track:    0.35
+  kp_track:    0.50
   deadband_deg: 0.6           # was 2.5  — tighter centering tolerance
-  max_step_deg: 2.0           # was 3.0 — softened for jittery human targets
+  max_step_deg: 3.0           # was 2.0 — V2 servos can handle bigger steps
   # D term on MEASUREMENT (not error). Subtracts kd × encoder velocity
   # (dpose/dt) from the closed-loop proportional output. Brakes when the
   # gimbal is moving fast toward target → smooth deceleration → no
@@ -985,41 +895,11 @@ gimbal:
     psr_lost: 5.0                # MOSSE PSR threshold below which we coast
     lost_frames: 5               # consecutive sub-PSR frames → COASTING
     coast_window_s: 3.0          # max time COASTING before HARD_RELEASED
-    # Seed-pending timeout (s). If the engaged fused-id never appears
-    # in BUS.get_latest(Topic.FUSED) within this window (operator
-    # engaged on a track that died between engage and the next fusion
-    # tick), abort seed_pending instead of leaving it set forever.
-    # Recordings/track worse.jsonl had 4/7 engagements with
-    # lock_state="active" published but zero lock_seeded events — the
-    # silent-miss path. Set 0 to disable timeout.
-    seed_pending_timeout_s: 2.0
     # v2 dropped reseed_iou_min — auto-reseed gates on ID equality
     # only, no IoU search. Kept here for backward-compat readers
     # but unused.
     reseed_iou_min: 0.20
     reseed_min_period_s: 0.30    # don't reseed faster than this even if obs allow
-    # PSR safety margin for auto-reseed. Auto-reseed only fires when
-    # state == ACTIVE (not COASTING) AND last_psr >= psr_lost*margin.
-    # Without this, recordings/lock test test.jsonl showed reseeds
-    # firing during low-PSR coast-recovery (PSR ~5.9, 6.4) which
-    # imprints a partially-occluded patch as the new template, then
-    # the next slew loses the lock immediately. 1.5 collapses ~95%
-    # of low-quality reseeds without weakening the legitimate path
-    # (stable tracks PSR routinely 30-60). Set 0 to disable the gate.
-    reseed_psr_margin: 1.5
-    # Pose-shift cached LockUpdate during MOSSE dedupe (T1.2).
-    # Between true EO/thermal frames the gimbal pose advances; this
-    # shifts the cached bbox by (cur_pose - cached_frame.gimbal_*_at_
-    # capture) * px_per_deg so the bracket follows the gimbal.
-    # 2026-05-06 DEFAULT FALSE after `track not good 5620261.jsonl`
-    # showed PSR flapping consistent with bbox landing off-target
-    # during slews. The pose-shift is in image coords; the cached
-    # frame is also in image coords; mixing them races the GUI's
-    # next render against the current pose. The right fix is in the
-    # MOSSE update path (predict bbox center via pose delta before
-    # MosseTracker.update) — not at the dedupe layer. Re-enable
-    # cautiously after that lands.
-    pose_shift_dedupe: false
     learning_rate: 0.125         # MOSSE online filter blending
     sigma: 2.0                   # MOSSE Gaussian peak width
     max_patch_dim: 96            # MOSSE FFT working size cap
@@ -1055,16 +935,7 @@ gimbal:
   # "lock dies during slew" rather than "acquisition feels slow."
   # Set 0 to disable the cap entirely (legacy behaviour); raise
   # toward 30 if mid-slew lock loss stops happening on your scenes.
-  #
-  # 2026-05-05: dropped 18 → 12 after `trying to lock.jsonl` showed
-  # the engaged-track chase saturating at 13-15 dps while pursuing a
-  # walking human; combined with bbox jitter, the chase oscillated
-  # the settled gate 4× in 0.5 s. 12 dps still tracks a 5 m walking
-  # human (~2 m/s × 0.2 rad/m ≈ 0.4 rad/s ≈ 23 dps tangentially —
-  # the rate ONLY matters for the chase-back-to-center after the
-  # operator lets the bbox drift to the edge of frame, not for
-  # holding a centered target where err < 1° → step ≪ 12 dps).
-  track_slew_cap_dps: 12.0
+  track_slew_cap_dps: 18.0
 
   # ── Optical residual correction (Stage A diagnostic + Stage B closed-loop)
   #

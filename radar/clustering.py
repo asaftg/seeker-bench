@@ -85,24 +85,6 @@ class ClusterParams:
     min_samples: int = 2
     min_size_m: float = 0.25
     max_size_m: float = 3.0
-    # T2.10 Range-aware cluster-size clamp (default OFF).
-    # The 1.5×std×atan2(size_m, slant) formulation in fusion turns
-    # a few-point cluster's high std into a 30-90deg angular bbox at
-    # close range. Wave 2 radar review showed mean ang_w 3-10 deg,
-    # max 97 deg across recordings — way bigger than the visible
-    # target. The clamp here scales max_size_m linearly with slant:
-    # max_at_range = min_size_m + size_per_meter_m * slant. At
-    # slant=4m and size_per_meter_m=0.05, max_size = 0.25 + 0.20
-    # = 0.45m (instead of 3.0m). At slant=200m, max_size = 0.25 +
-    # 10.05 = 10.3m (clamped further by max_size_m=3.0).
-    # Set range_aware_clamp=False to revert to the legacy fixed
-    # max_size_m clamp. NEEDS BENCH VALIDATION before turning on
-    # because radar↔camera extrinsics drift may currently masquerade
-    # as oversized cluster span; per Wave 3 reliability synthesis,
-    # extrinsics drift monitoring should land first. Default OFF.
-    range_aware_clamp: bool = False
-    range_aware_min_size_m: float = 0.25
-    range_aware_size_per_meter_m: float = 0.05
     # Tracker association
     assoc_gate_m: float = 5.0
     gate_growth_m_per_s: float = 2.0
@@ -114,15 +96,8 @@ class ClusterParams:
     # first cluster claims the real track, the orphan is its split
     # sibling, not a separate object.
     merge_overlap_m: float = 5.0
-    # Tracker persistence — TWO independent budgets, ANY can drop a track:
-    #   coast_max_frames is a frame-count safety net (default 30 frames).
-    #   coast_seconds is the wall-clock budget (default 2.5 s).
-    # Either alone misbehaves under variable Hz: at 7 Hz a 30-frame budget
-    # is 4.3 s (tracks linger after target really left); at 20 Hz it is
-    # only 1.5 s (a real recovery longer than 1.5 s drops the track).
-    # Wall-clock + frame-count together cap at the shorter of the two.
-    coast_max_frames: int = 30
-    coast_seconds: float = 2.5
+    # Tracker persistence
+    coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
     confirm_min_hits: int = 2
     confirm_window: int = 3
     # Velocity half-life during coast (seconds). The Kalman's velocity
@@ -345,25 +320,7 @@ class RadarClusterer:
                 1.5 * float(ys.std() if len(ys) > 1 else self.params.min_size_m),
                 1.5 * float(zs.std() if len(zs) > 1 else self.params.min_size_m),
             ], dtype=np.float64)
-            # T2.10 Range-aware clamp: when enabled, lower the upper
-            # bound of the cluster half-extent based on slant range.
-            # A 2-point cluster at 4m slant routinely has 1.5*std up
-            # to 2-3m — which projects to a >40deg angular bbox via
-            # the atan2 in fusion. With the clamp, max_at_slant is
-            # ~0.5m at close range, scaling up linearly to the
-            # configured max_size_m at far range.
-            if self.params.range_aware_clamp:
-                centroid_for_slant = np.array(
-                    [xs.mean(), ys.mean(), zs.mean()], dtype=np.float64)
-                slant = max(float(np.linalg.norm(centroid_for_slant)), 1e-3)
-                max_at_slant = (
-                    self.params.range_aware_min_size_m
-                    + self.params.range_aware_size_per_meter_m * slant
-                )
-                upper = min(float(self.params.max_size_m), max_at_slant)
-            else:
-                upper = self.params.max_size_m
-            np.clip(half, self.params.min_size_m, upper, out=half)
+            np.clip(half, self.params.min_size_m, self.params.max_size_m, out=half)
 
             # Radial-doppler → 3D velocity hint along the sensor ray.
             r = max(float(np.linalg.norm(centroid)), 1e-3)
@@ -506,11 +463,8 @@ class RadarClusterer:
 
     def _reap(self) -> None:
         now_t = self._last_step_t or time.time()
-        # Drop on whichever fires first: frame-count safety net OR
-        # wall-clock budget. See ClusterParams docstring.
         dead = [tid for tid, trk in self._tracks.items()
-                if (trk.misses > self.params.coast_max_frames)
-                or ((now_t - trk.last_hit_t) > self.params.coast_seconds)]
+                if trk.misses > self.params.coast_max_frames]
         for tid in dead:
             trk = self._tracks[tid]
             # Only confirmed tracks deserve resurrection — unconfirmed

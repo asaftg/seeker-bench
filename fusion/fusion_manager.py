@@ -96,50 +96,6 @@ class FusionManager:
         # the same target. Tunable via YAML; promote to DEV-tab slider
         # once we know the right operating range.
         self.radar_iou_gate = float(fcfg.get("radar_iou_gate", 0.05))
-        # T2.8 Containment metric for radar↔camera matching.
-        # Pure IoU under-matches when a small camera bbox sits inside
-        # a big radar bbox (1deg-in-10deg = 0.01 IoU, never passes
-        # any reasonable gate). Containment = intersection/min(area)
-        # returns 1.0 in that case. Wave 2 radar review found this
-        # is the actual cause of poor radar↔camera association at
-        # long range, not the bbox-size threshold.
-        # Mode: "iou" (legacy) or "containment" (new default).
-        self.radar_match_metric = str(
-            fcfg.get("radar_match_metric", "containment")).lower()
-        # Containment gate — much higher than IoU because the metric
-        # is strictly larger. 0.5 = "small bbox is at least half
-        # inside the big one." Tune up for stricter assoc, down to
-        # ~0.3 if radar bboxes routinely barely overlap.
-        self.radar_containment_gate = float(
-            fcfg.get("radar_containment_gate", 0.5))
-        # T2.7 Radar Doppler gate at the radar↔camera join.
-        # Wave 2 fusion review: an IoU-only join lets a stationary
-        # clutter return (|doppler|~0) absorb a moving EO/thermal
-        # target at the same angular bearing. Require |range_rate|
-        # >= radar_doppler_min_mps before a radar candidate can join
-        # a camera candidate. Standalone radar candidates (no camera
-        # match) are unaffected. Sign convention IS NOT verified
-        # against approaching/receding ground truth on this rig yet
-        # (per the no-guessing rule), so the magnitude gate is the
-        # only safe knob — it's symmetric on sign. Default 0 disables
-        # the gate; once verified, raise to 0.4 (matches the
-        # speed_min_mps clutter floor in radar/clustering.py).
-        self.radar_doppler_min_mps = float(
-            fcfg.get("radar_doppler_min_mps", 0.0))
-        # Cross-sensor temporal-alignment gate (T1.6, 2026-05-05).
-        # When EO and thermal frame timestamps disagree by more than
-        # this, skip the cross-sensor pairing for the current tick:
-        # treat each sensor's obs as standalone instead of pairing
-        # them. Without this, fusion silently joins a stale EO bbox
-        # to a fresh thermal bbox during slews — Wave 2 thermal
-        # finding showed p95 thermal-vs-EO timestamp skew of 48 ms
-        # on `lock test test.jsonl`, fusing across stale frames.
-        # 33 ms ~= 1 frame at 30 Hz EO. Set 0 to disable the gate
-        # (legacy behavior).
-        self.temporal_gate_ms = float(
-            fcfg.get("temporal_gate_ms", 33.0))
-        # Diagnostics counter — exposed via instrumentation later.
-        self._temporal_rejects = 0
         # Per-sensor grace window: how many fusion ticks a sensor can
         # miss a track before it's removed from the published `sensors`
         # list. Larger = more "sticky" (fewer green→red flickers from
@@ -324,43 +280,6 @@ class FusionManager:
         # a set of contributing sensors. These then match into the
         # persistent tracker.
         candidates: list[dict] = []
-        # Temporal gate: if EO and thermal frames are too far apart in
-        # wallclock, do not cross-pair this tick. Pose changes between
-        # the two captures could put the same target at different
-        # angular positions, and pairing them across that gap
-        # silently fattens fused angular extent. Skip pairing instead
-        # — both observations still become standalone candidates and
-        # the persistence tracker will associate them across ticks
-        # if they really are the same target.
-        cross_pair_enabled = True
-        if self.temporal_gate_ms > 0:
-            tf_ts = (float(getattr(tf, "timestamp", 0.0))
-                      if tf is not None else None)
-            ef_ts = (float(getattr(ef, "timestamp", 0.0))
-                      if ef is not None else None)
-            if tf_ts is not None and ef_ts is not None:
-                dt_ms = abs(tf_ts - ef_ts) * 1000.0
-                if dt_ms > self.temporal_gate_ms:
-                    cross_pair_enabled = False
-                    self._temporal_rejects += 1
-                    # Observability: emit one event per skipped pair,
-                    # rate-limited to once per second so a long sync
-                    # outage doesn't flood the recorder. The counter
-                    # in self._temporal_rejects is the cumulative
-                    # tally for batch summaries.
-                    _now = time.time()
-                    _last = getattr(self, "_temporal_evt_last_t", 0.0)
-                    if _now - _last >= 1.0:
-                        self._temporal_evt_last_t = _now
-                        try:
-                            from common.events import emit as _emit
-                            _emit("fusion_temporal_gate_reject", {
-                                "dt_ms": round(dt_ms, 1),
-                                "gate_ms": self.temporal_gate_ms,
-                                "cumulative_rejects": self._temporal_rejects,
-                            })
-                        except Exception:
-                            pass
         used_t = [False] * len(thermal_obs)
         # Cross-sensor association now uses angular IoU: two observations
         # of the same class with bbox overlap >= XSENSOR_IOU are the same
@@ -369,21 +288,6 @@ class FusionManager:
         # gates, because a small bbox inside a big bbox has IoU ≈ 0.
         XSENSOR_IOU = 0.15  # loose — FOV estimates & parallax can shift centers
         for e in eo_obs:
-            if not cross_pair_enabled:
-                # Skip the IoU-pair step; emit EO standalone. Thermal
-                # standalone fallback below handles thermal_obs.
-                candidates.append({
-                    "sensors": ["eo"],
-                    "primary": "eo",
-                    "class":   e["class"],
-                    "az":      e["az"],   "el":    e["el"],
-                    "ang_w":   e["ang_w"],"ang_h": e["ang_h"],
-                    "conf":    e["conf"],
-                    "eo_track_id": e.get("eo_track_id"),
-                    "_pose_pan":  e.get("_pose_pan"),
-                    "_pose_tilt": e.get("_pose_tilt"),
-                })
-                continue
             best_i, best_iou = -1, 0.0
             for i, t in enumerate(thermal_obs):
                 if used_t[i] or t["class"] != e["class"]:
@@ -453,39 +357,19 @@ class FusionManager:
         # are association targets here.
         n_cam_cands = len(candidates)
         used_c = [False] * n_cam_cands
-        # T2.8: pick metric + gate based on YAML. Default = containment
-        # (handles small-camera-in-big-radar correctly); legacy = iou.
-        if self.radar_match_metric == "containment":
-            from fusion.angular import angular_containment
-            radar_metric_fn = angular_containment
-            radar_metric_gate = self.radar_containment_gate
-        else:
-            radar_metric_fn = angular_iou
-            radar_metric_gate = self.radar_iou_gate
         for r in radar_obs:
-            best_i, best_score = -1, 0.0
-            # T2.7 doppler gate: skip the camera-join attempt entirely
-            # if this radar return looks static (|range_rate| < min).
-            # The radar candidate still falls through to the standalone
-            # branch below (RADAR_TARGET sentinel); we just don't let
-            # it absorb a moving EO/thermal target here.
-            r_rate = abs(float(r.get("range_rate_mps", 0.0)))
-            if (self.radar_doppler_min_mps > 0
-                    and r_rate < self.radar_doppler_min_mps):
-                # Skip cam-join. Will append as standalone radar below.
-                pass
-            else:
-                for i in range(n_cam_cands):
-                    if used_c[i]:
-                        continue
-                    c = candidates[i]
-                    score = radar_metric_fn(
-                        r["az"], r["el"], r["ang_w"], r["ang_h"],
-                        c["az"], c["el"], c["ang_w"], c["ang_h"],
-                    )
-                    if score > best_score:
-                        best_score, best_i = score, i
-            if best_i >= 0 and best_score >= radar_metric_gate:
+            best_i, best_iou = -1, 0.0
+            for i in range(n_cam_cands):
+                if used_c[i]:
+                    continue
+                c = candidates[i]
+                iou = angular_iou(
+                    r["az"], r["el"], r["ang_w"], r["ang_h"],
+                    c["az"], c["el"], c["ang_w"], c["ang_h"],
+                )
+                if iou > best_iou:
+                    best_iou, best_i = iou, i
+            if best_i >= 0 and best_iou >= self.radar_iou_gate:
                 c = candidates[best_i]
                 used_c[best_i] = True
                 if "radar" not in c["sensors"]:
@@ -729,18 +613,6 @@ class FusionManager:
             # Floor at 0.4° so a tiny cluster still gates against EO/thermal.
             ang_w = max(0.4, math.degrees(2.0 * math.atan2(t.size_x_m, slant)))
             ang_h = max(0.4, math.degrees(2.0 * math.atan2(t.size_z_m, slant)))
-            # Radial velocity (range-rate). Sign: positive = approaching
-            # the sensor (target's velocity vector projected onto the
-            # inverse-radial direction). RadarDetection.doppler_mps is
-            # signed by AWR firmware convention; here we recompute from
-            # the Kalman vel state to capture the cluster-tracker's
-            # smoothed estimate. T2.7 uses |range_rate| as a static-
-            # clutter gate at the radar↔camera join.
-            range_rate_mps = -(
-                (t.vel_x_mps * t.pos_x_m
-                 + t.vel_y_mps * t.pos_y_m
-                 + t.vel_z_mps * t.pos_z_m) / max(slant, 1e-6)
-            )
             out.append({
                 "az": az, "el": el, "ang_w": ang_w, "ang_h": ang_h,
                 "class": TargetClass.RADAR_TARGET.value,
@@ -748,7 +620,6 @@ class FusionManager:
                 # Radar Kalman tracker id from RadarClusterer — Phase
                 # B2 link, mirror of eo_track_id and thermal_heat_id.
                 "radar_tid": int(t.tid),
-                "range_rate_mps": float(range_rate_mps),
                 "_pose_pan": pose_pan,
                 "_pose_tilt": pose_tilt,
             })
@@ -820,23 +691,9 @@ class FusionManager:
         # vehicle-scene replay test, not just a YOLO-id-swap one.
         for c in candidates:
             best_i, best_iou = -1, 0.0
-            c_is_radar = (c["class"] == rt)
             for i in range(n_existing):
                 trk = self._tracks[i]
                 if matched[i] or not self._class_compatible(trk["class"], c["class"]):
-                    continue
-                # T2.9 (Wave 2 fusion review): when ONE side is the
-                # RADAR_TARGET sentinel and the other side is a real
-                # class, only match if the real-class track is
-                # currently ACTIVE (misses==0). Without this, a fresh
-                # radar return can revive a coasted real-class track
-                # whose physical target is gone — rebirthing the
-                # wrong identity at the radar's angular position.
-                # Guards the 75-83% short-life dropped-track tail seen
-                # in lock test test.jsonl / track worse.jsonl.
-                trk_is_radar = (trk["class"] == rt)
-                if (c_is_radar != trk_is_radar
-                        and int(trk.get("misses", 0)) > 0):
                     continue
                 iou = angular_iou(
                     c["az"], c["el"], c["ang_w"], c["ang_h"],

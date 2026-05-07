@@ -218,51 +218,11 @@ class HumanVehicleClassifier:
         """
         if self._model is None or image is None or image.size == 0:
             return []
-        # Resolve project-local bytetrack.yaml as an ABSOLUTE path so
-        # ultralytics doesn't silently fall back to its package
-        # default (new_track_thresh=0.25 → 3-4x ID churn at our
-        # YOLO conf gate). The file is committed at config/bytetrack
-        # .yaml; if missing we use the ultralytics default and log a
-        # warning rather than crashing.
-        if not hasattr(self, "_bytetrack_yaml_path"):
-            from pathlib import Path
-            import hashlib
-            project_yaml = (Path(__file__).resolve().parent.parent
-                              / "config" / "bytetrack.yaml")
-            if project_yaml.is_file():
-                self._bytetrack_yaml_path = str(project_yaml)
-                log.info("HV ByteTrack using project-local config: %s",
-                         self._bytetrack_yaml_path)
-                _src = "project_local"
-            else:
-                self._bytetrack_yaml_path = "bytetrack.yaml"
-                log.warning("HV ByteTrack project-local yaml not found "
-                            "at %s — falling back to ultralytics default",
-                            project_yaml)
-                _src = "ultralytics_default"
-            # Observability: emit one event per session so the
-            # resolved bytetrack.yaml is auditable from any recording.
-            # Includes a sha256 of the file content (when readable) so
-            # mid-session edits are visible too.
-            try:
-                if project_yaml.is_file():
-                    _sha = hashlib.sha256(
-                        project_yaml.read_bytes()).hexdigest()[:12]
-                else:
-                    _sha = None
-                from common.events import emit as _emit
-                _emit("bytetrack_yaml_resolved", {
-                    "source": _src,
-                    "path": self._bytetrack_yaml_path,
-                    "sha256_short": _sha,
-                })
-            except Exception:
-                pass
         try:
             results = self._model.track(
                 image,
                 persist=True,                  # keep tracker state across calls
-                tracker=self._bytetrack_yaml_path,
+                tracker="bytetrack.yaml",      # shipped by ultralytics
                 conf=self.conf_threshold,
                 imgsz=self.imgsz,
                 verbose=False,

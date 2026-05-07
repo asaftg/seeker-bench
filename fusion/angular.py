@@ -132,43 +132,6 @@ def angular_iou(
     return inter / union if union > 0 else 0.0
 
 
-def angular_containment(
-    az_a: float, el_a: float, w_a: float, h_a: float,
-    az_b: float, el_b: float, w_b: float, h_b: float,
-) -> float:
-    """Containment ratio = intersection / min(area_a, area_b).
-
-    Use this instead of IoU when the two bboxes are expected to differ
-    substantially in scale — typically radar (coarse cluster span ~3 deg)
-    vs camera (per-pixel YOLO bbox ~0.5 deg). With pure IoU, a small
-    camera bbox sitting fully INSIDE a big radar bbox returns
-    intersection/union ~= small/big ~= 0.01, even though the small bbox
-    is ENTIRELY contained — it should match. Containment returns 1.0
-    in that case (intersection = small_area = min). Range [0, 1].
-    """
-    ax1 = az_a - w_a / 2.0
-    ax2 = az_a + w_a / 2.0
-    ay1 = el_a - h_a / 2.0
-    ay2 = el_a + h_a / 2.0
-    bx1 = az_b - w_b / 2.0
-    bx2 = az_b + w_b / 2.0
-    by1 = el_b - h_b / 2.0
-    by2 = el_b + h_b / 2.0
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    area_a = max(0.0, w_a) * max(0.0, h_a)
-    area_b = max(0.0, w_b) * max(0.0, h_b)
-    smaller = min(area_a, area_b)
-    return inter / smaller if smaller > 0 else 0.0
-
-
 def angular_bbox_visible(
     az_deg: float, el_deg: float,
     ang_w_deg: float, ang_h_deg: float,

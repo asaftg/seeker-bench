@@ -120,18 +120,6 @@ class LockTracker:
         COASTING). False when OFF or HARD_RELEASED."""
         return self._state in (LockState.ACTIVE, LockState.COASTING)
 
-    @property
-    def last_psr(self) -> float:
-        """Last MOSSE peak-to-sidelobe ratio. 0 before first update."""
-        return float(self._last_psr)
-
-    @property
-    def psr_lost(self) -> float:
-        """Configured PSR threshold below which the tracker considers
-        the lock lost (transitions to COASTING after lost_frames
-        consecutive sub-threshold updates)."""
-        return float(self._cfg.psr_lost)
-
     def seed(self, frame: np.ndarray,
              bbox_xywh: Tuple[int, int, int, int],
              *, now: Optional[float] = None) -> bool:

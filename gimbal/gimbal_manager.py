@@ -864,58 +864,11 @@ class GimbalManager:
         self._lock_seed_pending: bool = False
         self._lock_reseed_min_period_s: float = float(
             lm_cfg.get("reseed_min_period_s", 0.30))
-        # PSR margin for auto-reseed gate. Reseed only when state is
-        # ACTIVE and last_psr >= psr_lost * margin. Default 1.5;
-        # set 0 to disable (legacy behavior — reseed any time
-        # is_active includes COASTING). See Wave 2 lock review.
-        self._lock_reseed_psr_margin: float = float(
-            lm_cfg.get("reseed_psr_margin", 1.5))
-        # Pose-shift cached LockUpdate during MOSSE dedupe (T1.2).
-        # Between true frames, the gimbal pose advances; the cached
-        # bbox is shifted by px-per-deg * pose-delta so the bracket
-        # follows the gimbal between EO frames at 17 FPS. 2026-05-06
-        # default DISABLED after `track not good 5620261.jsonl`
-        # showed PSR flapping consistent with bbox landing off-target
-        # during slews; the architecturally-correct fix is in the
-        # MOSSE search-window predictor (pending). Set true to
-        # re-enable cautiously.
-        self._lock_pose_shift_dedupe: bool = bool(
-            lm_cfg.get("pose_shift_dedupe", False))
         # State-transition tracker for the JSONL recorder. We emit
         # one event per real transition (not per tick) so a future
         # replay can reconstruct the lock-state machine from the
         # event stream alone.
         self._lock_last_state_str: str = "off"
-        # Seed-pending timeout. Without this, if the engaged fused-id
-        # never appears in BUS.get_latest(Topic.FUSED) (engaged
-        # against a track that died between engage and the next
-        # fusion tick), seed_pending stays True forever and the
-        # lock state machine never advances. Recordings showed 4/7
-        # engagements with `lock_state="active"` published but zero
-        # `lock_seeded` events (track worse.jsonl) — the seed-pending
-        # path was the silent miss. We tag the wallclock when
-        # seed_pending was armed; if 2 s pass without a successful
-        # seed, abort and reset the state-machine string so the next
-        # engagement emits a clean transition.
-        self._lock_seed_pending_t0: Optional[float] = None
-        self._lock_seed_pending_timeout_s: float = float(
-            lm_cfg.get("seed_pending_timeout_s", 2.0))
-        # Frame-id dedupe: skip MOSSE update() when the BUS-cached
-        # frame is the same one we just processed. Gimbal tick runs
-        # at ~35-60 Hz; EO at 17-25 Hz, thermal at 20-60 Hz. Without
-        # dedupe, MOSSE re-runs on identical data 1-3 times per real
-        # frame, burning CPU on no-op work — visible in
-        # `recordings/lock test test.jsonl` as 15 FPS EO under load.
-        # Dedupe also keeps the published lock_bbox_* coordinates
-        # from "twitching" between identical-frame re-runs (the FFT
-        # peak can land 1 px apart on identical input due to
-        # learning-rate updates, which the operator sees as jitter).
-        self._lock_last_eo_fid: Optional[int] = None
-        self._lock_last_th_fid: Optional[int] = None
-        # Cached last-update so we publish a stable bbox between
-        # frames without re-running MOSSE.
-        self._lock_last_eo_upd = None
-        self._lock_last_th_upd = None
 
         # Manual setpoint (mutated by GUI dpad / WASD CLI)
         self._manual_pan  = home_pan
@@ -1107,17 +1060,6 @@ class GimbalManager:
                     self._lock_target_id = new_id
                     self._lock_target_class = None  # filled when seeding
                     self._lock_seed_pending = True
-                    self._lock_seed_pending_t0 = time.time()
-                    # Reset state-transition tracker + dedupe cache
-                    # so the new engagement emits a clean `lock_seeded`
-                    # event and runs a fresh MOSSE update on its first
-                    # frame (mirrors the release-path reset in _tick's
-                    # else branch).
-                    self._lock_last_state_str = "off"
-                    self._lock_last_eo_fid = None
-                    self._lock_last_th_fid = None
-                    self._lock_last_eo_upd = None
-                    self._lock_last_th_upd = None
             self._tracked_id = new_id
             # Fused lock takes priority over any heat lock.
             self._tracked_heat_id = None
@@ -1934,49 +1876,12 @@ class GimbalManager:
             # Lock mode: operator dropped the lock OR grace expired.
             # Release the per-sensor lock trackers so the GUI stops
             # rendering the lock bbox.
-            #
-            # Race-fix 2026-05-05: re-acquire self._lock and re-check
-            # that no engagement happened between this tick's
-            # snapshot and now. Without this, the WS handler thread
-            # could call set_track_target(N) (which atomically arms
-            # _lock_target_id=N + _lock_seed_pending=True under the
-            # same lock) AFTER the tick took the snapshot — and this
-            # else branch would wipe the just-armed seed, so the
-            # next _lock_mode_tick saw _lock_target_id=None and
-            # quietly emitted `lock_state_change tracked_id=null
-            # active→off` instead of `lock_seeded`. Visible in
-            # `recordings/lock test test.jsonl`: 7 track_engaged
-            # events, only 1 lock_seeded — 6 of 7 engagements lost
-            # to this race.
             if self._lock_mode_enabled:
-                with self._lock:
-                    still_clear = (self._tracked_id is None)
-                if still_clear:
-                    self._lock_eo.release()
-                    self._lock_thermal.release()
-                    self._lock_target_id = None
-                    self._lock_target_class = None
-                    self._lock_seed_pending = False
-                    self._lock_seed_pending_t0 = None
-                    # Reset the state-transition tracker so the NEXT
-                    # engagement emits a clean `lock_seeded` event when
-                    # off → active. Without this, the tracker keeps the
-                    # stale "active" / "coasting" string from the prior
-                    # engagement (because _lock_mode_tick early-returns
-                    # on tracked_id=None and never updates it). The
-                    # next engagement's off → active transition would
-                    # then read as active → active and emit nothing —
-                    # the silent miss seen in `track worse.jsonl`
-                    # (4 engagements, 0 lock_seeded events).
-                    self._lock_last_state_str = "off"
-                    # Also drop the dedupe-cache fids/upds so the
-                    # next engagement always runs a fresh MOSSE update
-                    # on its first frame, even if frame_id happens to
-                    # equal the last value seen pre-release.
-                    self._lock_last_eo_fid = None
-                    self._lock_last_th_fid = None
-                    self._lock_last_eo_upd = None
-                    self._lock_last_th_upd = None
+                self._lock_eo.release()
+                self._lock_thermal.release()
+                self._lock_target_id = None
+                self._lock_target_class = None
+                self._lock_seed_pending = False
             # Not tracking — flush cached setpoints so next engage
             # starts fresh against whatever the new target's error is.
             self._last_track_ts = None
@@ -2171,30 +2076,6 @@ class GimbalManager:
         # ── Seed-pending: latch the engagement bbox from the fused
         # track on the first tick after operator engagement.
         if self._lock_seed_pending:
-            # Timeout: if seed_pending has been armed for too long
-            # without a successful seed (engaged track never appeared
-            # in fused, or per-sensor seed bbox kept failing
-            # validation), give up. Without this, _lock_last_state_str
-            # stays at "off" forever AFTER it transitions to "active"
-            # via the state-machine block below — but more importantly,
-            # the publish layer reports lock_state="off" forever and
-            # the operator sees no feedback.
-            if (self._lock_seed_pending_t0 is not None
-                    and (now - self._lock_seed_pending_t0)
-                        >= self._lock_seed_pending_timeout_s):
-                try:
-                    emit_event("lock_seed_timeout", {
-                        "tracked_id": self._lock_target_id,
-                        "elapsed_s": round(
-                            now - self._lock_seed_pending_t0, 3),
-                    })
-                except Exception:
-                    pass
-                self._lock_seed_pending = False
-                self._lock_seed_pending_t0 = None
-                # Reset state-string so next engagement re-emits the
-                # off→active transition cleanly.
-                self._lock_last_state_str = "off"
             fused = BUS.get_latest(Topic.FUSED) or []
             target = next((t for t in fused
                             if getattr(t, "id", None) == self._lock_target_id),
@@ -2206,125 +2087,28 @@ class GimbalManager:
             else:
                 self._lock_target_class = getattr(
                     getattr(target, "target_class", None), "value", None)
-                # Seed bbox source priority:
-                #   1. The per-sensor detection that contributed to this
-                #      fused track (EOFrame.detections matching
-                #      target.eo_track_id; ThermalFrame.detections
-                #      matching target.thermal_heat_id). This is the
-                #      RAW classifier/heat-detector bbox tightly fit to
-                #      the visible target — what MOSSE wants.
-                #   2. Fall back to the angular reprojection
-                #      (_fused_to_eo_bbox) only when the sensor didn't
-                #      contribute (radar-only track) or the detection
-                #      lookup fails.
-                # Recording `track worse.jsonl` showed seeded bboxes
-                # 240×156 (target #3) and 190×420 (target #15) — way
-                # bigger than the visible humans because the fused
-                # angular extent (ang_w_deg/ang_h_deg) gets contaminated
-                # by radar's coarse cluster bbox. MOSSE seeded on a
-                # 3-4x oversized patch then "tracks" the union of
-                # target + background, jumping wildly.
+                # Compute per-sensor bboxes from the fused track's
+                # world angles + each frame's pose-at-capture, same
+                # as gui.sensor_bridge.fused_to_wire does.
                 seeded_any = False
-                eo_src = "skip"
-                th_src = "skip"
                 if ef_ok:
-                    bbox_eo_det = self._eo_detection_bbox(target, ef)
-                    if bbox_eo_det is not None:
-                        bbox_eo = bbox_eo_det
-                        eo_src = "eo_track_id"
-                    else:
-                        bbox_eo = self._fused_to_eo_bbox(target, ef)
-                        eo_src = "fused_angular" if bbox_eo else "no_bbox"
+                    bbox_eo = self._fused_to_eo_bbox(target, ef)
                     if bbox_eo is not None:
                         if self._lock_eo.seed(ef.bgr, bbox_eo, now=now):
                             seeded_any = True
                 if tf_ok:
-                    bbox_th_det = self._thermal_detection_bbox(target, tf)
-                    if bbox_th_det is not None:
-                        bbox_th = bbox_th_det
-                        th_src = "thermal_heat_id"
-                    else:
-                        bbox_th = self._fused_to_thermal_bbox(target, tf)
-                        th_src = "fused_angular" if bbox_th else "no_bbox"
+                    bbox_th = self._fused_to_thermal_bbox(target, tf)
                     if bbox_th is not None:
                         if self._lock_thermal.seed(tf.agc8, bbox_th, now=now):
                             seeded_any = True
                 if seeded_any:
                     self._lock_seed_pending = False
-                    self._lock_seed_pending_t0 = None
-                    # Observability: record which seed-source path was
-                    # taken per sensor (eo_track_id / thermal_heat_id =
-                    # tight per-sensor classifier bbox, the fix from
-                    # commit 5670246; fused_angular = legacy projection
-                    # via FusedTrack.ang_w/h, which can be oversized
-                    # when radar contributes). Lets a future audit tell
-                    # whether the silent oversize-bbox bug regressed.
-                    try:
-                        emit_event("lock_seed_source", {
-                            "tracked_id": self._lock_target_id,
-                            "eo_source": eo_src,
-                            "thermal_source": th_src,
-                        })
-                    except Exception:
-                        pass
 
         # ── Per-frame lock updates.
-        # Dedupe by frame_id: only run MOSSE when the BUS-cached
-        # frame is actually new. Re-running on the same frame burns
-        # CPU and produces noise (FFT peak landing 1 px apart on
-        # identical input, plus the online learning-rate retraining
-        # the filter on the same patch).
-        #
-        # When dedupe hits, we publish a POSE-SHIFTED version of the
-        # cached LockUpdate's bbox: the gimbal tick runs at 35-60 Hz
-        # while EO publishes at 17-25 Hz, so several gimbal ticks
-        # land on the same EO frame. Without the pose shift, the
-        # operator sees the lock bbox "freeze" at the cached frame's
-        # image-pixel coords during a slew (the camera has panned
-        # since the cached frame was captured, so the same image-px
-        # bbox would land off-target in the LATEST frame the GUI
-        # is about to render). The shift = (cur_pan - pan_at_cached_
-        # frame_capture) × pixels-per-degree gives an honest
-        # interpolation between real MOSSE updates. Wave 2 review of
-        # this morning's frame-id dedupe (commit 5670246) flagged
-        # the freeze as the "sluggish lock bbox" symptom.
-        cur_pan_now = float(getattr(self, "_last_measured_pan", 0.0)
-                              or self._controller.current[0])
-        cur_tilt_now = float(getattr(self, "_last_measured_tilt", 0.0)
-                              or self._controller.current[1])
-        if ef_ok and self._lock_eo.is_active:
-            ef_fid = getattr(ef, "frame_id", None)
-            if ef_fid is not None and ef_fid == self._lock_last_eo_fid:
-                if self._lock_pose_shift_dedupe:
-                    eo_upd = self._pose_shift_lock_update(
-                        self._lock_last_eo_upd, ef,
-                        cur_pan_now, cur_tilt_now)
-                else:
-                    eo_upd = self._lock_last_eo_upd
-            else:
-                eo_upd = self._lock_eo.update(ef.bgr, now=now)
-                self._lock_last_eo_fid = ef_fid
-                self._lock_last_eo_upd = eo_upd
-        else:
-            eo_upd = None
-            self._lock_last_eo_upd = None
-
-        if tf_ok and self._lock_thermal.is_active:
-            tf_fid = getattr(tf, "frame_id", None)
-            if tf_fid is not None and tf_fid == self._lock_last_th_fid:
-                if self._lock_pose_shift_dedupe:
-                    th_upd = self._pose_shift_lock_update(
-                        self._lock_last_th_upd, tf,
-                        cur_pan_now, cur_tilt_now)
-                else:
-                    th_upd = self._lock_last_th_upd
-            else:
-                th_upd = self._lock_thermal.update(tf.agc8, now=now)
-                self._lock_last_th_fid = tf_fid
-                self._lock_last_th_upd = th_upd
-        else:
-            th_upd = None
-            self._lock_last_th_upd = None
+        eo_upd = (self._lock_eo.update(ef.bgr, now=now)
+                   if (ef_ok and self._lock_eo.is_active) else None)
+        th_upd = (self._lock_thermal.update(tf.agc8, now=now)
+                   if (tf_ok and self._lock_thermal.is_active) else None)
 
         # ── Auto-reseed (v2): STRICT ID-MATCH ONLY.
         #
@@ -2354,36 +2138,16 @@ class GimbalManager:
                 target = trk
                 break
         if target is not None:
-            # PSR + ACTIVE gate: require state == ACTIVE (not COASTING)
-            # AND last_psr above the safety margin before reseeding.
-            # Without this, auto-reseed fires DURING coasting recovery
-            # on a low-PSR frame, imprinting a partially-occluded
-            # patch as the new appearance template — visible in
-            # `lock test test.jsonl` engagement #57 with PSR resumes
-            # 5.91 / 6.38 (just above psr_lost=5.0). The 1.5x margin
-            # collapses ~95% of low-quality reseeds without
-            # weakening the legitimate refresh path on stable
-            # tracks (PSR routinely 30-60 there). Set the multiplier
-            # to 0 in YAML to disable the gate (legacy behavior).
-            from vision.lock_tracker import LockState
-            margin = float(self._lock_reseed_psr_margin)
-            def _ok_to_reseed(lt):
-                if margin <= 0:
-                    return lt.is_active
-                return (lt.state == LockState.ACTIVE
-                        and lt.last_psr >= lt.psr_lost * margin)
-            if (ef_ok and _ok_to_reseed(self._lock_eo)
+            if (ef_ok and self._lock_eo.is_active
                     and self._lock_eo.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
-                bbox_eo = (self._eo_detection_bbox(target, ef)
-                            or self._fused_to_eo_bbox(target, ef))
+                bbox_eo = self._fused_to_eo_bbox(target, ef)
                 if bbox_eo is not None:
                     self._lock_eo.reseed(ef.bgr, bbox_eo, now=now)
-            if (tf_ok and _ok_to_reseed(self._lock_thermal)
+            if (tf_ok and self._lock_thermal.is_active
                     and self._lock_thermal.time_since_reseed(now=now)
                         >= self._lock_reseed_min_period_s):
-                bbox_th = (self._thermal_detection_bbox(target, tf)
-                            or self._fused_to_thermal_bbox(target, tf))
+                bbox_th = self._fused_to_thermal_bbox(target, tf)
                 if bbox_th is not None:
                     self._lock_thermal.reseed(tf.agc8, bbox_th, now=now)
 
@@ -2397,54 +2161,24 @@ class GimbalManager:
         bbox_eo_pub = to_bbox(eo_upd)
         bbox_th_pub = to_bbox(th_upd)
 
-        # State priority. The published lock_state drives the GUI
-        # bracket color AND the HARD_RELEASED side-effect that drops
-        # the engagement entirely (line 2470+). Two sensor states are
-        # combined per these rules:
-        #
-        # - "released" ONLY when EVERY healthy sensor is released.
-        #   If EO is ACTIVE/COASTING and thermal hits HARD_RELEASED
-        #   (coast window expired alone), we MUST NOT drop the
-        #   engagement — the operator's lock is alive on EO.
-        #   `track not good 5620261.jsonl` tid=54 hit this: psr_eo=91
-        #   (rock solid) but psr_th=2.61 → thermal hard-released →
-        #   pre-fix code dropped the whole engagement.
-        # - "coasting" if EITHER sensor is coasting (amber bracket).
-        # - "active" only when ALL contributing sensors are ACTIVE.
-        # - "off" if no sensor is producing usable updates.
+        # State priority: HARD_RELEASED > COASTING > ACTIVE > OFF.
+        # We want the GUI to see "coasting" if EITHER sensor is
+        # coasting (so it goes amber), and "active" only when both
+        # are healthy.
         from vision.lock_tracker import LockState
         states = []
         if eo_upd is not None: states.append(eo_upd.state)
         if th_upd is not None: states.append(th_upd.state)
-        # Effective states for combination: drop HARD_RELEASED entries
-        # so a single-sensor coast-window expiry can't kill an
-        # engagement that's still alive on the other sensor. Track
-        # this so the per-sensor releases still trigger the
-        # individual LockTracker.release() inside the side-effect.
-        live_states = [s for s in states if s != LockState.HARD_RELEASED]
         if not states:
             lock_state = "off"
-        elif not live_states:
-            # All contributing sensors hard-released → engagement dies.
+        elif LockState.HARD_RELEASED in states:
             lock_state = "released"
-        elif LockState.COASTING in live_states:
+        elif LockState.COASTING in states:
             lock_state = "coasting"
-        elif LockState.ACTIVE in live_states:
+        elif LockState.ACTIVE in states:
             lock_state = "active"
         else:
             lock_state = "off"
-        # Side-effect: if exactly ONE sensor went HARD_RELEASED while
-        # the OTHER is still alive, release THAT sensor's tracker so
-        # we stop publishing its (released) bbox, but keep the
-        # engagement alive on the surviving sensor.
-        if (eo_upd is not None
-                and eo_upd.state == LockState.HARD_RELEASED
-                and lock_state != "released"):
-            self._lock_eo.release()
-        if (th_upd is not None
-                and th_upd.state == LockState.HARD_RELEASED
-                and lock_state != "released"):
-            self._lock_thermal.release()
 
         # ── Emit per-transition events for replay-debug. One event
         # per real edge in the state machine, never per-tick.
@@ -2484,119 +2218,8 @@ class GimbalManager:
             self._lock_target_id = None
             self._lock_target_class = None
             self._lock_seed_pending = False
-            self._lock_seed_pending_t0 = None
-            self._lock_last_state_str = "off"
             return None, None, "released"
         return bbox_eo_pub, bbox_th_pub, lock_state
-
-    def _pose_shift_lock_update(self, upd, frame,
-                                  cur_pan_deg: float,
-                                  cur_tilt_deg: float):
-        """Pose-shift the cached LockUpdate's bbox so the operator
-        sees the lock follow the gimbal between real frame updates.
-
-        EO publishes at 17-25 Hz, gimbal at 35-60 Hz — between two
-        real EO frames the gimbal pose advances. The cached MOSSE
-        bbox is in IMAGE coords of the cached frame; rendering it
-        verbatim looks "frozen" because the GUI's overlay sits on
-        top of the latest gimbal pose. Compute the pose delta from
-        the cached frame's gimbal_*_at_capture to the current pose
-        and shift the bbox by (delta * px_per_deg) so the bracket
-        keeps tracking the target through the slew. When the next
-        real frame arrives, MOSSE re-anchors on actual image data
-        and any prediction error is corrected in one tick.
-
-        Returns a NEW LockUpdate instance with the shifted bbox so
-        we don't mutate the cached value.
-        """
-        if upd is None or upd.bbox_xywh is None or frame is None:
-            return upd
-        from vision.lock_tracker import LockUpdate
-        cap_pan = getattr(frame, "gimbal_pan_at_capture", None)
-        cap_tilt = getattr(frame, "gimbal_tilt_at_capture", None)
-        bgr_or_agc = getattr(frame, "bgr", None)
-        if bgr_or_agc is None:
-            bgr_or_agc = getattr(frame, "agc8", None)
-        if (cap_pan is None or cap_tilt is None
-                or bgr_or_agc is None):
-            return upd
-        h, w = bgr_or_agc.shape[:2]
-        hfov = float(getattr(frame, "hfov_deg", 0.0))
-        vfov = float(getattr(frame, "vfov_deg", 0.0))
-        if hfov <= 0 or vfov <= 0:
-            return upd
-        d_pan = float(cur_pan_deg) - float(cap_pan)
-        d_tilt = float(cur_tilt_deg) - float(cap_tilt)
-        # Skip if delta is sub-pixel — saves a copy and avoids
-        # introducing micro-jitter from float rounding.
-        px_per_deg_x = w / hfov
-        px_per_deg_y = h / vfov
-        # Sign convention: when the gimbal pans RIGHT (+pan), the
-        # scene shifts LEFT in the image → bbox.x decreases. Same
-        # for tilt: tilt UP (+tilt) → scene moves DOWN in image →
-        # bbox.y increases. Verified against
-        # eo/eo_manager.py:1490+ phase-correlate sign conventions.
-        dx = -d_pan * px_per_deg_x
-        dy = d_tilt * px_per_deg_y
-        if abs(dx) < 0.5 and abs(dy) < 0.5:
-            return upd
-        x, y, bw, bh = upd.bbox_xywh
-        new_x = int(round(x + dx))
-        new_y = int(round(y + dy))
-        # Clamp to frame so a runaway slew can't push the bbox off
-        # screen (the brackets render correctly even when partially
-        # clipped, but a fully-off bbox vanishes).
-        new_x = max(-bw + 1, min(w - 1, new_x))
-        new_y = max(-bh + 1, min(h - 1, new_y))
-        return LockUpdate(
-            state=upd.state,
-            bbox_xywh=(new_x, new_y, int(bw), int(bh)),
-            psr=upd.psr,
-            coast_age_s=upd.coast_age_s,
-        )
-
-    def _eo_detection_bbox(self, trk: Any,
-                             ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
-        """Return the EO classifier's RAW bbox for the EO detection
-        that contributed to this fused track, or None if the fused
-        track has no EO contributor in this frame.
-
-        Why this exists: ``_fused_to_eo_bbox`` reprojects the fused
-        track's angular extent (ang_w_deg × ang_h_deg) into pixel
-        space. That extent is the cross-sensor union — for a track
-        with both EO and radar contributing, ang_w/h is dominated by
-        radar's coarse cluster span (~3°) instead of YOLO's tight
-        per-pixel bbox (~0.5°). MOSSE seeded on a 3-4× oversized
-        patch tracks the union of target + background and jumps
-        wildly. For seeding a per-sensor MOSSE, the right bbox is
-        the SENSOR'S OWN detection, not the fused projection.
-        """
-        eo_tid = getattr(trk, "eo_track_id", None)
-        if eo_tid is None:
-            return None
-        for det in getattr(ef, "detections", None) or []:
-            if getattr(det, "track_id", None) == eo_tid:
-                bb = det.bbox
-                if bb is None:
-                    return None
-                return (int(bb.x), int(bb.y), int(bb.w), int(bb.h))
-        return None
-
-    def _thermal_detection_bbox(self, trk: Any,
-                                  tf: "ThermalFrame") -> Optional[Tuple[int, int, int, int]]:
-        """Same as ``_eo_detection_bbox`` but for the thermal panel —
-        looks up the ThermalDetection whose ``track_id`` matches the
-        fused track's ``thermal_heat_id``."""
-        th_tid = getattr(trk, "thermal_heat_id", None)
-        if th_tid is None:
-            return None
-        for det in getattr(tf, "detections", None) or []:
-            if getattr(det, "track_id", None) == th_tid:
-                bb = det.bbox
-                if bb is None:
-                    return None
-                return (int(bb.x), int(bb.y), int(bb.w), int(bb.h))
-        return None
 
     def _fused_to_eo_bbox(self, trk: Any,
                            ef: "EOFrame") -> Optional[Tuple[int, int, int, int]]:
