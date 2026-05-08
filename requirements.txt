@@ -17,6 +17,11 @@ lap>=0.5.12             # linear-assignment solver used by ByteTrack/BoT-SORT
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.27,<1.0
 websockets>=12.0,<14.0
+# orjson: 5-10x faster than stdlib json on the WS broadcast payloads,
+# native numpy serialization. Soft dependency in code (gui/app.py
+# falls back to stdlib json if missing) so the install is non-blocking,
+# but install it — this is the single biggest GUI Hz win.
+orjson>=3.9,<4.0
 
 # Config + data
 pyyaml>=6.0,<7.0

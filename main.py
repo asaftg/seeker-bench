@@ -12,6 +12,7 @@ single process. Flags:
 from __future__ import annotations
 
 import argparse
+import atexit
 import signal
 import sys
 import threading
@@ -478,7 +479,53 @@ def main() -> int:
                 pass
         threading.Thread(target=_delayed_open, daemon=True).start()
 
+    # Producer-rate probe: every 5 s, log the publish cadence each
+    # sensor manager achieves on FrameBus. Decoupled from the GUI WS
+    # broadcast rate — when "GUI panel shows 7 Hz but radar producer
+    # is at 19 Hz" we know the bottleneck is downstream of the bus,
+    # not in the producer. (Multiple agents have wasted hours fixing
+    # the wrong layer here.)
+    def _producer_rate_probe():
+        from common.frame_bus import BUS as _BUS
+        from common.frames import Topic as _T
+        last = {_T.RADAR: (None, None), _T.EO: (None, None),
+                _T.THERMAL: (None, None)}
+        WINDOW_S = 5.0
+        while True:
+            time.sleep(WINDOW_S)
+            parts = []
+            for topic, label in ((_T.RADAR, "radar"),
+                                 (_T.EO, "eo"),
+                                 (_T.THERMAL, "thermal")):
+                obj = _BUS.get_latest(topic)
+                fid = getattr(obj, "frame_id", None)
+                ts = time.monotonic()
+                prev_fid, prev_ts = last[topic]
+                if fid is not None and prev_fid is not None and prev_ts is not None:
+                    df = fid - prev_fid
+                    dt = ts - prev_ts
+                    hz = (df / dt) if dt > 0 else 0.0
+                    parts.append(f"{label}={hz:.1f}Hz(+{df}f/{dt:.1f}s)")
+                else:
+                    parts.append(f"{label}=warming")
+                last[topic] = (fid, ts)
+            log.info("[producer_rate] %s", "  ".join(parts))
+    threading.Thread(target=_producer_rate_probe, daemon=True,
+                     name="ProducerRateProbe").start()
+
+    # Single-shot guard: radar.stop() must run EXACTLY ONCE per
+    # process. Calling sensorStop twice on a STOPPED chip wedges the
+    # mmw_demoDDM CLI parser into a state where it stops acking ANY
+    # command for the rest of the chip's power cycle. Both _shutdown
+    # (signal path) and _atexit_radar_stop (fallback path) share this
+    # flag so whichever fires first does the work and the other one
+    # is a no-op.
+    _shutdown_done = {"v": False}
+
     def _shutdown(*_):
+        if _shutdown_done["v"]:
+            return
+        _shutdown_done["v"] = True
         log.info("Shutdown signal received, stopping sensors")
         try:
             if recorder.is_recording:
@@ -503,25 +550,45 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass  # Windows / non-main thread
 
+    # atexit fallback so sensorStop runs even if Ctrl+C bypasses the
+    # signal handler (uvicorn occasionally dies before the handler
+    # fires).
+    def _atexit_radar_stop() -> None:
+        if _shutdown_done["v"]:
+            return
+        _shutdown_done["v"] = True
+        try:
+            if radar is not None:
+                log.info("atexit: stopping radar (chip sensorStop)")
+                radar.stop()
+        except Exception:
+            log.exception("atexit radar.stop failed")
+    atexit.register(_atexit_radar_stop)
+
     log.info("GUI -> http://%s:%d/", host, port)
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     finally:
-        try:
-            if recorder.is_recording:
-                recorder.stop()
-        except Exception:
-            log.exception("recorder stop failed at shutdown")
-        if gimbal is not None:
-            gimbal.stop()
-        if fusion is not None:
-            fusion.stop()
-        if radar is not None:
-            radar.stop()
-        if eo is not None:
-            eo.stop()
-        if thermal is not None:
-            thermal.stop()
+        # Gated by the same flag as _shutdown / _atexit_radar_stop so
+        # we never double-call radar.stop(). Other sensors are safe
+        # to stop multiple times.
+        if not _shutdown_done["v"]:
+            _shutdown_done["v"] = True
+            try:
+                if recorder.is_recording:
+                    recorder.stop()
+            except Exception:
+                log.exception("recorder stop failed at shutdown")
+            if gimbal is not None:
+                gimbal.stop()
+            if fusion is not None:
+                fusion.stop()
+            if radar is not None:
+                radar.stop()
+            if eo is not None:
+                eo.stop()
+            if thermal is not None:
+                thermal.stop()
 
     return 0
 

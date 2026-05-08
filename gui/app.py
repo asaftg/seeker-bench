@@ -19,6 +19,24 @@ import sys
 import time
 from pathlib import Path
 
+# orjson is 5-10x faster than the stdlib json on these payloads and
+# handles numpy scalars natively (OPT_SERIALIZE_NUMPY) so we don't pay
+# for `default=str` on the hot path. Falls back to stdlib if not
+# installed; the WS sender prefers _fast_json_dumps when available.
+try:
+    import orjson  # type: ignore[import-not-found]
+    _ORJSON_OPTS = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+    def _fast_json_dumps(payload) -> str:
+        # orjson returns bytes; one decode is still much cheaper than
+        # stdlib json.dumps on these payloads. We could push bytes
+        # through ws.send_bytes, but the JS client expects text frames.
+        return orjson.dumps(payload, option=_ORJSON_OPTS).decode("utf-8")
+except Exception:
+    orjson = None  # type: ignore[assignment]
+    _ORJSON_OPTS = 0
+    def _fast_json_dumps(payload) -> str:
+        return json.dumps(payload, default=str)
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -474,7 +492,19 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
         log.info("WebSocket client connected")
 
         async def _sender() -> None:
+            # Per-tick profiling. Buffers cumulative timing across N
+            # ticks then logs one summary so the per-tick overhead is
+            # negligible. Diagnoses the EO/thermal/json bottlenecks
+            # that cap all GUI panels at the same Hz — see
+            # docs/HANDOFF_2026-05-06_radar.md §2 for the history.
+            _PROF_LOG_EVERY = 60   # ~3 s at period=50 ms (ws_fps=20)
+            _prof_n = 0
+            _prof_build = 0.0
+            _prof_dumps = 0.0
+            _prof_send = 0.0
+            _prof_total = 0.0
             while True:
+                _t_iter0 = time.perf_counter()
                 try:
                     tf = BUS.get_latest(Topic.THERMAL)
                     ef = BUS.get_latest(Topic.EO)
@@ -517,6 +547,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     r_el = float(rm_for_bias.el_bias_deg) if rm_for_bias is not None else 0.0
                     t_az = float(fm_for_bias.thermal_az_bias_deg) if fm_for_bias is not None else 0.0
                     t_el = float(fm_for_bias.thermal_el_bias_deg) if fm_for_bias is not None else 0.0
+                    _t_build0 = time.perf_counter()
                     payload = build_ws_message(
                         tf=tf,
                         ef=ef,
@@ -532,6 +563,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         thermal_az_bias_deg=t_az,
                         thermal_el_bias_deg=t_el,
                     )
+                    _prof_build += (time.perf_counter() - _t_build0)
                     # `default=str` is a safety net for numpy scalars that
                     # slip through the dataclass contracts — better to ship
                     # a stringified value than kill the WS connection.
@@ -592,9 +624,14 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     # in the shared message because fused-track bbox_eo
                     # projection on the EO panel uses it every tick.
                     payload["type"] = "sensors"
-                    if isinstance(payload.get("eo"), dict):
-                        payload["eo"]["jpeg_b64"] = None
-                    text = json.dumps(payload, default=str)
+                    # EO jpeg_b64 is intentionally absent — eo_to_wire is
+                    # called with skip_jpeg=True from build_ws_message so
+                    # the base64 cost is skipped at the source. EO bytes
+                    # still reach the GUI via the binary _eo_sender fast
+                    # path below at sensor-arrival cadence.
+                    _t_dumps0 = time.perf_counter()
+                    text = _fast_json_dumps(payload)
+                    _prof_dumps += (time.perf_counter() - _t_dumps0)
                 except WebSocketDisconnect:
                     raise
                 except Exception:
@@ -603,7 +640,9 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     continue
 
                 try:
+                    _t_send0 = time.perf_counter()
                     await ws.send_text(text)
+                    _prof_send += (time.perf_counter() - _t_send0)
                 except WebSocketDisconnect:
                     raise
                 except RuntimeError as e:
@@ -611,6 +650,24 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     # Treat it as a clean disconnect rather than an error.
                     log.info("WebSocket send after close: %s", e)
                     return
+
+                _prof_total += (time.perf_counter() - _t_iter0)
+                _prof_n += 1
+                if _prof_n >= _PROF_LOG_EVERY:
+                    log.info(
+                        "[ws_sender_prof] over %d ticks: build=%.1fms/tick "
+                        "dumps=%.1fms/tick send=%.1fms/tick total=%.1fms/tick "
+                        "(orjson=%s, payload_bytes=%d)",
+                        _prof_n,
+                        1000.0 * _prof_build / _prof_n,
+                        1000.0 * _prof_dumps / _prof_n,
+                        1000.0 * _prof_send / _prof_n,
+                        1000.0 * _prof_total / _prof_n,
+                        "yes" if orjson is not None else "no (stdlib json)",
+                        len(text),
+                    )
+                    _prof_n = 0
+                    _prof_build = _prof_dumps = _prof_send = _prof_total = 0.0
                 await asyncio.sleep(period)
 
         async def _eo_sender() -> None:

@@ -189,6 +189,13 @@ class ThermalManager:
                 self._classifier_hv = None
 
         self._thcfg = cfg.get("thermal", {})
+        # JPEG quality for the colormapped display image. Encoded once on
+        # this process thread (see _process_and_publish) so the asyncio
+        # WS sender reuses bytes instead of re-encoding every tick — same
+        # pattern EO uses. Read from gui.thermal_jpeg_quality so the
+        # operator-tunable knob lives in one place.
+        gui_cfg = cfg.get("gui", {})
+        self._thermal_jpeg_quality = int(gui_cfg.get("thermal_jpeg_quality", 80))
         # classify_interval_frames: "auto" adapts to hardware (1 on GPU, 6 on CPU).
         _raw_interval = (cfg.get("classifier", {}) or {}).get("classify_interval_frames", "auto")
         if isinstance(_raw_interval, str) and _raw_interval.lower() == "auto":
@@ -824,6 +831,23 @@ class ThermalManager:
                     ))
 
         # ── 6. Publish ─────────────────────────────────────────────
+        # Encode the colormapped display once, on this thread. The shared
+        # WS _sender's thermal_to_wire reuses these bytes; without the
+        # cache it re-encodes the same frame every tick (~10-15 ms on a
+        # 640x512 Boson at q=80) and pins all GUI panels to ~7-9 Hz.
+        jpeg_bytes_cache: Optional[bytes] = None
+        if display is not None:
+            try:
+                ok, buf = cv2.imencode(
+                    ".jpg", display,
+                    [cv2.IMWRITE_JPEG_QUALITY, int(self._thermal_jpeg_quality)],
+                )
+                if ok:
+                    jpeg_bytes_cache = bytes(buf)
+            except Exception as e:
+                log.warning("Thermal JPEG encode failed (frame_id=%d): %s",
+                            self._frame_id, e)
+                jpeg_bytes_cache = None
         tf = ThermalFrame(
             timestamp=ts,
             frame_id=self._frame_id,
@@ -837,6 +861,8 @@ class ThermalManager:
             heat_tracks=heat_tracks_debug,
             gimbal_pan_at_capture=gimbal_pan_at_capture,
             gimbal_tilt_at_capture=gimbal_tilt_at_capture,
+            jpeg_bytes=jpeg_bytes_cache,
+            jpeg_quality=int(self._thermal_jpeg_quality),
         )
         BUS.publish(Topic.THERMAL, tf)
 

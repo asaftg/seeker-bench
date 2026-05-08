@@ -135,15 +135,25 @@ def thermal_to_wire(tf: Optional[ThermalFrame], jpeg_quality: int = 80,
             "heat_tracks": [],
         }
 
-    # JPEG-encode the AGC display image
+    # JPEG-encode the AGC display image. Fast path: ThermalManager
+    # already encoded the JPEG on its process thread (see
+    # thermal/thermal_manager.py:_process_and_publish, mirrors EO). Reuse
+    # those bytes when the cache's quality matches the requested one;
+    # falls back to inline encode for legacy ThermalFrames (replay,
+    # disconnect-reconnect race) that don't carry bytes.
     jpeg_b64 = None
     w, h = 0, 0
     if tf.agc8 is not None:
         img = tf.agc8
         h, w = img.shape[:2]
-        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
-        if ok:
-            jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        cached = getattr(tf, "jpeg_bytes", None)
+        cached_q = int(getattr(tf, "jpeg_quality", -1))
+        if cached and cached_q == int(jpeg_quality):
+            jpeg_b64 = base64.b64encode(cached).decode("ascii")
+        else:
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+            if ok:
+                jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
     # Detections
     det_list = []
@@ -628,7 +638,8 @@ def eo_to_wire_split(
 
 def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
                fused_id_by_eo: Optional[dict] = None,
-               fused_wire: Optional[list] = None) -> Dict[str, Any]:
+               fused_wire: Optional[list] = None,
+               skip_jpeg: bool = False) -> Dict[str, Any]:
     """Serialize an EOFrame for the WebSocket.
 
     Wire format matches ThermalFrame as closely as possible so the GUI
@@ -640,6 +651,12 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
     Each detection is shaped like a thermal detection (bbox + classification)
     so ``overlays.js::drawDetectionBox`` can render EO boxes with zero
     case-specific code.
+
+    ``skip_jpeg=True`` makes the function return ``jpeg_b64=None`` without
+    paying the base64 cost. The shared GUI WS sender uses this because
+    EO bytes ride the binary _eo_sender fast path — the redundant
+    base64 of a 460 KB JPEG every shared-tick is what dragged all three
+    sensor panels to 7-9 Hz.
     """
     if ef is None or not ef.connected:
         return {
@@ -658,21 +675,23 @@ def eo_to_wire(ef: Optional[EOFrame], jpeg_quality: int = 80,
 
     jpeg_b64 = None
     w, h = 0, 0
-    # Fast path: EOManager already encoded the JPEG on its process
-    # thread (see eo/eo_manager.py:_process_and_publish). Reuse those
-    # bytes if the requested quality matches — this is the whole point
-    # of the EOFrame.jpeg_bytes cache. Falls back to inline encode for
-    # legacy EOFrames (fake source, replay) that don't carry bytes.
-    cached = getattr(ef, "jpeg_bytes", None)
-    cached_q = int(getattr(ef, "jpeg_quality", -1))
     if ef.bgr is not None:
         h, w = ef.bgr.shape[:2]
-    if cached and cached_q == int(jpeg_quality):
-        jpeg_b64 = base64.b64encode(cached).decode("ascii")
-    elif ef.bgr is not None:
-        ok, buf = cv2.imencode(".jpg", ef.bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
-        if ok:
-            jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    if not skip_jpeg:
+        # Fast path: EOManager already encoded the JPEG on its process
+        # thread (see eo/eo_manager.py:_process_and_publish). Reuse those
+        # bytes if the requested quality matches — this is the whole
+        # point of the EOFrame.jpeg_bytes cache. Falls back to inline
+        # encode for legacy EOFrames (fake source, replay) that don't
+        # carry bytes.
+        cached = getattr(ef, "jpeg_bytes", None)
+        cached_q = int(getattr(ef, "jpeg_quality", -1))
+        if cached and cached_q == int(jpeg_quality):
+            jpeg_b64 = base64.b64encode(cached).decode("ascii")
+        elif ef.bgr is not None:
+            ok, buf = cv2.imencode(".jpg", ef.bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+            if ok:
+                jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
     det_list = []
     eo_map = fused_id_by_eo or {}
@@ -964,9 +983,16 @@ def build_ws_message(
                                    gstate=gstate,
                                    fused_id_by_thermal=thermal_to_fused,
                                    fused_wire=fused_wire),
+        # skip_jpeg=True: the binary _eo_sender fast path in gui/app.py
+        # delivers EO JPEG bytes at sensor-arrival cadence; the shared
+        # WS message only needs metadata (size, fov, detections) for
+        # fused-track bbox_eo projection. Re-base64-ing the same 460 KB
+        # JPEG on every shared-tick costs ~10 ms and was the dominant
+        # bottleneck dragging all panels to ~7-9 Hz.
         "eo": eo_to_wire(ef, jpeg_quality=eo_q,
                           fused_id_by_eo=eo_to_fused,
-                          fused_wire=fused_wire),
+                          fused_wire=fused_wire,
+                          skip_jpeg=True),
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
             radar_az_bias_deg=radar_az_bias_deg,

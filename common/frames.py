@@ -148,6 +148,15 @@ class ThermalFrame:
     gimbal_pan_at_capture: Optional[float] = None
     gimbal_tilt_at_capture: Optional[float] = None
 
+    # Pre-encoded JPEG bytes of the colormapped display image at
+    # `jpeg_quality`. Encoded ONCE on the thermal process thread so the
+    # asyncio WS sender doesn't pay cv2.imencode + base64 every tick
+    # (~10-15 ms/tick on a 640x512 Boson at q=80, the dominant remaining
+    # cost in the shared _sender after EO went binary). Same contract as
+    # EOFrame.jpeg_bytes below — None for disconnected sentinel frames.
+    jpeg_bytes: Optional[bytes] = None
+    jpeg_quality: int = 80
+
 
 # ───────────────────────────────────────────────────────────────
 # EO (visible / NIR RGB) frames — Ticket 3
