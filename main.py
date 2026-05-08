@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-classifier", action="store_true", help="Skip YOLO/shape classifier")
     p.add_argument("--no-gimbal", action="store_true", help="Disable gimbal (Maestro servo controller)")
     p.add_argument("--no-radar", action="store_true", help="Disable radar (AWR2944P)")
+    p.add_argument("--no-aa", action="store_true",
+                   help="Skip the DCA1000 raw-ADC (A/A / PMM) pipeline. "
+                        "TLV path (Topic.RADAR) still runs; only the "
+                        "DCAPipeline thread is suppressed. Diagnostic flag "
+                        "for isolating GUI lag — the range-FFT worker is "
+                        "GIL-heavy and competes with the asyncio loop.")
     p.add_argument(
         "--radar-firmware",
         choices=["demoDDM"],
@@ -277,7 +283,12 @@ def main() -> int:
                 _dca_control = None
                 _dca_listener = None
                 _dca_pipeline = None
-                if bool(_dca.get("enabled", True)):
+                _dca_enabled = bool(_dca.get("enabled", True)) and not args.no_aa
+                if args.no_aa:
+                    log.info("--no-aa: skipping DCA1000 raw-ADC pipeline "
+                             "(diagnostic mode — Topic.RADAR_AA will be "
+                             "absent; TLV radar path unaffected)")
+                if _dca_enabled:
                     _host_ip = str(_dca.get("host_ip", "192.168.33.30"))
                     _dca_ip = str(_dca.get("dca_ip", "192.168.33.180"))
                     _cfg_port = int(_dca.get("config_port", 4096))

@@ -97,11 +97,18 @@ class CompositeRadarBackend:
         dca_pipeline: Optional[DCAPipeline] = None,
         dca_listener: Optional[DataPortListener] = None,
         initial_mode: str = "stock",
+        radar_firmware: str = "demoDDM",
     ) -> None:
         self._radar = radar
         self._dca_control = dca_control
         self._dca_pipeline = dca_pipeline
         self._dca_listener = dca_listener
+        # Accepted for parity with main.py's launch wiring (commit b416885
+        # added the kwarg at the call site but missed it here, so every
+        # bench start since then crashed in __init__ and silently fell
+        # back to TLV-only at 7 Hz). Stored for diagnostics; the actual
+        # firmware-mode branching lives in the launcher itself.
+        self._radar_firmware = str(radar_firmware or "demoDDM").lower()
         self._mode = (initial_mode or "stock").lower()
         if self._mode not in _MODE_FILTERS:
             self._mode = "stock"
@@ -113,6 +120,68 @@ class CompositeRadarBackend:
         if self._dca_pipeline is not None:
             self._dca_pipeline._radar_manager_ref = self._radar
             self._dca_pipeline._dca_control_ref = self._dca_control
+
+        # Hook the chip-wedge recovery so the DCA1000 FPGA gets re-armed
+        # after xds110reset.exe pulses the chip. Without this, the FPGA
+        # keeps thinking it's recording but the LVDS source vanished
+        # under it, and after the chip resumes streaming the FPGA
+        # never resyncs — A/A is dead until the next full app launch.
+        # See radar_manager._probe_and_recover for the firing point.
+        try:
+            self._radar.set_post_recovery_callback(
+                self._rearm_dca_after_chip_reset
+            )
+        except AttributeError:
+            # Older RadarManager without the hook — fall back silently.
+            log.debug(
+                "RadarManager has no set_post_recovery_callback; "
+                "DCA re-arm after chip wedge will not happen automatically"
+            )
+
+    def _rearm_dca_after_chip_reset(self) -> None:
+        """Bring the DCA1000 FPGA back online after xds110reset.
+
+        Trigger: RadarManager just hard-reset the chip via xds110reset.exe
+        (post-Ctrl+C wedge recovery). The FPGA was in start_record state
+        and the LVDS source disappeared mid-stream. Re-run the same
+        arm sequence as composite.start(): stop_record (clears any
+        in-flight state) → reset_fpga → setup_capture → start_record.
+        Also drops the pipeline's accumulator buffer because whatever
+        bytes were sitting in there are pre-reset garbage.
+
+        Called BEFORE _push_profile pushes the cfg + sensorStarts the
+        chip — so the FPGA is freshly armed when LVDS resumes.
+        """
+        if self._dca_control is None:
+            return
+        log.info("Composite: re-arming DCA1000 after chip wedge recovery")
+        try:
+            self._dca_control.stop_record()
+        except Exception as e:
+            log.debug("re-arm: stop_record failed (FPGA may already be off): %s", e)
+        time.sleep(0.1)
+        try:
+            self._dca_control.reset_fpga()
+            self._dca_control.setup_capture()
+            self._dca_control.start_record()
+        except Exception as e:
+            log.warning(
+                "Composite: DCA re-arm failed: %s — A/A will stay dead "
+                "until the next app launch", e,
+            )
+            return
+        # Drop pre-reset bytes from the pipeline's accumulator. Whatever
+        # was buffered when LVDS stopped is misaligned vs the new stream.
+        if self._dca_pipeline is not None:
+            try:
+                self._dca_pipeline._buf.clear()
+                self._dca_pipeline._lvds_stalled_warned = False
+            except Exception:
+                pass
+        log.info(
+            "Composite: DCA1000 re-armed; LVDS will resume when chip "
+            "sensorStarts (cfg push happens next in _push_profile)"
+        )
 
     # ─────────────────────── pass-through attributes ────────────────────
     @property
@@ -243,15 +312,15 @@ class CompositeRadarBackend:
             log.info("Composite: mode %s → %s (host-side, no chip change, sliders untouched)",
                      self._mode, target)
             self._mode = target
-            # Tell the DCA pipeline whether to publish PMM hits (only
-            # when mode == aa). In stock + ag modes the pipeline keeps
-            # consuming raw-ADC bytes (so we don't lose data) but
-            # suppresses publishes — Topic.RADAR_AA stays quiet.
+            # Forward mode to the DCA pipeline so its _publish gate works.
+            # Was previously writing _publish_enabled which the pipeline
+            # never reads — dead code, the gate didn't fire and PMM hits
+            # flooded the GUI in stock mode.
             if self._dca_pipeline is not None:
                 try:
-                    self._dca_pipeline._publish_enabled = (target == "aa")
+                    self._dca_pipeline.set_mode(target)
                 except Exception:
-                    pass
+                    log.exception("dca_pipeline.set_mode(%s) failed", target)
         return self._mode
 
     # ─────────────────────── live-tune knobs ────────────────────────────

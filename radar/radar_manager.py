@@ -33,7 +33,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import serial
 
@@ -122,6 +122,26 @@ class RadarManager:
         self._data_ser: Optional[serial.Serial] = None
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
+
+        # Optional hook fired AFTER a successful xds110reset chip recovery
+        # but BEFORE _push_profile pushes the cfg. Composite registers a
+        # callback here that re-arms the DCA1000 FPGA so LVDS resumes
+        # cleanly when the chip sensorStarts. Without it, A/A is dead
+        # after every Ctrl+C → relaunch cycle.
+        self._post_recovery_callback: Optional[Callable[[], None]] = None
+
+    def set_post_recovery_callback(
+        self, cb: Optional[Callable[[], None]]
+    ) -> None:
+        """Register a callback fired after xds110 chip recovery.
+
+        Composite uses this to re-arm the DCA1000 FPGA after the chip
+        is hard-reset out from under it. Called inside the recovery
+        path of _probe_and_recover, after the chip is confirmed alive
+        and BEFORE the cfg push restarts LVDS streaming. Any exception
+        the callback raises is logged but doesn't abort recovery.
+        """
+        self._post_recovery_callback = cb
 
     # ─────────────────────── live tuning ─────────────────────
     def set_tuning(
@@ -408,6 +428,19 @@ class RadarManager:
         if probe2.strip():
             log.info("[ISSUE2-RECOVERY] Chip recovered (resp=%r)",
                      probe2.strip()[:80])
+            # Fire the post-recovery hook BEFORE returning. Composite
+            # uses this to re-arm the DCA1000 FPGA so LVDS resumes
+            # cleanly when the cfg push (next step in _push_profile)
+            # sensorStarts the chip. Best-effort — don't abort recovery
+            # if the callback explodes.
+            if self._post_recovery_callback is not None:
+                try:
+                    self._post_recovery_callback()
+                except Exception:
+                    log.exception(
+                        "[ISSUE2-RECOVERY] post-recovery callback raised; "
+                        "continuing with chip recovery anyway"
+                    )
             return ser2
         log.error("[ISSUE2-RECOVERY] Chip still silent after xds110 reset; "
                   "giving up this _push_profile cycle")
@@ -595,12 +628,21 @@ class RadarManager:
 
     def _open_data_port(self) -> bool:
         try:
-            # Short read timeout so the capture loop can stay responsive
-            # to self._stop while waiting for UART bytes.
+            # Read timeout matches the chip's frame period (50 ms = 20 Hz).
+            # With timeout=0.2, on cfar=0 frames the buffer accumulates
+            # ~4 small TLV packets per timeout window before read returns;
+            # the capture loop then notifies the process queue 4 times
+            # in microseconds, which the deque drains in microseconds,
+            # producing a 20 Hz publish rate that's BURSTY (4 frames
+            # back-to-back, then 200 ms of nothing). Average is correct
+            # but visually it looks like ~5 Hz with motion blur. With
+            # timeout matched to the chip's frame period, each read
+            # returns with ~1 packet — steady 20 Hz, no bursts. Also
+            # 4× faster shutdown responsiveness for free.
             self._data_ser = serial.Serial(
                 self.data_port,
                 self.data_baud,
-                timeout=0.2,
+                timeout=0.05,
             )
             return True
         except serial.SerialException as e:

@@ -469,7 +469,30 @@ class DCAPipeline:
         Stages 1, 2, 5 run -- the chip's on-chip CFAR is the source of
         truth for humans/vehicles via Topic.RADAR, and host-side CFAR
         without DDMA-unfold would produce mis-angled detections anyway.
+
+        Mode-aware short-circuit (added 2026-05-08): when pmm_only is
+        set AND the operator is NOT in "aa" mode, skip the entire
+        FFT/PMM chain. PMM is the only thing the host pipeline
+        contributes in this hybrid deployment, and it's only useful in
+        AA mode. Running it constantly in stock / ag burns 50-100 ms
+        per frame of GIL-held numpy work that starves the asyncio
+        event loop (causing the GUI/gimbal lag). It also has the
+        side-effect of leaking PMM points to the radar panel in stock
+        mode because the existing _publish branch in pmm_only emits
+        pmm_targets unconditionally. Publishing an empty RadarFrame
+        keeps Topic.RADAR_AA fresh so the GUI clears stale points.
         """
+        if self._pmm_only and self._mode_name != "aa":
+            self._frame_id += 1
+            self._publish([], [], [])
+            self._stats.frames_assembled += 1
+            self._stats.last_frame_t = time.time()
+            if self._frame_id % 80 == 0:
+                log.info(
+                    "DCAPipeline frame %d [%s]: idle (pmm_only + mode!=aa)",
+                    self._frame_id, self._mode_name,
+                )
+            return
         # Stage 1: reshape + range FFT.
         range_cube = self._stage1_range_fft(frame_bytes)
         # Stage 2: slow-time MTI + harmonic-artifact notch.
