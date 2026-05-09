@@ -588,10 +588,77 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
             except Exception:
                 log.exception("eo_binary_sender died")
 
-        # Run both senders cooperatively; whichever finishes first
-        # cancels the other.
+        async def receiver():
+            """Handle commands sent FROM the GUI (track lock, gimbal, etc).
+
+            Mirrors v1's gui/app.py:_receiver shape. Per the v1 protocol,
+            commands are JSON text frames like:
+                {"command":"track","track_id":N|null}
+                {"command":"track_heat","heat_id":N|null}
+                {"command":"gimbal_absolute","pan":X,"tilt":Y}
+                {"command":"gimbal_manual","delta_pan":X,"delta_tilt":Y}
+                {"command":"recording_start"|"recording_stop"}
+                {"command":"illuminator","state":"auto"|"on"|"off"}
+            """
+            import json as _j
+            try:
+                async for raw in ws.iter_text():
+                    try: cmd = _j.loads(raw)
+                    except Exception: continue
+                    op = cmd.get("command")
+                    if op == "track":
+                        tid = cmd.get("track_id")
+                        reg.tracked_target_id = int(tid) if tid is not None else None
+                        reg.tracked_heat_id = None
+                        if reg.v1_gimbal is not None:
+                            try: reg.v1_gimbal.set_track_target(reg.tracked_target_id)
+                            except Exception as e: log.warning("set_track_target: %r", e)
+                    elif op == "track_heat":
+                        hid = cmd.get("heat_id")
+                        reg.tracked_heat_id = int(hid) if hid is not None else None
+                        reg.tracked_target_id = None
+                        if reg.v1_gimbal is not None:
+                            try: reg.v1_gimbal.set_track_heat(reg.tracked_heat_id)
+                            except Exception as e: log.warning("set_track_heat: %r", e)
+                    elif op == "gimbal_manual":
+                        if reg.tracked_target_id is not None or reg.tracked_heat_id is not None:
+                            reg.tracked_target_id = None; reg.tracked_heat_id = None
+                        if reg.v1_gimbal is not None:
+                            try:
+                                reg.v1_gimbal.set_manual_delta(
+                                    float(cmd.get("delta_pan", 0.0)),
+                                    float(cmd.get("delta_tilt", 0.0)),
+                                )
+                            except Exception as e: log.warning("set_manual_delta: %r", e)
+                    elif op == "gimbal_absolute":
+                        if reg.tracked_target_id is not None:
+                            reg.tracked_target_id = None
+                        if reg.v1_gimbal is not None:
+                            try:
+                                reg.v1_gimbal.set_target_absolute(
+                                    float(cmd.get("pan", 0.0)),
+                                    float(cmd.get("tilt", 0.0)),
+                                )
+                            except Exception as e: log.warning("set_target_absolute: %r", e)
+                    elif op == "recording_start":
+                        if reg.v1_recorder is not None:
+                            try: reg.v1_recorder.start(); reg.recording_active = True
+                            except Exception as e: log.warning("rec start: %r", e)
+                    elif op == "recording_stop":
+                        if reg.v1_recorder is not None:
+                            try: reg.v1_recorder.stop(); reg.recording_active = False
+                            except Exception as e: log.warning("rec stop: %r", e)
+                    elif op == "illuminator":
+                        pass  # stub — wire to NIR LED when impl
+                    else:
+                        log.debug("WS unknown command: %r", op)
+            except WebSocketDisconnect: return
+            except Exception:
+                log.exception("ws receiver died")
+
+        # Run all three coroutines cooperatively; first to finish cancels.
         try:
-            await asyncio.gather(shared_sender(), eo_binary_sender())
+            await asyncio.gather(shared_sender(), eo_binary_sender(), receiver())
         except WebSocketDisconnect:
             log.info("WS client disconnected")
         except Exception:
