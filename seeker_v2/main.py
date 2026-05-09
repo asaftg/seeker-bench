@@ -275,14 +275,15 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                          ("fusion_stats", reg.fusion_stats)]:
             if q is None:
                 continue
-            try:
-                last = None
-                while True:
+            last = None
+            # Drain to the freshest message; queue.Empty exits the loop.
+            while True:
+                try:
                     last = q.get_nowait()
-                if last is not None:
-                    s[label] = last
-            except Exception:
-                pass
+                except Exception:
+                    break
+            if last is not None:
+                s[label] = last
         return s
 
     # ── WebSocket sender ───────────────────────────────────────────────

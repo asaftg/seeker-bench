@@ -51,7 +51,7 @@ class InferenceConfig:
     eo_height: int = 2064
     # Thermal classifier
     thermal_engine_path: str = "models/seeker_thermal_hv.engine"
-    thermal_imgsz: int = 640
+    thermal_imgsz: int = 960  # match seeker_thermal_hv.engine fixed input
     thermal_classify_interval: int = 4  # Phase 1 fix #2
     thermal_conf: float = 0.55
     thermal_shm_name: str = "seeker_thermal_bgr"
@@ -126,10 +126,10 @@ def _warmup(model, imgsz: int, n: int = 3):
     for _ in range(n):
         try:
             _ = model.track(dummy, persist=True, tracker="bytetrack.yaml",
-                            verbose=False)
+                            imgsz=imgsz, verbose=False)
         except Exception:
             try:
-                _ = model.predict(dummy, verbose=False)
+                _ = model.predict(dummy, imgsz=imgsz, verbose=False)
             except Exception as e:
                 log.warning("warmup pred failed: %r", e)
 
