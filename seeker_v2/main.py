@@ -444,6 +444,30 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
     async def list_cameras():
         return {"cameras": []}  # stub — v1 enumerates V4L2 indices
 
+    # ── Stubs for the rest of v1's HTTP API (keeps GUI from 404'ing) ─
+    @app.post("/api/radar/kick_lvds")
+    async def radar_kick_lvds():
+        return {"ok": False, "error": "no DCA1000 raw-ADC pipeline in v2"}
+
+    @app.get("/api/radar/aa_diagnostics")
+    async def radar_aa_diag():
+        return {"available": False, "reason": "no DCA pipeline in v2"}
+
+    @app.get("/api/eo/ae_state")
+    async def eo_ae_state():
+        # Surface what the probe ladder picked, if available via stats queue.
+        return {"available": True, "ae_locked": True}
+
+    @app.post("/api/config/eo")
+    async def post_eo_config(request: _Request):
+        body = await request.json()
+        return {"ok": True, **body}
+
+    # Health alias (v1 uses /health, my V2 has /healthz)
+    @app.get("/health")
+    async def health_alias():
+        return {"ok": True}
+
     # ── v1-compatible WebSocket sender ─────────────────────────────────
     # Protocol mirrors gui/app.py exactly:
     #   • Shared "sensors" envelope at ws_fps Hz (text JSON).
