@@ -3,125 +3,124 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>seeker_v2 · BENCH</title>
+    <title>SEEKER-01 BENCH · v2</title>
     <link rel="stylesheet" href="/static/css/main_v2.css">
 </head>
 <body>
-    <header class="topbar">
-        <div class="brand">
-            <span class="title">SEEKER&#8209;01 &middot; BENCH</span>
-            <span class="subtitle">v2 &middot; multi-process</span>
-        </div>
-        <div class="status-pills">
-            <span class="pill" id="pill-thermal">THERMAL</span>
-            <span class="pill" id="pill-eo">EO</span>
-            <span class="pill" id="pill-radar">RADAR</span>
-            <span class="pill" id="pill-gimbal">GIMBAL</span>
-            <span class="pill rec" id="pill-rec">REC</span>
-        </div>
-        <div class="ws-state">WS: <span id="ws-state">offline</span></div>
-    </header>
 
-    <nav class="tabs">
-        <button class="tab active" data-tab="main">MAIN</button>
-        <button class="tab" data-tab="developers">DEVELOPERS</button>
-    </nav>
+<header class="topbar">
+    <div class="brand">
+        SEEKER&#8209;01 &middot; <span class="brand-accent">BENCH</span>
+        <span class="subtitle">v2 &middot; multi-process</span>
+    </div>
+    <div class="pills">
+        <span class="pill" data-pill="thermal"><span class="dot"></span>THERMAL</span>
+        <span class="pill" data-pill="eo"><span class="dot"></span>EO</span>
+        <span class="pill" data-pill="radar"><span class="dot"></span>RADAR</span>
+        <span class="pill" data-pill="gimbal"><span class="dot"></span>GIMBAL</span>
+        <span class="pill" data-pill="rec"><span class="dot"></span>REC</span>
+    </div>
+    <div class="ws-state">WS: <span id="ws-state">offline</span></div>
+</header>
 
-    <main class="page" data-page="main">
-        <section class="grid">
-            <!-- THERMAL -->
-            <section class="panel" id="panel-thermal">
-                <header>
-                    <h2>THERMAL · Boson 640</h2>
-                    <span class="hz" id="thermal-hz">-- Hz</span>
-                </header>
-                <div class="stage">
-                    <img id="thermal-img" alt="Thermal">
-                    <canvas id="thermal-overlay"></canvas>
-                </div>
-            </section>
+<nav class="tabbar">
+    <button class="tab active" data-tab="main">MAIN</button>
+    <button class="tab" data-tab="dev">DEVELOPERS</button>
+</nav>
 
-            <!-- EO -->
-            <section class="panel" id="panel-eo">
-                <header>
-                    <h2>EO · IMX568 · 35mm · 11.1°</h2>
-                    <span class="hz" id="eo-hz">-- Hz</span>
-                </header>
-                <div class="stage">
-                    <img id="eo-img" alt="EO">
-                    <canvas id="eo-overlay"></canvas>
-                </div>
-            </section>
-
-            <!-- RADAR -->
-            <section class="panel" id="panel-radar">
-                <header>
-                    <h2>RADAR · AWR2944P</h2>
-                    <span class="hz" id="radar-hz">-- Hz</span>
-                </header>
-                <div class="stage">
-                    <svg id="radar-polar" viewBox="-110 -110 220 110" preserveAspectRatio="xMidYMid meet"></svg>
-                </div>
-            </section>
-        </section>
-
-        <section class="bottom">
-            <!-- TARGETS -->
-            <section class="panel small" id="panel-targets">
-                <header><h2>FUSED TRACKS · TOP 5</h2></header>
-                <div id="tracks-list" class="targets-grid">
-                    <div class="target-cell">--</div>
-                    <div class="target-cell">--</div>
-                    <div class="target-cell">--</div>
-                    <div class="target-cell">--</div>
-                    <div class="target-cell">--</div>
-                </div>
-            </section>
-
-            <!-- GIMBAL -->
-            <section class="panel small" id="panel-gimbal">
-                <header><h2>GIMBAL · manual</h2></header>
-                <div class="gimbal">
-                    <label>PAN <span id="pan-val">0.0°</span></label>
-                    <input type="range" id="pan-slider" min="-90" max="90" step="0.5" value="0">
-                    <label>TILT <span id="tilt-val">0.0°</span></label>
-                    <input type="range" id="tilt-slider" min="-30" max="60" step="0.5" value="0">
-                    <button id="home-btn">HOME</button>
-                    <p class="hint">v2 alpha: read-only telemetry. Gimbal control wired in next iteration.</p>
-                </div>
-            </section>
-        </section>
-    </main>
-
-    <main class="page hidden" data-page="developers">
-        <section class="dev-grid">
-            <div class="panel">
-                <header><h2>EO STATS</h2></header>
-                <pre id="dev-eo">no data</pre>
-            </div>
-            <div class="panel">
-                <header><h2>THERMAL STATS</h2></header>
-                <pre id="dev-thermal">no data</pre>
-            </div>
-            <div class="panel">
-                <header><h2>RADAR STATS</h2></header>
-                <pre id="dev-radar">no data</pre>
-            </div>
-            <div class="panel">
-                <header><h2>INFERENCE STATS</h2></header>
-                <pre id="dev-inference">no data</pre>
-            </div>
-            <div class="panel">
-                <header><h2>FUSION STATS</h2></header>
-                <pre id="dev-fusion">no data</pre>
-            </div>
-            <div class="panel">
-                <header><h2>RAW WS PAYLOAD (last)</h2></header>
-                <pre id="dev-ws">no data</pre>
+<!-- ─────────── MAIN TAB ─────────── -->
+<main class="tab-page active" data-page="main">
+    <div class="row sensors">
+        <section class="panel">
+            <header>
+                <span>THERMAL · Boson 640</span>
+                <span class="hz" id="thermal-hz">— Hz</span>
+            </header>
+            <div class="stage">
+                <img id="thermal-img" alt="">
+                <canvas id="thermal-overlay"></canvas>
             </div>
         </section>
-    </main>
 
-    <script src="/static/js/main_v2.js"></script>
+        <section class="panel">
+            <header>
+                <span>EO · IMX568 · 35mm · 11.1°</span>
+                <span class="hz" id="eo-hz">— Hz</span>
+            </header>
+            <div class="stage">
+                <img id="eo-img" alt="">
+                <canvas id="eo-overlay"></canvas>
+            </div>
+        </section>
+
+        <section class="panel">
+            <header>
+                <span>RADAR · AWR2944P</span>
+                <span class="hz" id="radar-hz">— Hz</span>
+            </header>
+            <div class="stage radar-stage">
+                <svg id="radar-polar" viewBox="-110 -110 220 110" preserveAspectRatio="xMidYMid meet"></svg>
+            </div>
+        </section>
+    </div>
+
+    <div class="row controls">
+        <section class="panel">
+            <header><span>FUSED TRACKS · TOP 5</span></header>
+            <div class="targets-row">
+                <div class="target-cell empty">--</div>
+                <div class="target-cell empty">--</div>
+                <div class="target-cell empty">--</div>
+                <div class="target-cell empty">--</div>
+                <div class="target-cell empty">--</div>
+            </div>
+        </section>
+
+        <section class="panel">
+            <header>
+                <span>GIMBAL · manual</span>
+                <span class="readout"><span id="pan-readout">0.0°</span> / <span id="tilt-readout">0.0°</span></span>
+            </header>
+            <div class="gimbal-body">
+                <label>PAN <input type="range" id="pan-slider" min="-90" max="90" step="0.5" value="0"></label>
+                <label>TILT <input type="range" id="tilt-slider" min="-30" max="60" step="0.5" value="0"></label>
+                <button id="home-btn">HOME</button>
+                <p class="hint">v2 alpha — sliders are read-only telemetry; control wired in next iter.</p>
+            </div>
+        </section>
+    </div>
+</main>
+
+<!-- ─────────── DEVELOPERS TAB ─────────── -->
+<main class="tab-page" data-page="dev">
+    <div class="dev-grid">
+        <section class="panel">
+            <header><span>EO STATS</span></header>
+            <pre id="dev-eo">no data</pre>
+        </section>
+        <section class="panel">
+            <header><span>THERMAL STATS</span></header>
+            <pre id="dev-thermal">no data</pre>
+        </section>
+        <section class="panel">
+            <header><span>RADAR STATS</span></header>
+            <pre id="dev-radar">no data</pre>
+        </section>
+        <section class="panel">
+            <header><span>INFERENCE STATS</span></header>
+            <pre id="dev-inference">no data</pre>
+        </section>
+        <section class="panel">
+            <header><span>FUSION STATS</span></header>
+            <pre id="dev-fusion">no data</pre>
+        </section>
+        <section class="panel">
+            <header><span>WS LIVE</span></header>
+            <pre id="dev-ws">no data</pre>
+        </section>
+    </div>
+</main>
+
+<script src="/static/js/main_v2.js"></script>
 </body>
 </html>
