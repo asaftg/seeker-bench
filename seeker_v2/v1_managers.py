@@ -124,7 +124,7 @@ def start_recorder(yaml_path: Optional[str] = None) -> Any:
         # Default to a user-writable dir; /var/log needs sudo.
         out_dir = rec_cfg.get("out_dir", str(Path.home() / "seeker_recordings"))
         Path(out_dir).mkdir(parents=True, exist_ok=True)
-        rec = JSONLRecorder(BUS, out_dir=out_dir)
+        rec = JSONLRecorder(BUS, output_dir=out_dir)
         log.info("JSONLRecorder ready (out_dir=%s)", out_dir)
         return rec
     except Exception:
