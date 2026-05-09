@@ -156,7 +156,10 @@ class FrameRing:
         self._owns = owns
         self._slot_idx = -1  # producer-side rolling slot
 
-        total_size = self._n * self._frame_bytes + FrameDescriptor._ATOMIC_SIZE
+        # +8 bytes for the cross-process seq counter at the tail.
+        total_size = (self._n * self._frame_bytes
+                      + FrameDescriptor._ATOMIC_SIZE
+                      + 8)
         if owns:
             try:
                 shm = shared_memory.SharedMemory(name=name)
@@ -174,12 +177,17 @@ class FrameRing:
                 raise ValueError(
                     f"FrameRing {name}: shm size {self._shm.size} < required {total_size}"
                 )
-        # Atomic publish slot is the LAST FrameDescriptor._ATOMIC_SIZE bytes
+        # Layout in shm:
+        #   [0 .. n*frame_bytes)              — frame slots
+        #   [atomic_offset .. +ATOMIC_SIZE)   — latest FrameDescriptor
+        #   [seq_offset .. +8)                — uint64 seq counter
+        #
+        # The seq counter MUST live in shm (NOT in a separate
+        # multiprocessing.Value) because the producer and consumer
+        # are different OS processes that each construct their own
+        # FrameRing object — a per-process Value would not be shared.
         self._atomic_offset = self._n * self._frame_bytes
-
-        # Atomic seq counter (multiprocessing.Value, no lock - naturally
-        # aligned int64 reads/writes are atomic on aarch64+x86_64).
-        self._seq = Value("q", 0, lock=False)
+        self._seq_offset    = self._atomic_offset + FrameDescriptor._ATOMIC_SIZE
 
     @classmethod
     def create(cls, name: str, n_slots: int, frame_bytes: int) -> "FrameRing":
@@ -217,6 +225,13 @@ class FrameRing:
         offset = slot_idx * self._frame_bytes
         return self._shm.buf[offset : offset + self._frame_bytes]
 
+    def _read_seq(self) -> int:
+        b = bytes(self._shm.buf[self._seq_offset : self._seq_offset + 8])
+        return struct.unpack("<Q", b)[0]
+
+    def _write_seq(self, v: int) -> None:
+        self._shm.buf[self._seq_offset : self._seq_offset + 8] = struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)
+
     def publish(self, desc: FrameDescriptor) -> None:
         """Producer: atomically publish a descriptor as the latest frame."""
         if desc.slot_idx < 0 or desc.slot_idx >= self._n:
@@ -230,15 +245,16 @@ class FrameRing:
         ] = b
         # Bump seq AFTER the descriptor write. Consumers read seq first,
         # then descriptor - and re-check seq after - to detect a torn
-        # read across the publish boundary.
-        self._seq.value = int(self._seq.value) + 1
+        # read across the publish boundary. uint64 8-byte writes are
+        # naturally atomic on aarch64+x86_64.
+        self._write_seq(self._read_seq() + 1)
 
     def latest(self) -> Tuple[Optional[FrameDescriptor], int]:
         """Consumer: return (latest_descriptor, seq).
 
         Returns (None, 0) before the first publish.
         """
-        seq_a = int(self._seq.value)
+        seq_a = self._read_seq()
         if seq_a == 0:
             return None, 0
         b = bytes(
@@ -247,7 +263,7 @@ class FrameRing:
                 : self._atomic_offset + FrameDescriptor._ATOMIC_SIZE
             ]
         )
-        seq_b = int(self._seq.value)
+        seq_b = self._read_seq()
         if seq_a != seq_b:
             # Torn read across publish - caller can retry next tick.
             return None, seq_a
