@@ -544,22 +544,34 @@ def main(argv=None) -> int:
          reg.radar_stats) = r_spawn(mp_ctx, radar_cfg)
         log.info("radar capture spawned (pid=%d)", reg.radar_proc.pid)
 
-    # Allow capture procs to create their shm rings before consumers
-    time.sleep(0.5)
+    # Attach consumer rings (main needs them to read frames into the WS payload).
+    # Captures may take a few seconds to bring up shm (camera open + first frame),
+    # so retry with backoff instead of a fixed sleep.
+    from seeker_v2.processes.ipc import FrameRing
+    def _attach_with_retry(shm_name, n_slots, frame_bytes, label, attempts=20):
+        for i in range(attempts):
+            try:
+                ring = FrameRing.attach(shm_name, n_slots=n_slots, frame_bytes=frame_bytes)
+                log.info("%s ring attached (try %d/%d)", label, i + 1, attempts)
+                return ring
+            except FileNotFoundError:
+                time.sleep(0.5)
+            except Exception as e:
+                log.warning("%s ring attach unexpected: %r", label, e)
+                time.sleep(0.5)
+        log.warning("%s ring attach gave up after %d attempts", label, attempts)
+        return None
 
-    # Attach consumer rings (main needs them to read frames into the WS payload)
-    try:
-        from seeker_v2.processes.ipc import FrameRing
-        reg.eo_ring = FrameRing.attach(
-            eo_cfg.shm_name, n_slots=eo_cfg.n_slots,
-            frame_bytes=eo_cfg.width * eo_cfg.height * 3,
+    if not args.no_eo:
+        reg.eo_ring = _attach_with_retry(
+            eo_cfg.shm_name, eo_cfg.n_slots,
+            eo_cfg.width * eo_cfg.height * 3, "EO",
         )
-        reg.thermal_ring = FrameRing.attach(
-            thermal_cfg.shm_name, n_slots=thermal_cfg.n_slots,
-            frame_bytes=thermal_cfg.width * thermal_cfg.height * 3,
+    if not args.no_thermal:
+        reg.thermal_ring = _attach_with_retry(
+            thermal_cfg.shm_name, thermal_cfg.n_slots,
+            thermal_cfg.width * thermal_cfg.height * 3, "thermal",
         )
-    except Exception as e:
-        log.warning("ring attach failed: %r", e)
 
     if not args.no_inference:
         from seeker_v2.processes.inference import spawn as i_spawn

@@ -68,7 +68,15 @@ class EOCaptureConfig:
     height: int = NATIVE_H
     shm_name: str = "seeker_eo_bgr"
     n_slots: int = 4
-    initial_exposure_ext: int = 1264
+    # IMX568+FX3 firmware quirk: exposure_ext < ~32 puts the FX3 into
+    # an invalid range and it reports stale 0xFF buffers (looks like
+    # full saturation to AGC -> display goes black). Empirically,
+    # exposure_ext=32 in our garage daylight gives mean=375/4095 and
+    # p99=810/4095 — clean image. Probed with /tmp/probe_exp.py.
+    # Valid range tested: 32..~200.
+    initial_exposure_ext: int = 32
+    ae_min_exposure_ext: int = 32       # never clamp below the FX3 floor
+    ae_max_exposure_ext: int = 4000     # broad upper bound; cap further if AGC saturates
     target_p99_lo: float = 300.0
     target_p99_hi: float = 3500.0
     # Phase 2.5: GUI snapshot stream
