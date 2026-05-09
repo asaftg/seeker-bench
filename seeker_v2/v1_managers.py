@@ -13,7 +13,7 @@ v1-compatible WS envelope (see seeker_v2/wire_v1.py).
 Construction is a near-copy of the relevant slice of v1's main.py:
   - RadarManager(cli_port=..., data_port=..., cfg_path=..., ...)
     publishes radar.RadarFrame on Topic.RADAR
-  - GimbalManager() publishes gimbal.GimbalState on Topic.GIMBAL_STATE
+  - GimbalManager() publishes gimbal.GimbalState on Topic.GIMBAL
   - JSONLRecorder subscribes to topics and writes JSONL on demand
 """
 from __future__ import annotations
@@ -121,7 +121,8 @@ def start_recorder(yaml_path: Optional[str] = None) -> Any:
         log.error("recorder import failed: %r", e); return None
     try:
         rec_cfg = _load_yaml_section(yaml_path, "recording") if yaml_path else {}
-        out_dir = rec_cfg.get("out_dir", "/var/log/seeker")
+        # Default to a user-writable dir; /var/log needs sudo.
+        out_dir = rec_cfg.get("out_dir", str(Path.home() / "seeker_recordings"))
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         rec = JSONLRecorder(BUS, out_dir=out_dir)
         log.info("JSONLRecorder ready (out_dir=%s)", out_dir)
@@ -148,7 +149,7 @@ def bus_get_gimbal_state() -> Any:
     try:
         from common.frame_bus import BUS
         from common.frames import Topic
-        return BUS.get_latest(Topic.GIMBAL_STATE)
+        return BUS.get_latest(Topic.GIMBAL)
     except Exception:
         return None
 
