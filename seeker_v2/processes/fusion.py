@@ -344,11 +344,16 @@ def run(cfg: FusionConfig, ctrl_q, eo_det_q, thermal_det_q,
 
             # ── Persistent matcher ───────────────────────────────────
             # Greedy nearest-neighbor in angular space.
-            t_used = [False] * len(persistent)
+            # Use a set of indices instead of a fixed-length list because
+            # `persistent` can grow inside this loop (when a candidate
+            # creates a new persistent track), and the old list-based
+            # version threw IndexError when the new index exceeded the
+            # initial len.
+            t_used = set()
             for c in candidates:
                 best_i, best_dist = -1, 999.0
                 for i, p in enumerate(persistent):
-                    if t_used[i]:
+                    if i in t_used:
                         continue
                     d = ((c["az"] - p["az"]) ** 2
                          + (c["el"] - p["el"]) ** 2) ** 0.5
@@ -356,7 +361,7 @@ def run(cfg: FusionConfig, ctrl_q, eo_det_q, thermal_det_q,
                         best_dist = d
                         best_i = i
                 if best_i >= 0:
-                    t_used[best_i] = True
+                    t_used.add(best_i)
                     p = persistent[best_i]
                     p["az"] = c["az"]; p["el"] = c["el"]
                     p["ang_w"] = c["ang_w"]; p["ang_h"] = c["ang_h"]
