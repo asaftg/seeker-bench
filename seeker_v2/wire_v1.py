@@ -336,6 +336,12 @@ def build_ws_message(
     *,
     thermal_desc=None, thermal_jpeg_bytes=None, thermal_heat_dets=None,
     eo_desc=None, eo_dets=None,
+    # NEW: pass-through for v1 BUS objects so we can call v1's
+    # serializers verbatim and inherit all their fields.
+    v1_radar_frame=None,
+    v1_gimbal_state=None,
+    v1_radar_aa_frame=None,
+    # Fallback path (V2 native radar_capture). Used only if v1_radar_frame=None.
     radar_targets=None, radar_last_frame_id=0, radar_last_ts=0.0,
     fused_tracks=None,
     gimbal_state=None,
@@ -356,6 +362,50 @@ def build_ws_message(
                          key=lambda t: -(int(t.get("hits", 0))))[: max(0, top_n)]
     top_targets = sorted(top_targets, key=lambda t: int(t.get("id") or 0))
 
+    # ── Radar: prefer v1's RadarFrame via v1's serializer (more
+    # complete shape; the GUI's radar_view.js relies on it). Falls back
+    # to V2's stub if v1 path unavailable.
+    radar_payload = None
+    if v1_radar_frame is not None:
+        try:
+            from gui.sensor_bridge import radar_to_wire as v1_radar_to_wire
+            radar_payload = v1_radar_to_wire(
+                v1_radar_frame,
+                radar_aa_frame=v1_radar_aa_frame,
+            )
+        except Exception:
+            radar_payload = None
+    if radar_payload is None:
+        radar_payload = radar_to_wire(
+            radar_targets,
+            last_frame_id=radar_last_frame_id,
+            last_ts=radar_last_ts,
+        )
+
+    # ── Gimbal: build payload from v1's GimbalState if present.
+    if v1_gimbal_state is not None:
+        try:
+            gs = v1_gimbal_state
+            gimbal_payload = {
+                "pan": round(float(getattr(gs, "pan_deg", 0.0)), 2),
+                "tilt": round(float(getattr(gs, "tilt_deg", 0.0)), 2),
+                "mode": getattr(gs, "mode", "manual"),
+                "connected": bool(getattr(gs, "connected", False)),
+                "tracked_target_id": getattr(gs, "tracked_target_id", None),
+                "target_pan": round(float(getattr(gs, "target_pan_deg", 0.0)), 2),
+                "target_tilt": round(float(getattr(gs, "target_tilt_deg", 0.0)), 2),
+                "error": getattr(gs, "error", None),
+                "lock_state": getattr(gs, "lock_state", "off"),
+                "lock_bbox_eo": None,
+                "lock_bbox_thermal": None,
+                "lock_target_id": getattr(gs, "lock_target_id", None),
+                "lock_solo_mode": False,
+            }
+        except Exception:
+            gimbal_payload = gimbal_disconnected_stub(main_target_id)
+    else:
+        gimbal_payload = gimbal_state or gimbal_disconnected_stub(main_target_id)
+
     return {
         "type": "sensors",
         "ts": time.time(),
@@ -365,18 +415,14 @@ def build_ws_message(
         ),
         "eo": eo_to_wire(eo_desc, eo_dets,
                           hfov_deg=eo_hfov_deg, vfov_deg=eo_vfov_deg),
-        "radar": radar_to_wire(
-            radar_targets,
-            last_frame_id=radar_last_frame_id,
-            last_ts=radar_last_ts,
-        ),
+        "radar": radar_payload,
         "fused": fused_wire,
         "tracks": [],
         "top_targets": top_targets,
         "main_target_id": main_target_id,
         "tracked_target_id": tracked_target_id,
         "tracked_heat_id": tracked_heat_id,
-        "gimbal": gimbal_state or gimbal_disconnected_stub(main_target_id),
+        "gimbal": gimbal_payload,
         "illuminator": {
             "state": nir_mode,
             "duty": 0.20 if nir_mode == "auto" else (1.0 if nir_mode == "on" else 0.0),

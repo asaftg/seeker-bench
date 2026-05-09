@@ -146,6 +146,14 @@ class ProcReg:
         self.radar_ctrl = None
         self.radar_targets_q = None
         self.radar_stats = None
+        # In-process v1 managers (radar/gimbal/recorder live in this process)
+        self.v1_radar = None
+        self.v1_gimbal = None
+        self.v1_recorder = None
+        # GUI control state (set by HTTP/WS commands)
+        self.tracked_target_id = None
+        self.tracked_heat_id = None
+        self.recording_active = False
         self.inference_proc = None
         self.inference_ctrl = None
         self.eo_det_q = None
@@ -338,6 +346,104 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
             _config_state[key].update(body or {})
         return {"ok": True, **_config_state.get(key, {})}
 
+    # ── Gimbal control endpoints ─────────────────────────────────────
+    @app.post("/api/gimbal/absolute")
+    async def gimbal_absolute(request: _Request):
+        body = await request.json()
+        if reg.v1_gimbal is None:
+            return {"ok": False, "error": "no gimbal manager"}
+        try:
+            pan = float(body.get("pan", 0.0))
+            tilt = float(body.get("tilt", 0.0))
+            reg.v1_gimbal.set_target_absolute(pan, tilt)
+            return {"ok": True, "pan": pan, "tilt": tilt}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    @app.post("/api/gimbal/home")
+    async def gimbal_home():
+        if reg.v1_gimbal is None:
+            return {"ok": False}
+        try:
+            reg.v1_gimbal.set_target_absolute(0.0, 0.0)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    # ── Track / heat-track lock ──────────────────────────────────────
+    @app.post("/api/track")
+    async def set_track(request: _Request):
+        body = await request.json()
+        tid = body.get("target_id")
+        reg.tracked_target_id = int(tid) if tid is not None else None
+        reg.tracked_heat_id = None  # heat lock superseded by fused lock
+        return {"ok": True, "tracked_target_id": reg.tracked_target_id}
+
+    @app.post("/api/heat_track")
+    async def set_heat_track(request: _Request):
+        body = await request.json()
+        hid = body.get("heat_id")
+        reg.tracked_heat_id = int(hid) if hid is not None else None
+        reg.tracked_target_id = None
+        return {"ok": True, "tracked_heat_id": reg.tracked_heat_id}
+
+    # ── Recording (v1's JSONLRecorder) ───────────────────────────────
+    @app.post("/api/recording/start")
+    async def recording_start():
+        if reg.v1_recorder is None:
+            return {"ok": False, "error": "no recorder"}
+        try:
+            reg.v1_recorder.start()
+            reg.recording_active = True
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    @app.post("/api/recording/stop")
+    async def recording_stop():
+        if reg.v1_recorder is None:
+            return {"ok": False}
+        try:
+            reg.v1_recorder.stop()
+            reg.recording_active = False
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    @app.get("/api/recording/state")
+    async def recording_state():
+        return {"recording": reg.recording_active}
+
+    # ── Extrinsic / illuminator / calibration stubs ──────────────────
+    @app.get("/api/extrinsic")
+    async def get_extrinsic():
+        if reg.v1_radar is None:
+            return {}
+        return {
+            "radar_az_bias_deg": float(getattr(reg.v1_radar, "az_bias_deg", 0.0)),
+            "radar_el_bias_deg": float(getattr(reg.v1_radar, "el_bias_deg", 0.0)),
+        }
+
+    @app.post("/api/extrinsic")
+    async def set_extrinsic(request: _Request):
+        body = await request.json()
+        if reg.v1_radar is None:
+            return {"ok": False}
+        if "radar_az_bias_deg" in body:
+            reg.v1_radar.az_bias_deg = float(body["radar_az_bias_deg"])
+        if "radar_el_bias_deg" in body:
+            reg.v1_radar.el_bias_deg = float(body["radar_el_bias_deg"])
+        return {"ok": True, **(await get_extrinsic())}
+
+    @app.post("/api/illuminator")
+    async def set_illuminator(request: _Request):
+        body = await request.json()
+        return {"ok": True, "state": body.get("state", "auto")}
+
+    @app.get("/api/devices/cameras")
+    async def list_cameras():
+        return {"cameras": []}  # stub — v1 enumerates V4L2 indices
+
     # ── v1-compatible WebSocket sender ─────────────────────────────────
     # Protocol mirrors gui/app.py exactly:
     #   • Shared "sensors" envelope at ws_fps Hz (text JSON).
@@ -409,6 +515,16 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                         thermal_desc, seq = reg.thermal_ring.latest()
                         if seq != last_thermal_seq: last_thermal_seq = seq
 
+                    # Pull v1 BUS objects (radar / gimbal) — present
+                    # when v1_managers spawned them.
+                    try:
+                        from seeker_v2 import v1_managers
+                        v1_radar    = v1_managers.bus_get_radar()
+                        v1_gimbal_s = v1_managers.bus_get_gimbal_state()
+                        v1_radar_aa = v1_managers.bus_get_radar_aa()
+                    except Exception:
+                        v1_radar = v1_gimbal_s = v1_radar_aa = None
+
                     msg = wire_v1.build_ws_message(
                         thermal_desc=thermal_desc,
                         thermal_jpeg_bytes=reg.last_thermal_jpeg or None,
@@ -416,10 +532,15 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                                             if thermal_desc else None),
                         eo_desc=eo_desc,
                         eo_dets=last_eo_dets,
+                        v1_radar_frame=v1_radar,
+                        v1_gimbal_state=v1_gimbal_s,
+                        v1_radar_aa_frame=v1_radar_aa,
                         radar_targets=last_radar_targets,
                         radar_last_frame_id=last_radar_frame_id,
                         radar_last_ts=last_radar_ts,
                         fused_tracks=last_fused,
+                        tracked_target_id=reg.tracked_target_id,
+                        tracked_heat_id=reg.tracked_heat_id,
                     )
                     text = _dumps(msg).decode("utf-8") if isinstance(_dumps(msg), bytes) else _dumps(msg)
 
@@ -538,11 +659,17 @@ def main(argv=None) -> int:
          reg.thermal_jpeg_q) = t_spawn(mp_ctx, thermal_cfg)
         log.info("thermal capture spawned (pid=%d)", reg.thermal_proc.pid)
 
-    if not args.no_radar:
-        from seeker_v2.processes.radar_capture import spawn as r_spawn
-        (reg.radar_proc, reg.radar_ctrl, reg.radar_targets_q,
-         reg.radar_stats) = r_spawn(mp_ctx, radar_cfg)
-        log.info("radar capture spawned (pid=%d)", reg.radar_proc.pid)
+    # Radar + Gimbal + Recorder: reuse v1's managers (in-process, threaded).
+    # They publish to v1's BUS singleton in *this* process; wire_v1
+    # reads from BUS to merge into the WS envelope.
+    try:
+        from seeker_v2 import v1_managers
+        if not args.no_radar:
+            reg.v1_radar = v1_managers.start_radar(args.config)
+        reg.v1_gimbal   = v1_managers.start_gimbal(args.config)
+        reg.v1_recorder = v1_managers.start_recorder(args.config)
+    except Exception:
+        log.exception("v1 manager start failed")
 
     # Attach consumer rings (main needs them to read frames into the WS payload).
     # Captures may take a few seconds to bring up shm (camera open + first frame),
