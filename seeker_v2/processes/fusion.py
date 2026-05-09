@@ -400,26 +400,31 @@ def run(cfg: FusionConfig, ctrl_q, eo_det_q, thermal_det_q,
             ]
 
             # ── Publish to fused_q ───────────────────────────────────
+            # Include the raw consumed inputs (radar_targets, eo_dets,
+            # thermal_dets) so main's WS handler can forward them to the
+            # GUI without contending with fusion on those queues. Fusion
+            # is the SOLE consumer of eo_det_q / thermal_det_q /
+            # radar_targets_q, and the GUI reads everything via fused_q.
+            envelope = {
+                "kind": "fused_tracks",
+                "fusion_frame_id": fusion_frame_id,
+                "ts": time.time(),
+                "tracks": confirmed,
+                "radar_targets": radar_targets,
+                "eo_dets": eo_dets,
+                "thermal_dets": thermal_dets,
+                "radar_frame_id": int(latest_fid) if radar_msgs else 0,
+                "n_radar_targets": len(radar_targets),
+                "n_eo_dets": len(eo_dets),
+                "n_thermal_dets": len(thermal_dets),
+            }
             try:
-                fused_q.put_nowait({
-                    "kind": "fused_tracks",
-                    "fusion_frame_id": fusion_frame_id,
-                    "ts": time.time(),
-                    "tracks": confirmed,
-                    "n_radar_targets": len(radar_targets),
-                    "n_eo_dets": len(eo_dets),
-                    "n_thermal_dets": len(thermal_dets),
-                })
+                fused_q.put_nowait(envelope)
             except Exception:
                 # Drop oldest, retry
                 try:
                     fused_q.get_nowait()
-                    fused_q.put_nowait({
-                        "kind": "fused_tracks",
-                        "fusion_frame_id": fusion_frame_id,
-                        "ts": time.time(),
-                        "tracks": confirmed,
-                    })
+                    fused_q.put_nowait(envelope)
                 except Exception:
                     pass
 

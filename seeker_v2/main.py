@@ -312,88 +312,165 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                 s[label] = last
         return s
 
-    # ── WebSocket sender ───────────────────────────────────────────────
-    # WebSocket is imported at the module top level so FastAPI's
-    # get_type_hints(handler) call can resolve the string annotation
-    # back to the class even with `from __future__ import annotations`.
+    # ── Stub HTTP endpoints used by the v1 GUI ────────────────────────
+    # The v1 frontend hits these on load + on user input; we return
+    # sensible defaults so the GUI doesn't error. State is held
+    # in-process and echoed back as the GUI expects.
+    _config_state = {
+        "thermal": {"available": True, "zoom_preset": "full",
+                    "min_area_px": 8, "tophat_kernel": 11, "mad_k": 6.0},
+        "heat_detector": {"available": True, "min_area_px": 8,
+                          "tophat_kernel": 11, "mad_k": 6.0},
+        "eo_exposure": {"available": True, "auto": True,
+                        "exposure_ext": 1264, "gain": 0},
+        "eo_lowlight": {"available": True, "enabled": False, "boost_db": 6.0},
+    }
+    from fastapi import Request as _Request  # local-only
+
+    @app.get("/api/config/{key}")
+    async def get_config(key: str):
+        return _config_state.get(key, {"available": False})
+
+    @app.post("/api/config/{key}")
+    async def post_config(key: str, request: _Request):
+        body = await request.json()
+        if key in _config_state:
+            _config_state[key].update(body or {})
+        return {"ok": True, **_config_state.get(key, {})}
+
+    # ── v1-compatible WebSocket sender ─────────────────────────────────
+    # Protocol mirrors gui/app.py exactly:
+    #   • Shared "sensors" envelope at ws_fps Hz (text JSON).
+    #   • Binary EO frames on every new EO frame:
+    #       [4-byte LE hdr_len][JSON header][JPEG bytes]
+    #   Both run as cooperating coroutines on the same WebSocket.
     @app.websocket("/ws/sensors")
     async def ws_sensors(ws: WebSocket):
-        log.info("WS handler entered (pre-accept)")
         try:
             await ws.accept()
         except Exception as e:
-            log.exception("ws.accept() raised: %r", e)
-            return
+            log.exception("ws.accept() failed: %r", e); return
         log.info("WS client connected")
+
+        from seeker_v2 import wire_v1
         period = 1.0 / float((cfg.get("gui", {}) or {}).get("ws_fps", 30))
+        eo_idle_poll_s = 0.005
 
-        last_eo_seq = 0
-        last_thermal_seq = 0
+        # Shared state held in closure (one per WS connection)
+        last_eo_seq = -1
+        last_thermal_seq = -1
         last_fused = []
-        try:
-            while True:
-                t_tick = time.monotonic()
+        last_radar_targets = []
+        last_radar_frame_id = 0
+        last_radar_ts = 0.0
+        last_eo_dets = []
+        last_thermal_dets = []
+        send_lock = asyncio.Lock()      # arbitrate text vs bytes sends
 
-                # ── Drain JPEG queues so /api/snapshot stays fresh ──
-                _drain_jpeg_queues()
+        # Drain producer queues into closure state. Called from both
+        # senders so neither sees stale data.
+        # NOTE: fusion is the SOLE consumer of eo_det_q / thermal_det_q
+        # / radar_targets_q. It re-publishes those payloads inside its
+        # fused_q envelope, so we only drain fused_q here. (See
+        # processes/fusion.py — envelope keys: tracks, radar_targets,
+        # eo_dets, thermal_dets, radar_frame_id.)
+        def _drain_all():
+            nonlocal last_fused, last_radar_targets
+            nonlocal last_radar_frame_id, last_radar_ts
+            nonlocal last_eo_dets, last_thermal_dets
 
-                # ── Build frame payload ─────────────────────────────
-                payload = {"ts": time.time()}
+            _drain_jpeg_queues()  # already updates reg.last_*_jpeg
 
-                if reg.eo_ring is not None:
-                    desc, seq = reg.eo_ring.latest()
-                    if desc is not None and seq != last_eo_seq:
-                        last_eo_seq = seq
-                        payload["eo_meta"] = {
-                            "frame_id": desc.frame_id,
-                            "w": desc.width, "h": desc.height,
-                        }
-
-                if reg.thermal_ring is not None:
-                    desc, seq = reg.thermal_ring.latest()
-                    if desc is not None and seq != last_thermal_seq:
-                        last_thermal_seq = seq
-                        payload["thermal_meta"] = {
-                            "frame_id": desc.frame_id,
-                            "w": desc.width, "h": desc.height,
-                            "heat_dets": (desc.meta.get("heat_dets")
-                                          or reg.last_thermal_heat),
-                        }
-                # Tell the client which JPEG IDs are current — frontend
-                # uses these to bust the snapshot cache without polling.
-                payload["snapshots"] = {
-                    "eo_id": reg.last_eo_jpeg_id,
-                    "thermal_id": reg.last_thermal_jpeg_id,
-                }
-
-                # Drain fused tracks queue
-                if reg.fused_q is not None:
-                    try:
-                        while True:
-                            msg = reg.fused_q.get_nowait()
-                            if msg is None:
-                                break
-                            last_fused = msg.get("tracks", [])
-                    except Exception:
-                        pass
-                payload["fused"] = last_fused
-
-                # Send
+            if reg.fused_q is not None:
                 try:
-                    t_send = time.monotonic()
-                    await ws.send_bytes(_dumps(payload))
-                    send_dt = time.monotonic() - t_send
-                    if send_dt > 0.080:
-                        # Yield event loop on slow send (Phase 1 fix #3)
-                        await asyncio.sleep(0.005)
-                except WebSocketDisconnect:
-                    raise
-                except Exception as e:
-                    log.warning("ws send failed: %r", e)
-                    break
+                    while True:
+                        msg = reg.fused_q.get_nowait()
+                        if msg is None: break
+                        last_fused          = msg.get("tracks", []) or []
+                        last_radar_targets  = msg.get("radar_targets", []) or []
+                        last_eo_dets        = msg.get("eo_dets", []) or []
+                        last_thermal_dets   = msg.get("thermal_dets", []) or []
+                        last_radar_frame_id = int(msg.get("radar_frame_id", 0))
+                        last_radar_ts       = float(msg.get("ts", 0.0))
+                except Exception: pass
 
-                elapsed = time.monotonic() - t_tick
-                await asyncio.sleep(max(0.0, period - elapsed))
+        async def shared_sender():
+            nonlocal last_eo_seq, last_thermal_seq
+            try:
+                while True:
+                    t0 = time.monotonic()
+                    _drain_all()
+
+                    eo_desc = None; thermal_desc = None
+                    if reg.eo_ring is not None:
+                        eo_desc, seq = reg.eo_ring.latest()
+                        if seq != last_eo_seq: last_eo_seq = seq
+                    if reg.thermal_ring is not None:
+                        thermal_desc, seq = reg.thermal_ring.latest()
+                        if seq != last_thermal_seq: last_thermal_seq = seq
+
+                    msg = wire_v1.build_ws_message(
+                        thermal_desc=thermal_desc,
+                        thermal_jpeg_bytes=reg.last_thermal_jpeg or None,
+                        thermal_heat_dets=(thermal_desc.meta.get("heat_dets")
+                                            if thermal_desc else None),
+                        eo_desc=eo_desc,
+                        eo_dets=last_eo_dets,
+                        radar_targets=last_radar_targets,
+                        radar_last_frame_id=last_radar_frame_id,
+                        radar_last_ts=last_radar_ts,
+                        fused_tracks=last_fused,
+                    )
+                    text = _dumps(msg).decode("utf-8") if isinstance(_dumps(msg), bytes) else _dumps(msg)
+
+                    async with send_lock:
+                        try:
+                            await ws.send_text(text)
+                        except WebSocketDisconnect: raise
+                        except Exception as e:
+                            log.warning("ws shared send failed: %r", e); return
+
+                    elapsed = time.monotonic() - t0
+                    await asyncio.sleep(max(0.0, period - elapsed))
+            except WebSocketDisconnect: return
+            except Exception:
+                log.exception("shared_sender died")
+
+        async def eo_binary_sender():
+            last_id = -1
+            try:
+                while True:
+                    _drain_jpeg_queues()
+                    fid = reg.last_eo_jpeg_id
+                    if fid <= last_id or not reg.last_eo_jpeg:
+                        await asyncio.sleep(eo_idle_poll_s); continue
+                    last_id = fid
+
+                    eo_desc = None
+                    if reg.eo_ring is not None:
+                        eo_desc, _ = reg.eo_ring.latest()
+
+                    hdr, jpeg_bytes = wire_v1.eo_to_wire_split(
+                        eo_desc, reg.last_eo_jpeg,
+                        eo_dets_v2=last_eo_dets,
+                    )
+                    payload = wire_v1.build_eo_binary_frame(hdr, jpeg_bytes)
+
+                    async with send_lock:
+                        try:
+                            await ws.send_bytes(payload)
+                        except WebSocketDisconnect: raise
+                        except Exception as e:
+                            log.warning("ws eo binary send failed: %r", e); return
+                    await asyncio.sleep(0.0)
+            except WebSocketDisconnect: return
+            except Exception:
+                log.exception("eo_binary_sender died")
+
+        # Run both senders cooperatively; whichever finishes first
+        # cancels the other.
+        try:
+            await asyncio.gather(shared_sender(), eo_binary_sender())
         except WebSocketDisconnect:
             log.info("WS client disconnected")
         except Exception:
