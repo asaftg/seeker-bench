@@ -131,17 +131,26 @@ def thermal_to_wire(
                 if jpeg_bytes else None)
 
     raw_dets = heat_dets_v2 or (desc.meta or {}).get("heat_dets") or []
-    det_list = []
-    for d in raw_dets:
-        det_list.append({
+    # v1 has TWO separate concepts on thermal:
+    #   detections   = raw YOLO H/V detections (run sparsely, e.g. 1/4 frames)
+    #   heat_tracks  = tophat blob tracks (run every frame, drives the live
+    #                  yellow boxes the operator sees moving in real time)
+    # V2's tophat output (stored in desc.meta["heat_dets"]) maps to v1's
+    # heat_tracks shape, NOT detections. The GUI's thermal overlay (see
+    # gui/static/js/overlays.js drawHeatTracks) reads from heat_tracks.
+    det_list = []      # YOLO H/V dets — populated by inference, separate path
+    heat_tracks = []
+    for i, d in enumerate(raw_dets):
+        heat_tracks.append({
+            "id": int(d.get("id", i)),
             "bbox": {"x": int(d.get("x", 0)), "y": int(d.get("y", 0)),
                      "w": int(d.get("w", 0)), "h": int(d.get("h", 0))},
-            "area_px": int(d.get("area", 0)),
-            "contrast": round(float(d.get("peak", 0)), 1),
-            "classification": None,
+            "hits":      int(d.get("hits", 1)),
+            "misses":    int(d.get("misses", 0)),
+            "age":       int(d.get("age", 1)),
+            "confirmed": True,
+            "coasting":  False,
             "synthetic": False,
-            "track_id": None,
-            "fused_id": None,
         })
 
     return {
@@ -155,7 +164,7 @@ def thermal_to_wire(
         "vfov_deg": vfov_deg,
         "zoom_preset": zoom_preset,
         "detections": det_list,
-        "heat_tracks": [],
+        "heat_tracks": heat_tracks,
     }
 
 
