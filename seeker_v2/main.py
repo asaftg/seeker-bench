@@ -45,7 +45,7 @@ import numpy as np
 # annotation (a string under `from __future__ import annotations`)
 # resolves to None, FastAPI treats the param as a missing dependency,
 # and every WS upgrade returns HTTP 403.
-from fastapi import WebSocket  # noqa: E402
+from fastapi import WebSocket, Request as _Request  # noqa: E402
 
 log = logging.getLogger("seeker_v2.main")
 
@@ -333,8 +333,6 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                         "exposure_ext": 1264, "gain": 0},
         "eo_lowlight": {"available": True, "enabled": False, "boost_db": 6.0},
     }
-    from fastapi import Request as _Request  # local-only
-
     @app.get("/api/config/{key}")
     async def get_config(key: str):
         return _config_state.get(key, {"available": False})
