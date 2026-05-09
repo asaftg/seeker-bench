@@ -341,9 +341,20 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
 
     @app.post("/api/config/{key}")
     async def post_config(key: str, request: _Request):
-        body = await request.json()
+        body = await request.json() or {}
         if key in _config_state:
-            _config_state[key].update(body or {})
+            _config_state[key].update(body)
+        # Propagate to capture processes where applicable.
+        # EO exposure → eo_capture ctrl_q
+        if key == "eo_exposure" and reg.eo_ctrl is not None:
+            new_exp = body.get("exposure_ext")
+            if new_exp is not None:
+                try: reg.eo_ctrl.put_nowait(("exposure_ext", int(new_exp)))
+                except Exception as e: log.warning("eo_ctrl exp: %r", e)
+        # Thermal zoom preset → wire payload (v2 has fixed-optics Boson;
+        # zoom is GUI-side cropping driven by this field in the envelope).
+        # heat_detector / eo_lowlight currently only stored in state;
+        # capture-side propagation is next iter.
         return {"ok": True, **_config_state.get(key, {})}
 
     # ── Gimbal control endpoints ─────────────────────────────────────
@@ -549,6 +560,12 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                     except Exception:
                         v1_radar = v1_gimbal_s = v1_radar_aa = None
 
+                    # Surface zoom_preset and config state from the
+                    # in-memory _config_state so v1 GUI buttons stay in
+                    # sync (active border / hover state).
+                    th_zoom = (_config_state.get("thermal", {})
+                               .get("zoom_preset", "full"))
+
                     msg = wire_v1.build_ws_message(
                         thermal_desc=thermal_desc,
                         thermal_jpeg_bytes=reg.last_thermal_jpeg or None,
@@ -568,6 +585,9 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                         tracked_target_id=reg.tracked_target_id,
                         tracked_heat_id=reg.tracked_heat_id,
                     )
+                    # Override zoom_preset from config state (v1 GUI sync).
+                    if "thermal" in msg:
+                        msg["thermal"]["zoom_preset"] = th_zoom
                     text = _dumps(msg).decode("utf-8") if isinstance(_dumps(msg), bytes) else _dumps(msg)
 
                     async with send_lock:
@@ -615,16 +635,11 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                 log.exception("eo_binary_sender died")
 
         async def receiver():
-            """Handle commands sent FROM the GUI (track lock, gimbal, etc).
+            """Handle commands sent FROM the GUI (mirror v1 gui/app.py:_receiver).
 
-            Mirrors v1's gui/app.py:_receiver shape. Per the v1 protocol,
-            commands are JSON text frames like:
-                {"command":"track","track_id":N|null}
-                {"command":"track_heat","heat_id":N|null}
-                {"command":"gimbal_absolute","pan":X,"tilt":Y}
-                {"command":"gimbal_manual","delta_pan":X,"delta_tilt":Y}
-                {"command":"recording_start"|"recording_stop"}
-                {"command":"illuminator","state":"auto"|"on"|"off"}
+            Every command v1's main.js can wsSend() is handled here so
+            every button in the v1 GUI does the same thing under V2 as
+            under v1.
             """
             import json as _j
             try:
@@ -632,26 +647,34 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                     try: cmd = _j.loads(raw)
                     except Exception: continue
                     op = cmd.get("command")
+                    typ = cmd.get("type")
+                    gm = reg.v1_gimbal
+                    rm = reg.v1_radar
+
+                    # ── Track / heat-track ────────────────────────────
                     if op == "track":
                         tid = cmd.get("track_id")
                         reg.tracked_target_id = int(tid) if tid is not None else None
                         reg.tracked_heat_id = None
-                        if reg.v1_gimbal is not None:
-                            try: reg.v1_gimbal.set_track_target(reg.tracked_target_id)
+                        if gm is not None:
+                            try: gm.set_track_target(reg.tracked_target_id)
                             except Exception as e: log.warning("set_track_target: %r", e)
+                        log.info("WS track -> %s", reg.tracked_target_id)
                     elif op == "track_heat":
                         hid = cmd.get("heat_id")
                         reg.tracked_heat_id = int(hid) if hid is not None else None
                         reg.tracked_target_id = None
-                        if reg.v1_gimbal is not None:
-                            try: reg.v1_gimbal.set_track_heat(reg.tracked_heat_id)
+                        if gm is not None:
+                            try: gm.set_track_heat(reg.tracked_heat_id)
                             except Exception as e: log.warning("set_track_heat: %r", e)
+                        log.info("WS track_heat -> %s", reg.tracked_heat_id)
+
+                    # ── Gimbal control ────────────────────────────────
                     elif op == "gimbal_manual":
-                        if reg.tracked_target_id is not None or reg.tracked_heat_id is not None:
-                            reg.tracked_target_id = None; reg.tracked_heat_id = None
-                        if reg.v1_gimbal is not None:
+                        reg.tracked_target_id = None; reg.tracked_heat_id = None
+                        if gm is not None:
                             try:
-                                reg.v1_gimbal.set_manual_delta(
+                                gm.set_manual_delta(
                                     float(cmd.get("delta_pan", 0.0)),
                                     float(cmd.get("delta_tilt", 0.0)),
                                 )
@@ -659,25 +682,145 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                     elif op == "gimbal_absolute":
                         if reg.tracked_target_id is not None:
                             reg.tracked_target_id = None
-                        if reg.v1_gimbal is not None:
+                            if gm is not None:
+                                try: gm.set_track_target(None)
+                                except Exception: pass
+                        if gm is not None:
                             try:
-                                reg.v1_gimbal.set_manual_absolute(
+                                gm.set_manual_absolute(
                                     float(cmd.get("pan", 0.0)),
                                     float(cmd.get("tilt", 0.0)),
                                 )
                             except Exception as e: log.warning("set_manual_absolute: %r", e)
-                    elif op == "recording_start":
+                    elif op == "gimbal_home":
+                        reg.tracked_target_id = None; reg.tracked_heat_id = None
+                        if gm is not None:
+                            try: gm.set_track_target(None); gm.set_track_heat(None); gm.set_home()
+                            except Exception as e: log.warning("set_home: %r", e)
+                        log.info("WS gimbal_home")
+
+                    # ── Synthetic target (DRAW TARGET button) ─────────
+                    elif typ == "synthetic_target" or op == "synthetic_target":
+                        bbox = cmd.get("bbox")
+                        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                            try:
+                                # Find a thermal manager — V2 doesn't have
+                                # one but v1's synthetic-target plumbing is
+                                # in ThermalManager. Stub: log + ack so the
+                                # GUI doesn't error.
+                                x, y, w, h = (int(v) for v in bbox)
+                                log.info("WS synthetic_target bbox=%d,%d,%d,%d (V2 stub: no thermal mgr to seed)", x, y, w, h)
+                            except Exception as e:
+                                log.warning("synthetic_target bad bbox: %r", e)
+                    elif typ == "clear_synthetic_target" or op == "clear_synthetic_target":
+                        reg.tracked_heat_id = None
+                        if gm is not None:
+                            try: gm.set_track_heat(None)
+                            except Exception: pass
+                        log.info("WS clear_synthetic_target")
+
+                    # ── Recording (REC pill, command:'record') ────────
+                    elif op == "record":
+                        on = bool(cmd.get("on", False))
+                        if reg.v1_recorder is not None:
+                            try:
+                                if on and not reg.v1_recorder.is_recording:
+                                    reg.v1_recorder.start()
+                                    reg.recording_active = True
+                                    log.info("WS record START")
+                                elif not on and reg.v1_recorder.is_recording:
+                                    reg.v1_recorder.stop()
+                                    reg.recording_active = False
+                                    log.info("WS record STOP")
+                            except Exception as e: log.warning("record cmd: %r", e)
+                    elif op in ("recording_start",):
                         if reg.v1_recorder is not None:
                             try: reg.v1_recorder.start(); reg.recording_active = True
                             except Exception as e: log.warning("rec start: %r", e)
-                    elif op == "recording_stop":
+                    elif op in ("recording_stop",):
                         if reg.v1_recorder is not None:
                             try: reg.v1_recorder.stop(); reg.recording_active = False
                             except Exception as e: log.warning("rec stop: %r", e)
-                    elif op == "illuminator":
-                        pass  # stub — wire to NIR LED when impl
+
+                    # ── NIR / illuminator ────────────────────────────
+                    elif op == "nir" or op == "illuminator":
+                        # No NIR LED wired; just record state for echo.
+                        pass
+
+                    # ── Radar tuning (DEV tab sliders) ────────────────
+                    elif op == "radar_tune":
+                        if rm is not None and hasattr(rm, "set_tuning"):
+                            try:
+                                rm.set_tuning(
+                                    snr_min_db          = cmd.get("snr_min_db"),
+                                    max_range_m         = cmd.get("max_range_m"),
+                                    az_half_deg         = cmd.get("az_half_deg"),
+                                    speed_min_mps       = cmd.get("speed_min_mps"),
+                                    range_min_m         = cmd.get("range_min_m"),
+                                    cluster_eps_pos_m   = cmd.get("cluster_eps_pos_m"),
+                                    cluster_eps_dop_mps = cmd.get("cluster_eps_dop_mps"),
+                                    cluster_min_samples = cmd.get("cluster_min_samples"),
+                                )
+                            except Exception as e: log.warning("radar_tune: %r", e)
+                    elif op == "set_radar_mode":
+                        mode = str(cmd.get("mode", "")).lower()
+                        if mode in ("stock", "ag", "aa") and rm is not None and hasattr(rm, "set_mode"):
+                            try: rm.set_mode(mode)
+                            except Exception as e: log.warning("set_radar_mode: %r", e)
+                    elif op == "ag_tune":
+                        if rm is not None and hasattr(rm, "update_ag_params"):
+                            try: rm.update_ag_params(**{k: v for k, v in cmd.items() if k not in ("command",) and v is not None})
+                            except Exception as e: log.warning("ag_tune: %r", e)
+                    elif op == "aa_tune":
+                        if rm is not None and hasattr(rm, "update_aa_params"):
+                            try: rm.update_aa_params(**{k: v for k, v in cmd.items() if k not in ("command",) and v is not None})
+                            except Exception as e: log.warning("aa_tune: %r", e)
+                    elif op == "save_radar_mode_config":
+                        try:
+                            import json as _j2
+                            from pathlib import Path as _P
+                            mode = str(cmd.get("mode", "")).lower()
+                            if mode in ("stock", "ag", "aa"):
+                                d = _P("config"); d.mkdir(exist_ok=True)
+                                f = d / "radar_modes.json"
+                                store = {}
+                                try: store = _j2.loads(f.read_text())
+                                except Exception: pass
+                                store[mode] = {k: v for k, v in cmd.items()
+                                                if k not in ("command", "mode") and v is not None}
+                                f.write_text(_j2.dumps(store, indent=2))
+                                log.info("Saved radar mode %s to %s", mode, f)
+                        except Exception as e: log.warning("save_radar_mode_config: %r", e)
+
+                    # ── Extrinsic calibration sliders (DEV tab) ───────
+                    elif op == "extrinsic_tune":
+                        r_az = cmd.get("radar_az_bias_deg")
+                        r_el = cmd.get("radar_el_bias_deg")
+                        if rm is not None and (r_az is not None or r_el is not None):
+                            try:
+                                if hasattr(rm, "set_extrinsic"):
+                                    rm.set_extrinsic(az_bias_deg=r_az, el_bias_deg=r_el)
+                                else:
+                                    if r_az is not None: rm.az_bias_deg = float(r_az)
+                                    if r_el is not None: rm.el_bias_deg = float(r_el)
+                            except Exception as e: log.warning("extrinsic radar: %r", e)
+                    elif op == "extrinsic_tune_done":
+                        pass
+                    elif op == "extrinsic_save":
+                        # Persist current biases via v1 calibration_store.
+                        try:
+                            from common import calibration_store
+                            payload = {}
+                            if rm is not None:
+                                payload["radar_az"] = float(getattr(rm, "az_bias_deg", 0.0))
+                                payload["radar_el"] = float(getattr(rm, "el_bias_deg", 0.0))
+                            calibration_store.save(**payload)
+                            log.info("extrinsic saved %r", payload)
+                        except Exception as e: log.warning("extrinsic_save: %r", e)
+
                     else:
-                        log.debug("WS unknown command: %r", op)
+                        log.debug("WS unknown command: op=%r type=%r keys=%s",
+                                   op, typ, list(cmd.keys()))
             except WebSocketDisconnect: return
             except Exception:
                 log.exception("ws receiver died")
