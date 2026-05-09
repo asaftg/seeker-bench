@@ -146,16 +146,60 @@ def run(cfg: EOCaptureConfig, ctrl_q, stats_q, jpeg_q=None) -> int:
             log.error("EO V4L2 open failed on %s", cfg.dev_path)
             return 1
 
-        # Trigger-disable + initial exposure (handled inside open() for our backend)
-        log.info("EO capture: open OK, beginning frame loop")
+        log.info("EO capture: open OK; running exposure probe ladder")
 
         frame_id = 0
         last_stats_emit = time.monotonic()
+
+        # ── Exposure probe ladder ─────────────────────────────────────
+        # IMX568+FX3 firmware: exposure_ext response is non-monotonic
+        # and scene-dependent. Rather than pretend an AE loop can
+        # converge on it, walk a known-safe ladder, capture a frame,
+        # decode mean+p99, and pick the value that gives a usable image.
+        def _probe_one(exp_val):
+            try:
+                backend.set_exposure_ext(int(exp_val))
+            except AttributeError:
+                return None
+            time.sleep(0.5)
+            # Drain stale buffers so the next grab reflects the new exposure
+            for _ in range(4):
+                _ = backend.grab()
+                if _ is None: time.sleep(0.05)
+            bgr = backend.grab()
+            if bgr is None: return None
+            import numpy as _np
+            mean = float(bgr.mean())
+            p99  = float(_np.percentile(bgr, 99))
+            return mean, p99
+
         ae_chosen_ext = cfg.initial_exposure_ext
+        best_score = float("inf"); best_exp = ae_chosen_ext
+        log.info("EO probe ladder: %s", list(cfg.ae_probe_values))
+        for exp in cfg.ae_probe_values:
+            r = _probe_one(exp)
+            if r is None:
+                log.info("  exp=%d: NO FRAME", exp); continue
+            mean, p99 = r
+            # Reject: too dark (mean < 20) or too saturated (mean > 240 or p99 > 254)
+            usable = 20 <= mean <= 240 and p99 < 254
+            # Score: distance from "ideal" mean of 100
+            score = abs(mean - 100) if usable else 9999
+            log.info("  exp=%d: mean=%.0f p99=%.0f usable=%s score=%.0f",
+                     exp, mean, p99, usable, score)
+            if score < best_score:
+                best_score = score; best_exp = exp
+
+        ae_chosen_ext = best_exp
+        log.info("EO probe ladder picked exp=%d (score=%.0f); locking", ae_chosen_ext, best_score)
         try:
             backend.set_exposure_ext(ae_chosen_ext)
         except AttributeError:
             pass
+        time.sleep(0.5)
+        # Drain
+        for _ in range(8):
+            _ = backend.grab()
 
         # Stats trickle to main every ~1s
         STATS_PERIOD = 1.0
