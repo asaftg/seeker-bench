@@ -68,15 +68,23 @@ class EOCaptureConfig:
     height: int = NATIVE_H
     shm_name: str = "seeker_eo_bgr"
     n_slots: int = 4
-    # IMX568+FX3 firmware quirk: exposure_ext < ~32 puts the FX3 into
-    # an invalid range and it reports stale 0xFF buffers (looks like
-    # full saturation to AGC -> display goes black). Empirically,
-    # exposure_ext=32 in our garage daylight gives mean=375/4095 and
-    # p99=810/4095 — clean image. Probed with /tmp/probe_exp.py.
-    # Valid range tested: 32..~200.
-    initial_exposure_ext: int = 32
-    ae_min_exposure_ext: int = 32       # never clamp below the FX3 floor
-    ae_max_exposure_ext: int = 4000     # broad upper bound; cap further if AGC saturates
+    # IMX568+FX3 firmware quirk: the response of exposure_ext to
+    # actual sensor brightness is HIGHLY non-monotonic and scene-
+    # dependent. Probed values that gave clean frames (mean=375,
+    # p99=810) varied between exp=16 and exp=32 across two probes
+    # 30 s apart in the same garage scene. v1's AE walks exposure
+    # geometrically and gets stuck on any value that returns the
+    # all-FF "saturated" signature, mistaking it for real sensor
+    # saturation.
+    # Default to a probe-ladder AE (see _ae_probe_ladder below) that
+    # tries known-safe exposure values and picks the one with valid
+    # frame stats. Initial value is just a starting point.
+    initial_exposure_ext: int = 16
+    ae_probe_values: tuple = (4, 8, 16, 32, 48, 64, 96, 128)
+    ae_recheck_every_n_frames: int = 600   # ~30 s @ 20 Hz; re-probe to track light changes
+    target_mean_lo: float = 100.0          # if mean < lo, exposure too low
+    target_mean_hi: float = 2500.0         # if mean > hi, exposure too high
+    target_p99_max: float = 3800.0         # if p99 above this, saturated
     target_p99_lo: float = 300.0
     target_p99_hi: float = 3500.0
     # Phase 2.5: GUI snapshot stream
