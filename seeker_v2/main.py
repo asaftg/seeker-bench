@@ -355,7 +355,7 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
         try:
             pan = float(body.get("pan", 0.0))
             tilt = float(body.get("tilt", 0.0))
-            reg.v1_gimbal.set_target_absolute(pan, tilt)
+            reg.v1_gimbal.set_manual_absolute(pan, tilt)
             return {"ok": True, "pan": pan, "tilt": tilt}
         except Exception as e:
             return {"ok": False, "error": repr(e)}
@@ -365,7 +365,7 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
         if reg.v1_gimbal is None:
             return {"ok": False}
         try:
-            reg.v1_gimbal.set_target_absolute(0.0, 0.0)
+            reg.v1_gimbal.set_home()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": repr(e)}
@@ -635,11 +635,11 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                             reg.tracked_target_id = None
                         if reg.v1_gimbal is not None:
                             try:
-                                reg.v1_gimbal.set_target_absolute(
+                                reg.v1_gimbal.set_manual_absolute(
                                     float(cmd.get("pan", 0.0)),
                                     float(cmd.get("tilt", 0.0)),
                                 )
-                            except Exception as e: log.warning("set_target_absolute: %r", e)
+                            except Exception as e: log.warning("set_manual_absolute: %r", e)
                     elif op == "recording_start":
                         if reg.v1_recorder is not None:
                             try: reg.v1_recorder.start(); reg.recording_active = True
