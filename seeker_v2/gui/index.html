@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>seeker_v2</title>
+    <link rel="stylesheet" href="/static/css/main_v2.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="logo">seeker_v2</div>
+        <div class="metrics">
+            <span class="metric"><label>EO</label><span id="eo-fps">--</span> Hz</span>
+            <span class="metric"><label>Thermal</label><span id="thermal-fps">--</span> Hz</span>
+            <span class="metric"><label>Radar</label><span id="radar-fps">--</span> Hz</span>
+            <span class="metric"><label>Inf</label><span id="inf-fps">--</span> Hz</span>
+            <span class="metric"><label>WS</label><span id="ws-state">offline</span></span>
+        </div>
+    </header>
+
+    <main class="grid">
+        <section class="panel" id="panel-eo">
+            <h2>EO</h2>
+            <div class="stage">
+                <img id="eo-img" alt="EO">
+                <canvas id="eo-overlay"></canvas>
+            </div>
+        </section>
+
+        <section class="panel" id="panel-thermal">
+            <h2>Thermal</h2>
+            <div class="stage">
+                <img id="thermal-img" alt="Thermal">
+                <canvas id="thermal-overlay"></canvas>
+            </div>
+        </section>
+
+        <section class="panel" id="panel-tracks">
+            <h2>Fused tracks</h2>
+            <div id="tracks-list"></div>
+        </section>
+    </main>
+
+    <script src="/static/js/main_v2.js"></script>
+</body>
+</html>

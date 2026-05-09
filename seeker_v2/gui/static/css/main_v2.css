@@ -1,0 +1,79 @@
+/* seeker_v2 GUI — minimal dark UI optimized for the bench */
+:root {
+    --bg: #0c0c0e;
+    --panel: #16161a;
+    --line: #2a2a30;
+    --fg: #e8e8ea;
+    --accent: #6cf;
+    --warn: #f6c560;
+    --bad: #e8556d;
+    --good: #6ce085;
+}
+* { box-sizing: border-box; }
+html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+    height: 100%; overflow: hidden;
+}
+.topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+}
+.logo {
+    font-weight: 700; letter-spacing: 0.05em; color: var(--accent);
+    font-size: 18px;
+}
+.metrics {
+    display: flex; gap: 14px; font-size: 12px;
+}
+.metrics .metric { display: flex; gap: 6px; align-items: baseline; }
+.metrics label { color: #888; text-transform: uppercase; font-size: 10px; }
+.metrics span#ws-state.online { color: var(--good); }
+.metrics span#ws-state.offline { color: var(--bad); }
+
+.grid {
+    display: grid;
+    grid-template-columns: 1.5fr 1fr 0.6fr;
+    grid-template-rows: 1fr;
+    gap: 8px; padding: 8px;
+    height: calc(100vh - 50px);
+}
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+}
+.panel h2 {
+    margin: 0; padding: 6px 10px;
+    font-size: 12px; color: #aaa;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    border-bottom: 1px solid var(--line);
+    background: #0e0e11;
+}
+.stage {
+    position: relative; flex: 1; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    background: #000;
+}
+.stage img, .stage canvas {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    object-fit: contain;
+}
+.stage canvas { pointer-events: none; }
+
+#tracks-list { padding: 8px; font-size: 11px; overflow-y: auto; }
+.track {
+    border: 1px solid var(--line);
+    padding: 4px 6px; margin-bottom: 4px;
+    border-radius: 3px;
+    display: grid; grid-template-columns: auto 1fr auto;
+    gap: 8px; align-items: center;
+}
+.track .tid { color: var(--accent); font-weight: 700; }
+.track .cls { color: var(--good); }
+.track.cls-vehicle .cls { color: var(--warn); }
+.track .age { color: #888; font-size: 10px; }
