@@ -552,8 +552,10 @@ def _build_fastapi_app(reg: ProcReg, cfg: dict):
                     msg = wire_v1.build_ws_message(
                         thermal_desc=thermal_desc,
                         thermal_jpeg_bytes=reg.last_thermal_jpeg or None,
-                        thermal_heat_dets=(thermal_desc.meta.get("heat_dets")
-                                            if thermal_desc else None),
+                        # heat_dets ride the jpeg queue (see thermal_capture:
+                        # jpeg_q.put((fid, bytes, heat_dets))); the FrameRing
+                        # atomic publish only carries fixed fields, not meta.
+                        thermal_heat_dets=reg.last_thermal_heat,
                         eo_desc=eo_desc,
                         eo_dets=last_eo_dets,
                         v1_radar_frame=v1_radar,
