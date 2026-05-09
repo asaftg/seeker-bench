@@ -54,7 +54,8 @@ def _try_load_nvjpeg(quality: int):
 
 @dataclass
 class ThermalCaptureConfig:
-    dev_path: str = "/dev/video2"  # may need auto-probe
+    # Stable udev symlink (always points at the Boson capture node)
+    dev_path: str = "/dev/seeker_thermal_v"
     width: int = 640
     height: int = 512
     target_fps: int = 60
@@ -74,10 +75,18 @@ class ThermalCaptureConfig:
 
 
 def _open_boson(cfg: ThermalCaptureConfig):
+    """Open the Boson via V4L2.
+
+    OpenCV's CAP_V4L2 backend doesn't always follow udev symlinks
+    cleanly; pass the realpath (e.g. /dev/video5) to be safe.
+    """
     import cv2
-    cap = cv2.VideoCapture(cfg.dev_path, cv2.CAP_V4L2)
+    import os
+    real_path = os.path.realpath(cfg.dev_path)
+    log.info("Boson opening %s (realpath: %s)", cfg.dev_path, real_path)
+    cap = cv2.VideoCapture(real_path, cv2.CAP_V4L2)
     if not cap.isOpened():
-        log.error("Boson open failed at %s", cfg.dev_path)
+        log.error("Boson open failed at %s (realpath %s)", cfg.dev_path, real_path)
         return None
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)

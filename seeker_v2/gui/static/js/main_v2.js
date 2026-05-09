@@ -1,88 +1,51 @@
-/*
- * seeker_v2 GUI — RAF-driven render loop
- * =======================================================================
- *
- * Phase 2.5 of the rewrite. Goal: decouple WebSocket message arrival
- * from canvas painting so a momentary WS burst doesn't pile up paints
- * inside the requestAnimationFrame queue. v1's frontend repainted on
- * every onmessage which caused per-tab CPU spikes whenever the backend
- * batch-emitted, and worse, dropped the GPU into low-power state when
- * the browser fell behind.
- *
- * Architecture:
- *
- *   onmessage (WS) ──► state.latest = parsed_payload  (constant time)
- *   img.onload      ──► state.eoBitmap / thermalBitmap = new ImageBitmap
- *
- *                      state          (single source of truth)
- *                        ▲
- *                        │
- *   requestAnimationFrame  ──► reads state, repaints DOM/canvas
- *
- * The image fetch path uses one in-flight Image() per stream. When the
- * WS tells us there's a new snapshot id, we kick off a new fetch; the
- * onload swap is atomic. If the fetch is slower than the WS, we just
- * skip ids — the latest always wins.
- */
-
+/* seeker_v2 GUI — RAF-driven render loop, v1-style layout. */
 (() => {
     'use strict';
 
-    // ── State ─────────────────────────────────────────────────────────
     const state = {
         ws: null,
         wsConnected: false,
-        latest: null,        // last parsed WS payload
-        // snapshot ids we've requested (so we don't refetch the same id)
+        latest: null,
         eoFetchedId: -1,
         thermalFetchedId: -1,
-        // FPS rolling counters (per stream)
-        fps: {
-            eo: new RollingFps(),
-            thermal: new RollingFps(),
-            radar: new RollingFps(),
-            inf: new RollingFps(),
-        },
-        // Stats from /api/status (refreshed every 2s)
+        fps: { eo: rfps(), thermal: rfps() },
         stats: {},
     };
-
-    function RollingFps(windowSec = 2.0) {
-        this.windowSec = windowSec;
-        this.t = [];
+    function rfps(win = 2.0) {
+        const o = { win, t: [] };
+        o.tick = () => {
+            const n = performance.now() / 1000; o.t.push(n);
+            const cut = n - o.win;
+            while (o.t.length && o.t[0] < cut) o.t.shift();
+        };
+        o.value = () => o.t.length / o.win;
+        return o;
     }
-    RollingFps.prototype.tick = function () {
-        const now = performance.now() / 1000;
-        this.t.push(now);
-        const cutoff = now - this.windowSec;
-        while (this.t.length && this.t[0] < cutoff) this.t.shift();
-    };
-    RollingFps.prototype.value = function () {
-        return this.t.length / this.windowSec;
-    };
 
-    // ── DOM refs ──────────────────────────────────────────────────────
-    const dom = {
-        eoImg: document.getElementById('eo-img'),
-        thermalImg: document.getElementById('thermal-img'),
-        eoCanvas: document.getElementById('eo-overlay'),
-        thermalCanvas: document.getElementById('thermal-overlay'),
-        tracksList: document.getElementById('tracks-list'),
-        eoFps: document.getElementById('eo-fps'),
-        thermalFps: document.getElementById('thermal-fps'),
-        radarFps: document.getElementById('radar-fps'),
-        infFps: document.getElementById('inf-fps'),
-        wsState: document.getElementById('ws-state'),
-    };
+    const dom = {};
+    [
+        'eo-img', 'thermal-img', 'eo-overlay', 'thermal-overlay',
+        'tracks-list', 'eo-hz', 'thermal-hz', 'radar-hz', 'ws-state',
+        'pill-thermal', 'pill-eo', 'pill-radar', 'pill-gimbal', 'pill-rec',
+        'pan-val', 'tilt-val', 'pan-slider', 'tilt-slider', 'home-btn',
+        'radar-polar',
+        'dev-eo', 'dev-thermal', 'dev-radar', 'dev-inference', 'dev-fusion', 'dev-ws',
+    ].forEach(id => dom[id.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = document.getElementById(id));
 
-    // ── WebSocket ─────────────────────────────────────────────────────
+    // ── Tabs ────────────────────────────────────────────────────────
+    document.querySelectorAll('.tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const target = btn.dataset.tab;
+            document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b === btn));
+            document.querySelectorAll('.page').forEach(p => p.classList.toggle('hidden', p.dataset.page !== target));
+        });
+    });
+
+    // ── WebSocket ───────────────────────────────────────────────────
     function connectWS() {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = `${proto}//${location.host}/ws/sensors`;
-        console.log('[ws] connecting', url);
-        const ws = new WebSocket(url);
+        const ws = new WebSocket(`${proto}//${location.host}/ws/sensors`);
         ws.binaryType = 'arraybuffer';
-
         ws.onopen = () => {
             state.wsConnected = true;
             dom.wsState.textContent = 'online';
@@ -92,189 +55,205 @@
             state.wsConnected = false;
             dom.wsState.textContent = 'offline';
             dom.wsState.className = 'offline';
-            // Reconnect with backoff.
             setTimeout(connectWS, 1000);
         };
-        ws.onerror = (e) => console.warn('[ws] error', e);
-
-        ws.onmessage = (ev) => {
-            // Hot path: parse payload, stash, return. NO painting.
+        ws.onerror = e => console.warn('[ws] error', e);
+        ws.onmessage = ev => {
             try {
-                let payload;
-                if (typeof ev.data === 'string') {
-                    payload = JSON.parse(ev.data);
-                } else {
-                    payload = JSON.parse(new TextDecoder().decode(ev.data));
-                }
-                state.latest = payload;
-            } catch (e) {
-                console.warn('[ws] parse failed', e);
-            }
+                const txt = (typeof ev.data === 'string')
+                    ? ev.data : new TextDecoder().decode(ev.data);
+                state.latest = JSON.parse(txt);
+            } catch (e) { console.warn('[ws] parse', e); }
         };
-
         state.ws = ws;
     }
 
-    // ── Image streaming ────────────────────────────────────────────────
-    // Two-buffer pattern: img.src points at /api/snapshot/<sensor>.jpg?
-    // ID bust. We let the browser network stack handle the actual GET;
-    // RAF only checks whether to start a new request.
-    function maybeFetchEo() {
-        if (!state.latest) return;
-        const snaps = state.latest.snapshots;
+    // ── Image streaming ──────────────────────────────────────────────
+    function maybeFetch(sensor, imgEl, key) {
+        const snaps = state.latest && state.latest.snapshots;
         if (!snaps) return;
-        const id = snaps.eo_id ?? -1;
-        if (id < 0 || id === state.eoFetchedId) return;
-        state.eoFetchedId = id;
-        // Cache-bust on the id, not on a timestamp — browsers will
-        // dedupe identical URLs and skip refetching.
-        dom.eoImg.src = `/api/snapshot/eo.jpg?id=${id}`;
+        const id = snaps[key] ?? -1;
+        const stKey = sensor + 'FetchedId';
+        if (id < 0 || id === state[stKey]) return;
+        state[stKey] = id;
+        imgEl.src = `/api/snapshot/${sensor}.jpg?id=${id}`;
     }
-    function maybeFetchThermal() {
-        if (!state.latest) return;
-        const snaps = state.latest.snapshots;
-        if (!snaps) return;
-        const id = snaps.thermal_id ?? -1;
-        if (id < 0 || id === state.thermalFetchedId) return;
-        state.thermalFetchedId = id;
-        dom.thermalImg.src = `/api/snapshot/thermal.jpg?id=${id}`;
-    }
-
-    // Track image load ticks for FPS (img.onload fires once per fetch)
-    dom.eoImg.addEventListener('load', () => state.fps.eo.tick());
+    dom.eoImg.addEventListener('load',      () => state.fps.eo.tick());
     dom.thermalImg.addEventListener('load', () => state.fps.thermal.tick());
 
-    // ── Overlay drawing ──────────────────────────────────────────────
-    function drawOverlay(canvas, w, h, drawFn) {
-        // Resize to backing-store ratio for crispness on HiDPI
+    // ── Overlay drawing ─────────────────────────────────────────────
+    function drawOverlay(canvas, w, h, fn) {
         const dpr = window.devicePixelRatio || 1;
         const cw = canvas.clientWidth, ch = canvas.clientHeight;
         if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
-            canvas.width = cw * dpr;
-            canvas.height = ch * dpr;
+            canvas.width = cw * dpr; canvas.height = ch * dpr;
         }
         const ctx = canvas.getContext('2d');
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, cw, ch);
-        // Scale source-pixel coords (w x h) into the canvas display.
         const sx = cw / w, sy = ch / h;
-        drawFn(ctx, sx, sy);
+        fn(ctx, sx, sy);
     }
-
     function drawEoOverlay() {
         const m = state.latest && state.latest.eo_meta;
-        if (!m) {
-            const ctx = dom.eoCanvas.getContext('2d');
-            ctx.clearRect(0, 0, dom.eoCanvas.width, dom.eoCanvas.height);
-            return;
-        }
-        drawOverlay(dom.eoCanvas, m.w, m.h, (ctx, sx, sy) => {
+        if (!m) return;
+        drawOverlay(dom.eoOverlay, m.w, m.h, (ctx, sx, sy) => {
             const fused = state.latest.fused || [];
-            ctx.lineWidth = 2;
-            ctx.font = '12px ui-monospace, monospace';
+            ctx.lineWidth = 2; ctx.font = '12px ui-monospace, monospace';
             for (const t of fused) {
                 if (!t.eo_box) continue;
                 const [x, y, ww, hh] = t.eo_box;
                 ctx.strokeStyle = t.cls === 'vehicle' ? '#f6c560' : '#6ce085';
                 ctx.strokeRect(x * sx, y * sy, ww * sx, hh * sy);
                 ctx.fillStyle = ctx.strokeStyle;
-                ctx.fillText(`#${t.tid} ${t.cls || ''}`,
-                             x * sx + 2, y * sy - 4);
+                ctx.fillText(`#${t.tid} ${t.cls || ''}`, x * sx + 2, y * sy - 4);
             }
         });
     }
-
     function drawThermalOverlay() {
         const m = state.latest && state.latest.thermal_meta;
-        if (!m) {
-            const ctx = dom.thermalCanvas.getContext('2d');
-            ctx.clearRect(0, 0, dom.thermalCanvas.width, dom.thermalCanvas.height);
-            return;
-        }
-        drawOverlay(dom.thermalCanvas, m.w, m.h, (ctx, sx, sy) => {
-            // Heat dets — yellow boxes
-            ctx.lineWidth = 1.5;
-            ctx.strokeStyle = '#ffcd56';
+        if (!m) return;
+        drawOverlay(dom.thermalOverlay, m.w, m.h, (ctx, sx, sy) => {
+            ctx.lineWidth = 1.5; ctx.strokeStyle = '#ffcd56';
             for (const d of (m.heat_dets || [])) {
                 ctx.strokeRect(d.x * sx, d.y * sy, d.w * sx, d.h * sy);
             }
-            // Fused track boxes (thermal projection)
             const fused = state.latest.fused || [];
-            ctx.lineWidth = 2;
-            ctx.font = '11px ui-monospace, monospace';
+            ctx.lineWidth = 2; ctx.font = '11px ui-monospace, monospace';
             for (const t of fused) {
                 if (!t.thermal_box) continue;
                 const [x, y, ww, hh] = t.thermal_box;
                 ctx.strokeStyle = t.cls === 'vehicle' ? '#f6c560' : '#6ce085';
                 ctx.strokeRect(x * sx, y * sy, ww * sx, hh * sy);
-                ctx.fillStyle = ctx.strokeStyle;
-                ctx.fillText(`#${t.tid}`, x * sx + 2, y * sy - 3);
             }
         });
     }
 
+    // ── Radar polar ─────────────────────────────────────────────────
+    function buildRadarPolar() {
+        const svg = dom.radarPolar;
+        if (svg.dataset.built) return;
+        svg.dataset.built = '1';
+        const NS = 'http://www.w3.org/2000/svg';
+        // semicircles at 25 50 75 100 m
+        for (const r of [25, 50, 75, 100]) {
+            const c = document.createElementNS(NS, 'path');
+            c.setAttribute('d', `M ${-r} 0 A ${r} ${r} 0 0 1 ${r} 0`);
+            c.setAttribute('class', 'ring');
+            svg.appendChild(c);
+            const lbl = document.createElementNS(NS, 'text');
+            lbl.setAttribute('x', '0'); lbl.setAttribute('y', String(-r + 1));
+            lbl.setAttribute('text-anchor', 'middle');
+            lbl.setAttribute('class', 'axis-label');
+            lbl.textContent = `${r} m`;
+            svg.appendChild(lbl);
+        }
+        // axes at -60, -30, 0, 30, 60°
+        for (const a of [-60, -30, 0, 30, 60]) {
+            const rad = a * Math.PI / 180;
+            const x = 100 * Math.sin(rad), y = -100 * Math.cos(rad);
+            const ln = document.createElementNS(NS, 'line');
+            ln.setAttribute('x1', '0'); ln.setAttribute('y1', '0');
+            ln.setAttribute('x2', String(x)); ln.setAttribute('y2', String(y));
+            ln.setAttribute('class', 'axis');
+            svg.appendChild(ln);
+        }
+    }
+    function drawRadarPolar() {
+        buildRadarPolar();
+        const svg = dom.radarPolar;
+        // remove old targets
+        svg.querySelectorAll('.target,.target-label').forEach(el => el.remove());
+        const tgts = (state.stats && state.stats.radar_stats &&
+                      state.stats.radar_stats.targets) || [];
+        const NS = 'http://www.w3.org/2000/svg';
+        for (const t of tgts.slice(0, 20)) {
+            const az = (t.az_deg ?? 0) * Math.PI / 180;
+            const rng = t.range_m ?? Math.hypot(t.x ?? 0, t.y ?? 0);
+            const x = rng * Math.sin(az), y = -rng * Math.cos(az);
+            const c = document.createElementNS(NS, 'circle');
+            c.setAttribute('cx', String(x)); c.setAttribute('cy', String(y));
+            c.setAttribute('r', '1.2');
+            c.setAttribute('class', 'target');
+            svg.appendChild(c);
+        }
+    }
+
+    // ── Tracks list ─────────────────────────────────────────────────
     function renderTracks() {
         const fused = (state.latest && state.latest.fused) || [];
-        // Update DOM only if content changed; avoids layout thrash.
-        const sig = JSON.stringify(fused.map(t =>
-            [t.tid, t.cls, Math.round(t.az_deg ?? 0), Math.round(t.el_deg ?? 0)]
-        ));
-        if (renderTracks._lastSig === sig) return;
-        renderTracks._lastSig = sig;
-
-        const frag = document.createDocumentFragment();
-        for (const t of fused) {
-            const div = document.createElement('div');
-            div.className = `track cls-${t.cls || 'unknown'}`;
-            div.innerHTML = `
-                <span class="tid">#${t.tid}</span>
-                <span class="cls">${t.cls || '?'}</span>
-                <span class="age">${(t.age_ms || 0)|0} ms</span>
-            `;
-            frag.appendChild(div);
+        const cells = dom.tracksList.children;
+        for (let i = 0; i < 5; i++) {
+            const t = fused[i];
+            if (!t) {
+                cells[i].textContent = '--';
+                cells[i].className = 'target-cell';
+            } else {
+                cells[i].className = `target-cell cls-${t.cls || 'unknown'}`;
+                cells[i].innerHTML =
+                    `<b>#${t.tid}</b><br>${t.cls || '?'}<br>` +
+                    `az ${(t.az_deg||0).toFixed(1)}°<br>el ${(t.el_deg||0).toFixed(1)}°`;
+            }
         }
-        dom.tracksList.replaceChildren(frag);
+    }
+
+    // ── Header pills ────────────────────────────────────────────────
+    function updatePills() {
+        const s = state.stats || {};
+        dom.pillEo.classList.toggle('online',
+            !!(s.eo_stats && (s.eo_stats.frame_id || 0) > 0));
+        dom.pillThermal.classList.toggle('online',
+            !!(s.thermal_stats && (s.thermal_stats.fps_5s || 0) > 0.1));
+        dom.pillRadar.classList.toggle('online',
+            !!(s.radar_stats && (s.radar_stats.fps_5s || 0) > 0.1));
+        dom.pillGimbal.classList.toggle('online', state.wsConnected);
+        // REC pill stays muted in v2 alpha (recording wired in next iter)
     }
 
     function updateMetrics() {
-        dom.eoFps.textContent = state.fps.eo.value().toFixed(1);
-        dom.thermalFps.textContent = state.fps.thermal.value().toFixed(1);
+        dom.eoHz.textContent = state.fps.eo.value().toFixed(1) + ' Hz';
+        dom.thermalHz.textContent = state.fps.thermal.value().toFixed(1) + ' Hz';
         const s = state.stats || {};
-        const rfps = s.radar_stats && s.radar_stats.fps_5s;
-        const ifps = s.inference_stats &&
-                     ((s.inference_stats.eo_inferences || 0) +
-                      (s.inference_stats.thermal_inferences || 0));
-        dom.radarFps.textContent = rfps != null ? rfps.toFixed(1) : '--';
-        dom.infFps.textContent = ifps != null ? ifps.toFixed(0) : '--';
+        const r = s.radar_stats && s.radar_stats.fps_5s;
+        dom.radarHz.textContent = (r != null ? r.toFixed(1) : '--') + ' Hz';
     }
 
-    // ── RAF loop ──────────────────────────────────────────────────────
-    // The single point where we touch the DOM. Browser caps this at
-    // monitor refresh rate so we never repaint faster than visible.
+    function updateDevTab() {
+        const fmt = o => o ? JSON.stringify(o, null, 2) : 'no data';
+        const s = state.stats || {};
+        dom.devEo.textContent = fmt(s.eo_stats);
+        dom.devThermal.textContent = fmt(s.thermal_stats);
+        dom.devRadar.textContent = fmt(s.radar_stats);
+        dom.devInference.textContent = fmt(s.inference_stats);
+        dom.devFusion.textContent = fmt(s.fusion_stats);
+        dom.devWs.textContent = fmt(state.latest);
+    }
+
+    // ── RAF tick ────────────────────────────────────────────────────
     function rafTick() {
         try {
-            maybeFetchEo();
-            maybeFetchThermal();
+            maybeFetch('eo', dom.eoImg, 'eo_id');
+            maybeFetch('thermal', dom.thermalImg, 'thermal_id');
             drawEoOverlay();
             drawThermalOverlay();
+            drawRadarPolar();
             renderTracks();
+            updatePills();
             updateMetrics();
-        } catch (e) {
-            console.error('[raf] tick failed', e);
-        }
+            updateDevTab();
+        } catch (e) { console.error('[raf]', e); }
         requestAnimationFrame(rafTick);
     }
 
-    // ── Status poller (slow path) ────────────────────────────────────
     async function pollStatus() {
         try {
             const r = await fetch('/api/status', { cache: 'no-store' });
             if (r.ok) state.stats = await r.json();
-        } catch (_) { /* ignore */ }
-        setTimeout(pollStatus, 2000);
+        } catch (_) {}
+        setTimeout(pollStatus, 1500);
     }
 
-    // ── Boot ──────────────────────────────────────────────────────────
+    // ── Boot ─────────────────────────────────────────────────────────
     connectWS();
     pollStatus();
     requestAnimationFrame(rafTick);

@@ -62,7 +62,8 @@ def _make_backend(dev_path: str):
 
 @dataclass
 class EOCaptureConfig:
-    dev_path: str = "/dev/video0"
+    # Stable udev symlink (always points at the IMX568 capture node)
+    dev_path: str = "/dev/seeker_eo_v"
     width: int = NATIVE_W
     height: int = NATIVE_H
     shm_name: str = "seeker_eo_bgr"

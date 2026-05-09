@@ -3,41 +3,122 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>seeker_v2</title>
+    <title>seeker_v2 · BENCH</title>
     <link rel="stylesheet" href="/static/css/main_v2.css">
 </head>
 <body>
     <header class="topbar">
-        <div class="logo">seeker_v2</div>
-        <div class="metrics">
-            <span class="metric"><label>EO</label><span id="eo-fps">--</span> Hz</span>
-            <span class="metric"><label>Thermal</label><span id="thermal-fps">--</span> Hz</span>
-            <span class="metric"><label>Radar</label><span id="radar-fps">--</span> Hz</span>
-            <span class="metric"><label>Inf</label><span id="inf-fps">--</span> Hz</span>
-            <span class="metric"><label>WS</label><span id="ws-state">offline</span></span>
+        <div class="brand">
+            <span class="title">SEEKER&#8209;01 &middot; BENCH</span>
+            <span class="subtitle">v2 &middot; multi-process</span>
         </div>
+        <div class="status-pills">
+            <span class="pill" id="pill-thermal">THERMAL</span>
+            <span class="pill" id="pill-eo">EO</span>
+            <span class="pill" id="pill-radar">RADAR</span>
+            <span class="pill" id="pill-gimbal">GIMBAL</span>
+            <span class="pill rec" id="pill-rec">REC</span>
+        </div>
+        <div class="ws-state">WS: <span id="ws-state">offline</span></div>
     </header>
 
-    <main class="grid">
-        <section class="panel" id="panel-eo">
-            <h2>EO</h2>
-            <div class="stage">
-                <img id="eo-img" alt="EO">
-                <canvas id="eo-overlay"></canvas>
-            </div>
+    <nav class="tabs">
+        <button class="tab active" data-tab="main">MAIN</button>
+        <button class="tab" data-tab="developers">DEVELOPERS</button>
+    </nav>
+
+    <main class="page" data-page="main">
+        <section class="grid">
+            <!-- THERMAL -->
+            <section class="panel" id="panel-thermal">
+                <header>
+                    <h2>THERMAL · Boson 640</h2>
+                    <span class="hz" id="thermal-hz">-- Hz</span>
+                </header>
+                <div class="stage">
+                    <img id="thermal-img" alt="Thermal">
+                    <canvas id="thermal-overlay"></canvas>
+                </div>
+            </section>
+
+            <!-- EO -->
+            <section class="panel" id="panel-eo">
+                <header>
+                    <h2>EO · IMX568 · 35mm · 11.1°</h2>
+                    <span class="hz" id="eo-hz">-- Hz</span>
+                </header>
+                <div class="stage">
+                    <img id="eo-img" alt="EO">
+                    <canvas id="eo-overlay"></canvas>
+                </div>
+            </section>
+
+            <!-- RADAR -->
+            <section class="panel" id="panel-radar">
+                <header>
+                    <h2>RADAR · AWR2944P</h2>
+                    <span class="hz" id="radar-hz">-- Hz</span>
+                </header>
+                <div class="stage">
+                    <svg id="radar-polar" viewBox="-110 -110 220 110" preserveAspectRatio="xMidYMid meet"></svg>
+                </div>
+            </section>
         </section>
 
-        <section class="panel" id="panel-thermal">
-            <h2>Thermal</h2>
-            <div class="stage">
-                <img id="thermal-img" alt="Thermal">
-                <canvas id="thermal-overlay"></canvas>
-            </div>
-        </section>
+        <section class="bottom">
+            <!-- TARGETS -->
+            <section class="panel small" id="panel-targets">
+                <header><h2>FUSED TRACKS · TOP 5</h2></header>
+                <div id="tracks-list" class="targets-grid">
+                    <div class="target-cell">--</div>
+                    <div class="target-cell">--</div>
+                    <div class="target-cell">--</div>
+                    <div class="target-cell">--</div>
+                    <div class="target-cell">--</div>
+                </div>
+            </section>
 
-        <section class="panel" id="panel-tracks">
-            <h2>Fused tracks</h2>
-            <div id="tracks-list"></div>
+            <!-- GIMBAL -->
+            <section class="panel small" id="panel-gimbal">
+                <header><h2>GIMBAL · manual</h2></header>
+                <div class="gimbal">
+                    <label>PAN <span id="pan-val">0.0°</span></label>
+                    <input type="range" id="pan-slider" min="-90" max="90" step="0.5" value="0">
+                    <label>TILT <span id="tilt-val">0.0°</span></label>
+                    <input type="range" id="tilt-slider" min="-30" max="60" step="0.5" value="0">
+                    <button id="home-btn">HOME</button>
+                    <p class="hint">v2 alpha: read-only telemetry. Gimbal control wired in next iteration.</p>
+                </div>
+            </section>
+        </section>
+    </main>
+
+    <main class="page hidden" data-page="developers">
+        <section class="dev-grid">
+            <div class="panel">
+                <header><h2>EO STATS</h2></header>
+                <pre id="dev-eo">no data</pre>
+            </div>
+            <div class="panel">
+                <header><h2>THERMAL STATS</h2></header>
+                <pre id="dev-thermal">no data</pre>
+            </div>
+            <div class="panel">
+                <header><h2>RADAR STATS</h2></header>
+                <pre id="dev-radar">no data</pre>
+            </div>
+            <div class="panel">
+                <header><h2>INFERENCE STATS</h2></header>
+                <pre id="dev-inference">no data</pre>
+            </div>
+            <div class="panel">
+                <header><h2>FUSION STATS</h2></header>
+                <pre id="dev-fusion">no data</pre>
+            </div>
+            <div class="panel">
+                <header><h2>RAW WS PAYLOAD (last)</h2></header>
+                <pre id="dev-ws">no data</pre>
+            </div>
         </section>
     </main>
 
