@@ -494,9 +494,23 @@ class RawV4L2Backend:
         # the numpy float-multiply path that took ~30ms per frame on Jetson
         # AGX (now ~6ms). Profiled 2026-05-08: cv2.convertScaleAbs at 6.3ms,
         # cv2.cvtColor mono->BGR at ~3ms, total ~9ms vs 32ms before.
-        span = max(s_p99 - s_p1, 4.0)
-        alpha = 255.0 / span
-        beta = -s_p1 * alpha
+        #
+        # Degenerate-span guard (added 2026-05-10): when the scene is
+        # uniformly saturated (e.g. garage door opens to bright daylight,
+        # AE at floor, p99=p1=4095) the previous max(span, 4.0) safety
+        # gave alpha=63.75, beta=-261058, which mapped pixel=4095 to
+        # 4095*63.75-261058 ≈ -5 → clipped to 0 → uniform BLACK panel.
+        # When span collapses, fall back to raw 12-bit→8-bit mapping so
+        # a saturated scene shows as WHITE (truthful) rather than BLACK
+        # (looks broken). Threshold 32 chosen so genuine low-contrast
+        # but informative scenes still get the percentile stretch.
+        span = s_p99 - s_p1
+        if span < 32.0:
+            alpha = 255.0 / 4095.0  # raw 12-bit → 8-bit, no stretch
+            beta = 0.0
+        else:
+            alpha = 255.0 / span
+            beta = -s_p1 * alpha
         y8 = cv2.convertScaleAbs(u16, alpha=alpha, beta=beta)
 
         # Replicate luma to BGR — matches IMX568Capture's documented
