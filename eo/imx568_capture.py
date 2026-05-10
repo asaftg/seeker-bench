@@ -964,6 +964,24 @@ class IMX568Capture:
                         self._sdk_stream_mode = True
                         self._raw_yuy2_mode = False
                         self._sw_ae_enabled = False
+                        # Commit any caller-supplied manual ExposureExt to the
+                        # streaming fd. Without this, the Linux V4L2 path
+                        # silently drops manual_exposure_ext writes (Windows
+                        # SDK and PyAV branches both commit at open time but
+                        # this branch was missing the call) — meaning the
+                        # GUI's manual-exposure control + the AE thread's
+                        # initial seed both no-op'd. Same for manual gain.
+                        try:
+                            if self._manual_exposure_ext is not None:
+                                v4l2cap.set_exposure_ext(int(self._manual_exposure_ext))
+                                log.info("V4L2 init: committed manual exposure_ext=%d",
+                                         self._manual_exposure_ext)
+                            if self._manual_gain is not None and hasattr(v4l2cap, "set_gain_rgb"):
+                                v4l2cap.set_gain_rgb(int(self._manual_gain))
+                                log.info("V4L2 init: committed manual gain=%d",
+                                         self._manual_gain)
+                        except Exception as _e_init_xu:
+                            log.warning("V4L2 init: failed to commit manual values: %s", _e_init_xu)
                         log.info(
                             "IMX568Capture mode: RAW_V4L2_YUY2 on %s "
                             "(clean mono Y, no DSHOW dead-zone recovery)",
