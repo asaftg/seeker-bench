@@ -65,15 +65,26 @@ class EOClassifier:
         imgsz: int = 640,
         per_class_conf: dict | None = None,
     ) -> None:
-        # Priority: v3 (close-targets fine-tune) > v2 (long-range only)
-        # > COCO. We resolve the chain HERE so callers don't have to
-        # know about versioning. Pass model_path explicitly to override.
+        # Priority: v3 .engine (TRT FP16, ~1.6× faster on Jetson Volta)
+        # > v3 .pt > v2 .pt > COCO. ultralytics YOLO() loads .engine and
+        # .pt transparently — same predict() / track() interface, same
+        # output shape. The .engine MUST be built on-device against the
+        # installed TensorRT version (mismatched magic-tag fails to
+        # deserialize) and at the SAME imgsz the runtime will call with;
+        # config currently sets imgsz=832 for EO, so the engine on disk
+        # must be exported at imgsz=832 half=True device=0. To rebuild:
+        #     yolo export model=models/seeker_eo_v3.pt format=engine         #                 imgsz=832 half=True device=0
+        # To roll back to .pt only: delete models/seeker_eo_v3.engine.
         if model_path is None:
+            v3_engine = Path("models/seeker_eo_v3.engine")
             v3 = Path("models/seeker_eo_v3.pt")
             v2 = Path("models/seeker_eo_v2.pt")
-            if v3.exists():
+            if v3_engine.exists():
+                model_path = str(v3_engine)
+                log.info("EOClassifier: using seeker_eo_v3.engine (TRT FP16)")
+            elif v3.exists():
                 model_path = str(v3)
-                log.info("EOClassifier: using seeker_eo_v3.pt (close-targets fine-tune)")
+                log.info("EOClassifier: using seeker_eo_v3.pt (TRT engine not on disk)")
             elif v2.exists():
                 model_path = str(v2)
                 log.info("EOClassifier: using seeker_eo_v2.pt (v3 not present)")

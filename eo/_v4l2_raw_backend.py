@@ -469,7 +469,18 @@ class RawV4L2Backend:
         if (self._frames_since_stats >= 5
                 or self.last_raw_stats is None):
             self._frames_since_stats = 0
-            sample = u16[::8, ::8]
+            # Denser grid (::4) with randomized phase per stats compute.
+            # The earlier fixed [::8, ::8] grid sampled 1/64 of pixels
+            # on a static lattice; sub-degree gimbal shifts (~4 raw px)
+            # moved the entire grid onto different scene pixels, which
+            # could systematically miss bright/dark features and corrupt
+            # the percentile stretch for several frames at a time.
+            # ::4 = 4× more samples (~640k px); randomized phase removes
+            # the fixed-grid bias so percentile is stable across small
+            # scene shifts.
+            oy = int(np.random.randint(0, 4))
+            ox = int(np.random.randint(0, 4))
+            sample = u16[oy::4, ox::4]
             s_p1 = float(np.percentile(sample, 1))
             s_p99 = float(np.percentile(sample, 99))
             s_mean = float(sample.mean())
@@ -495,22 +506,24 @@ class RawV4L2Backend:
         # AGX (now ~6ms). Profiled 2026-05-08: cv2.convertScaleAbs at 6.3ms,
         # cv2.cvtColor mono->BGR at ~3ms, total ~9ms vs 32ms before.
         #
-        # Degenerate-span guard (added 2026-05-10): when the scene is
-        # uniformly saturated (e.g. garage door opens to bright daylight,
-        # AE at floor, p99=p1=4095) the previous max(span, 4.0) safety
-        # gave alpha=63.75, beta=-261058, which mapped pixel=4095 to
-        # 4095*63.75-261058 ≈ -5 → clipped to 0 → uniform BLACK panel.
-        # When span collapses, fall back to raw 12-bit→8-bit mapping so
-        # a saturated scene shows as WHITE (truthful) rather than BLACK
-        # (looks broken). Threshold 32 chosen so genuine low-contrast
-        # but informative scenes still get the percentile stretch.
-        span = s_p99 - s_p1
-        if span < 32.0:
-            alpha = 255.0 / 4095.0  # raw 12-bit → 8-bit, no stretch
-            beta = 0.0
-        else:
-            alpha = 255.0 / span
-            beta = -s_p1 * alpha
+        # Always-stretch AGC. Restored 2026-05-11 to match the
+        # pre-ea79b97 behavior that worked at pitch-black night.
+        # The intermediate degenerate-span fallback ("if span<32 use
+        # raw 12→8 mapping") was a misdirected attempt to make a
+        # uniform-saturated scene render WHITE instead of BLACK; in
+        # practice it caught common mid-range uniform regions (sky,
+        # wall, road through 11° HFOV) and posterized them to black
+        # on every small gimbal move whenever the strided percentile
+        # sampler missed bright pixels. Per the operator: the sensor
+        # is for detecting people at pitch-black night — always
+        # stretch what's there, never fall back to a 12→8 collapse.
+        # Saturated-bright edge case (lens covered, span literally 0)
+        # still produces dark output here (alpha=63, beta cancels);
+        # accept that as a "sensor saturated" cue rather than reintroduce
+        # the fallback.
+        span = max(s_p99 - s_p1, 4.0)
+        alpha = 255.0 / span
+        beta = -s_p1 * alpha
         y8 = cv2.convertScaleAbs(u16, alpha=alpha, beta=beta)
 
         # Replicate luma to BGR — matches IMX568Capture's documented
