@@ -469,18 +469,19 @@ class RawV4L2Backend:
         if (self._frames_since_stats >= 5
                 or self.last_raw_stats is None):
             self._frames_since_stats = 0
-            # Denser grid (::4) with randomized phase per stats compute.
-            # The earlier fixed [::8, ::8] grid sampled 1/64 of pixels
-            # on a static lattice; sub-degree gimbal shifts (~4 raw px)
-            # moved the entire grid onto different scene pixels, which
-            # could systematically miss bright/dark features and corrupt
-            # the percentile stretch for several frames at a time.
-            # ::4 = 4× more samples (~640k px); randomized phase removes
-            # the fixed-grid bias so percentile is stable across small
-            # scene shifts.
-            oy = int(np.random.randint(0, 4))
-            ox = int(np.random.randint(0, 4))
-            sample = u16[oy::4, ox::4]
+            # Denser fixed grid: [::4, ::4] = 4× more samples than the
+            # historical [::8, ::8] (~640k px vs ~160k). Density is the
+            # correct fix for the binary BAD/GOOD AGC flip on small
+            # gimbal moves — a denser grid is far less likely to miss
+            # sparse bright features. An earlier attempt also added a
+            # randomized per-compute phase (oy, ox = randint(0,4)) but
+            # that injected per-recompute percentile jitter (±5 raw
+            # counts on p1/p99) which, on low-contrast scenes (span ~10),
+            # swung alpha = 255/span by 2× between recomputes and made
+            # static scenes pulse every ~0.25 s. Fixed grid = stable
+            # stats on a static scene = no flicker; ::4 density alone
+            # is enough to handle the sub-degree gimbal-move case.
+            sample = u16[::4, ::4]
             s_p1 = float(np.percentile(sample, 1))
             s_p99 = float(np.percentile(sample, 99))
             s_mean = float(sample.mean())
