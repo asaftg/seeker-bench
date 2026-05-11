@@ -960,18 +960,32 @@ class EOManager:
             # Out of band — step.
             new_ext = ctrl.step(cur, p99, mean, frac_clip)
             if new_ext == cur:
-                # Bracket collapsed at current value. If we'''re still
-                # out of band, the brackets are stale — typically scene
-                # got dimmer than the original hi_brake exposure tested
-                # for. Reset so the next iteration can search outside
-                # the stuck range. Without this, AE locks at e.g. exp=15
-                # while the real correct answer is exp=300.
-                if not ctrl.in_band(p99, frac_clip):
-                    log.info('EO AE: bracket collapsed at exp=%d but '
-                             'p99=%.0f still out of band (target [%.0f,%.0f]) '
-                             '— resetting brackets',
-                             cur, p99, ctrl.target_lo, ctrl.target_hi)
-                    ctrl.reset_brackets()
+                # Bracket collapsed at current value.
+                #   - If at AE_EXP_MAX or AE_EXP_MIN: scene is genuinely
+                #     beyond the sensor envelope (too dim past max, too
+                #     bright past min). Accept it and stop trying — log
+                #     ONCE per stuck session, not every 1.5s. Otherwise
+                #     each AE iteration triggers a source restart and
+                #     the panel blinks black continuously.
+                #   - If collapsed at intermediate value AND still out
+                #     of band: brackets are stale (scene moved outside
+                #     originally-tested range). Reset to let the next
+                #     iteration search beyond the stuck region.
+                if cur >= _AE_EXP_MAX or cur <= _AE_EXP_MIN:
+                    if not getattr(self, "_ae_at_boundary_logged", False):
+                        log.warning(
+                            "EO AE: stuck at boundary exp=%d, p99=%.0f "
+                            "out of band — sensor envelope exhausted, "
+                            "holding", cur, p99,
+                        )
+                        self._ae_at_boundary_logged = True
+                else:
+                    self._ae_at_boundary_logged = False
+                    if not ctrl.in_band(p99, frac_clip):
+                        log.info("EO AE: bracket collapsed at exp=%d but "
+                                 "p99=%.0f still out of band — resetting brackets",
+                                 cur, p99)
+                        ctrl.reset_brackets()
                 continue
             log.info("EO AE step: exp %d -> %d (p99=%.0f mean=%.0f "
                      "clip=%.3f, lo_floor=%s, hi_brake=%s)",
