@@ -960,8 +960,18 @@ class EOManager:
             # Out of band — step.
             new_ext = ctrl.step(cur, p99, mean, frac_clip)
             if new_ext == cur:
-                # Bracket collapsed at current value (best we can do on
-                # this scene). No restart, just wait.
+                # Bracket collapsed at current value. If we'''re still
+                # out of band, the brackets are stale — typically scene
+                # got dimmer than the original hi_brake exposure tested
+                # for. Reset so the next iteration can search outside
+                # the stuck range. Without this, AE locks at e.g. exp=15
+                # while the real correct answer is exp=300.
+                if not ctrl.in_band(p99, frac_clip):
+                    log.info('EO AE: bracket collapsed at exp=%d but '
+                             'p99=%.0f still out of band (target [%.0f,%.0f]) '
+                             '— resetting brackets',
+                             cur, p99, ctrl.target_lo, ctrl.target_hi)
+                    ctrl.reset_brackets()
                 continue
             log.info("EO AE step: exp %d -> %d (p99=%.0f mean=%.0f "
                      "clip=%.3f, lo_floor=%s, hi_brake=%s)",
