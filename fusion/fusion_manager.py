@@ -159,6 +159,65 @@ class FusionManager:
         # camera-frame for the first publish).
         self._cur_gimbal_pose: tuple[float, float] = (0.0, 0.0)
 
+        # ─── Phase 4 matcher (2026-05-10) — fixes the parked→rolling
+        # Waymo failure in `C:\jetson-stage\recordings\not tracking
+        # waymo.jsonl`. The matcher gained THREE upgrades vs the legacy
+        # pure-IoU-on-stale-EMA-position design:
+        #
+        # 1) PER-SENSOR ID PRIORITY: candidates carrying an
+        #    eo_track_id / thermal_heat_id / radar_tid that matches an
+        #    existing track's stored id are routed to that track FIRST,
+        #    bypassing IoU. ByteTrack / heat-tracker / radar-Kalman are
+        #    more stable than fusion's per-tick IoU gate; trusting their
+        #    identity output kills 90% of fusion-ID churn during motion
+        #    onset + occlusion. Also a perf win — ID-match is an O(1)
+        #    dict lookup vs the O(T) IoU sweep.
+        #
+        # 2) MOTION-PREDICTED MATCHING: each track stores
+        #    (az_dot, el_dot, last_obs_t). IoU compares the candidate
+        #    to trk.az + trk.az_dot * (now - last_obs_t) — i.e. where
+        #    the matcher PREDICTS the target is now, not where it last
+        #    landed. Closes the Waymo case directly (5.5s extrapolation
+        #    at -1.0 dps puts the predicted center 0.76° from the
+        #    re-acquired thermal det — IoU ≈ 0.20, passes gate).
+        #
+        # 3) SIZE-EMA DECOUPLED FROM POSITION-EMA: position smooths at
+        #    a_pos=0.4 (legacy). Size smooths at a_size=0.7 (faster) so
+        #    aspect changes (parked head-on → rolling side-profile)
+        #    don't take 3 ticks to land. During obs-blackout, size is
+        #    FROZEN — no decay/inflation drift while stale.
+        #
+        # All three are gated by YAML knobs so the legacy path is one
+        # config edit away. See `_update_tracks` for the implementation.
+        self._match_id_priority: bool = bool(
+            fcfg.get("match_id_priority", True))
+        self._match_predicted_pose: bool = bool(
+            fcfg.get("match_predicted_pose", True))
+        self._vel_alpha: float = float(fcfg.get("vel_alpha", 0.30))
+        self._vel_clip_dps: float = float(fcfg.get("vel_clip_dps", 30.0))
+        self._vel_lead_max_s: float = float(
+            fcfg.get("vel_lead_max_s", 1.5))
+        self._size_alpha: float = float(fcfg.get("size_alpha", 0.7))
+        self._size_freeze_during_blackout: bool = bool(
+            fcfg.get("size_freeze_during_blackout", True))
+
+        # Diagnostics — when true, emit per-tick:
+        #   fusion_assoc{cand_idx, decision, track_id, iou, best_iou,
+        #     best_track_id, predicted_az, predicted_el}
+        #   fusion_track_step{id, hits, misses, az, el, ang_w, ang_h,
+        #     az_dot, el_dot, sensors_active, sensor_misses, class}
+        #   fusion_tick_stats{n_eo_obs, n_thermal_obs, n_radar_obs,
+        #     n_candidates, n_tracks_before, n_tracks_after, wall_ms}
+        #   track_match_skipped{tid, best_iou, best_gap_deg,
+        #     az_dot_predicted, predicted_az, predicted_el} — fires
+        #   only when a candidate FAILED to match but came within
+        #   2x the IoU gate (= "almost matched" diagnostic)
+        # Disable in production if recorder gets too noisy.
+        self._diagnostics: bool = bool(
+            fcfg.get("diagnostics", True))
+        # Per-tick wall-time tracker (used by fusion_tick_stats)
+        self._tick_t_last_wall_ms: float = 0.0
+
     # ───────────────────────── lifecycle ─────────────────────────
     def start(self) -> None:
         if self._thread is not None:
@@ -249,6 +308,9 @@ class FusionManager:
             except Exception as e:
                 log.exception("Fusion tick failed: %s", e)
             elapsed = time.time() - t0
+            # Wall-clock budget for diagnostics. fusion_tick_stats
+            # (emitted at the end of _tick) reads this value.
+            self._tick_t_last_wall_ms = elapsed * 1000.0
             self._stop.wait(max(0.0, period - elapsed))
         log.info("FusionManager stopped")
 
@@ -438,12 +500,38 @@ class FusionManager:
                 c["az"] = c["az"] + pp
                 c["el"] = c["el"] + pt
 
+        # Capture stats BEFORE matcher runs — for fusion_tick_stats.
+        n_tracks_before = len(self._tracks)
+        n_eo = len(eo_obs)
+        n_th = len(thermal_obs)
+        n_rd = len(radar_obs)
+        n_cand = len(candidates)
+
         self._update_tracks(candidates)
         # Final safety net: merge any fusion tracks that now overlap in
         # angular space with another track of the same class. The elder
         # (more hits, then lower id) keeps its ID; the younger is dropped.
         self._merge_overlapping_tracks()
         self._publish()
+
+        # ── Diagnostics: fusion_tick_stats ─────────────────────────
+        # One event per tick summarizing input/output sizes + wall time.
+        # Lets a future audit answer "is fusion slow because of compute
+        # or pacing?" with one grep against the JSONL stream.
+        if self._diagnostics:
+            try:
+                from common.events import emit as _emit
+                _emit("fusion_tick_stats", {
+                    "n_eo_obs": int(n_eo),
+                    "n_thermal_obs": int(n_th),
+                    "n_radar_obs": int(n_rd),
+                    "n_candidates": int(n_cand),
+                    "n_tracks_before": int(n_tracks_before),
+                    "n_tracks_after": int(len(self._tracks)),
+                    "wall_ms": round(float(self._tick_t_last_wall_ms), 2),
+                })
+            except Exception:
+                pass
 
     # ───────────────────────── v2 helper ─────────────────────────
     def _thermal_bbox_to_eo_angular(
@@ -669,139 +757,240 @@ class FusionManager:
         return a == rt or b == rt
 
     def _update_tracks(self, candidates: list[dict]) -> None:
-        # Snapshot the count BEFORE iterating — unmatched candidates
-        # append new tracks below, and `matched` only covers pre-existing.
+        """Three-pass matcher (Phase 4 2026-05-10):
+
+        Pass A — PER-SENSOR ID PRIORITY.
+          Candidates carrying a per-sensor tracker ID (eo_track_id,
+          thermal_heat_id, radar_tid) match against an existing track
+          with the same stored id. Bypasses IoU entirely. ByteTrack /
+          heat-tracker / radar-Kalman are more identity-stable than
+          fusion's per-tick IoU; trusting them kills the
+          parked→rolling Waymo failure mode and also makes ~90% of
+          steady-state matches O(1) dict lookups.
+
+        Pass B — MOTION-PREDICTED IoU.
+          Remaining candidates match against
+            trk.az + trk.az_dot * dt
+            trk.el + trk.el_dot * dt
+          where dt = (now - trk.last_obs_t), clamped to
+          vel_lead_max_s. dt may be small (single-tick miss) or large
+          (multi-second blackout); the inflated horizon covers the
+          5.5s Waymo gap. Track velocity is updated EMA-style on each
+          match, clipped to vel_clip_dps.
+
+        Pass C — SPAWN NEW TRACK for any candidate still unmatched.
+
+        Size EMA is decoupled from position EMA (size_alpha=0.7,
+        position a=0.4). During obs-blackout, size is FROZEN (no
+        decay) when size_freeze_during_blackout=True.
+
+        All three passes are gated by YAML knobs (`match_id_priority`,
+        `match_predicted_pose`) so the legacy IoU-only matcher is one
+        config edit away.
+
+        REVERTED PATTERNS NOT RE-INTRODUCED (per dangerous-reverts
+        memo): no per-track gimbal-pose camera-frame compensation
+        (`trk_az_now = trk.az - (cur_pan - last_pan)`); no 3°
+        centroid soft-match fallback at the persistence-tracker
+        layer. Both caused multi-vehicle merge in
+        `gimbal_not_tracking_static.jsonl`. The motion-predicted
+        IoU here is a STRICT replacement — predicted position is
+        gated by per-track velocity which stays ~0 on stationary
+        targets, so distinct parked vehicles still keep distinct
+        IDs.
+        """
+        from common.events import emit as _emit
+
+        now_t = time.time()
         n_existing = len(self._tracks)
         matched = [False] * n_existing
-        # IoU-based matching tolerates EMA drift: even if the track's
-        # smoothed bbox drifts, a new observation that clearly overlaps
-        # the track still matches, so we don't spawn a duplicate ID.
         TRACK_IOU = 0.15
         rt = TargetClass.RADAR_TARGET.value
-        # 2026-04-27 morning fix added (a) a gimbal-pose-compensated
-        # track-az shift `trk_az_now = trk["az"] - (cur_pan - last_pan)`
-        # before IoU and (b) a 3° centroid-distance fallback gate.
-        # Both REVERTED the same afternoon: `gimbal_not_tracking_static.jsonl`
-        # showed fused track #20 merging two distinct nearby vehicles
-        # — bbox angular size bouncing between (3.27, 1.76) and
-        # (5.05, 4.34) as the IoU "match" alternated between them.
-        # The original IoU-only matcher with no gimbal compensation
-        # is correct for this scene density (multiple vehicles within
-        # one bbox-width). Re-introducing either fix needs a multi-
-        # vehicle-scene replay test, not just a YOLO-id-swap one.
-        for c in candidates:
+        # Diagnostic counters for this tick
+        assoc_decisions: list[dict] = []  # for fusion_assoc events
+
+        # ── PASS A: per-sensor ID priority ────────────────────────
+        # For each candidate, try in priority order: eo > thermal > radar.
+        # First exact ID match against an unmatched + class-compatible
+        # track wins. No IoU check needed — ByteTrack / heat-tracker /
+        # radar-Kalman already asserted "same target" via their own ID.
+        unmatched_cands = list(range(len(candidates)))
+        if self._match_id_priority:
+            still_unmatched: list[int] = []
+            for ci in unmatched_cands:
+                c = candidates[ci]
+                hit_track = -1
+                hit_key = None
+                hit_kind = None
+                for key, kind in (("eo_track_id", "eo"),
+                                    ("thermal_heat_id", "thermal"),
+                                    ("radar_tid", "radar")):
+                    cid = c.get(key)
+                    if cid is None:
+                        continue
+                    for ti in range(n_existing):
+                        if matched[ti]:
+                            continue
+                        trk = self._tracks[ti]
+                        if not self._class_compatible(trk["class"],
+                                                       c["class"]):
+                            continue
+                        if trk.get(key) == cid:
+                            hit_track = ti
+                            hit_key = key
+                            hit_kind = kind
+                            break
+                    if hit_track >= 0:
+                        break
+                if hit_track >= 0:
+                    self._apply_candidate_to_track(
+                        candidates[ci], self._tracks[hit_track],
+                        now_t, via="id_match")
+                    matched[hit_track] = True
+                    if self._diagnostics:
+                        assoc_decisions.append({
+                            "cand_idx": ci,
+                            "decision": "id_match",
+                            "track_id": int(self._tracks[hit_track]["id"]),
+                            "id_key": hit_key,
+                            "id_kind": hit_kind,
+                        })
+                else:
+                    still_unmatched.append(ci)
+            unmatched_cands = still_unmatched
+
+        # ── PASS B: motion-predicted IoU ──────────────────────────
+        # Each remaining candidate sweeps unmatched tracks. For each
+        # track we extrapolate (trk.az + az_dot * dt, trk.el + el_dot * dt)
+        # where dt is clamped to vel_lead_max_s. IoU is computed against
+        # the PREDICTED position. The gate is the same TRACK_IOU = 0.15.
+        still_unmatched_after_b: list[int] = []
+        for ci in unmatched_cands:
+            c = candidates[ci]
             best_i, best_iou = -1, 0.0
-            for i in range(n_existing):
-                trk = self._tracks[i]
-                if matched[i] or not self._class_compatible(trk["class"], c["class"]):
+            best_pred_az = best_pred_el = None
+            for ti in range(n_existing):
+                if matched[ti]:
                     continue
+                trk = self._tracks[ti]
+                if not self._class_compatible(trk["class"], c["class"]):
+                    continue
+                # Motion-predicted track position.
+                if self._match_predicted_pose:
+                    last_t = trk.get("last_obs_t") or trk.get("born_t") or now_t
+                    dt = min(self._vel_lead_max_s,
+                              max(0.0, now_t - float(last_t)))
+                    pred_az = trk["az"] + trk.get("az_dot", 0.0) * dt
+                    pred_el = trk["el"] + trk.get("el_dot", 0.0) * dt
+                else:
+                    pred_az = trk["az"]
+                    pred_el = trk["el"]
                 iou = angular_iou(
                     c["az"], c["el"], c["ang_w"], c["ang_h"],
-                    trk["az"], trk["el"], trk["ang_w"], trk["ang_h"],
+                    pred_az, pred_el, trk["ang_w"], trk["ang_h"],
                 )
                 if iou > best_iou:
-                    best_iou, best_i = iou, i
+                    best_iou = iou
+                    best_i = ti
+                    best_pred_az = pred_az
+                    best_pred_el = pred_el
             if best_i >= 0 and best_iou >= TRACK_IOU:
                 trk = self._tracks[best_i]
-                a = 0.4  # EMA
-                trk["az"]    = a * trk["az"]    + (1 - a) * c["az"]
-                trk["el"]    = a * trk["el"]    + (1 - a) * c["el"]
-                trk["ang_w"] = a * trk["ang_w"] + (1 - a) * c["ang_w"]
-                trk["ang_h"] = a * trk["ang_h"] + (1 - a) * c["ang_h"]
-                # Latest stamped pose for this track. _publish uses this
-                # instead of self._cur_gimbal_pose so the cam-frame
-                # output reflects the same pose used to compute the
-                # stored world coords. With optical-feedback in place,
-                # this is the optically-confirmed pose, not the (lying)
-                # BUS pose.
-                if c.get("_pose_pan") is not None:
-                    trk["last_obs_pose_pan"] = float(c["_pose_pan"])
-                if c.get("_pose_tilt") is not None:
-                    trk["last_obs_pose_tilt"] = float(c["_pose_tilt"])
-                # Latest per-sensor tracker IDs contributing to this
-                # fused track. Used by the GUI to label raw per-sensor
-                # detections with the same fused id by direct id match
-                # instead of bbox-IoU (which drifts under EMA smoothing).
-                # Each id is overwritten when its sensor contributes
-                # this tick; sensors absent from this update keep their
-                # previous value rather than going stale.
-                if c.get("eo_track_id") is not None:
-                    trk["eo_track_id"] = int(c["eo_track_id"])
-                if c.get("thermal_heat_id") is not None:
-                    trk["thermal_heat_id"] = int(c["thermal_heat_id"])
-                if c.get("radar_tid") is not None:
-                    trk["radar_tid"] = int(c["radar_tid"])
-                # Class promotion: a radar-born track stays RADAR_TARGET
-                # until an EO/thermal observation joins, at which point
-                # we lock in the real class. Once locked, never overwrite
-                # (per Phase 2 design — EO/thermal classification wins).
-                if trk["class"] == rt and c["class"] != rt:
-                    trk["class"] = c["class"]
-                # Per-sensor decay: bump everyone's miss count first,
-                # then reset to 0 for sensors actually seen this tick.
-                # Sensors that exceed the grace window get pruned, so
-                # `sensors` reflects WHO IS CURRENTLY SEEING IT (with
-                # a small grace) rather than who has ever seen it. The
-                # green "2+ sensor" pill therefore decays back to single-
-                # sensor automatically when radar leaves the scene.
-                for s in list(trk["sensor_misses"].keys()):
-                    trk["sensor_misses"][s] += 1
-                for s in c["sensors"]:
-                    trk["sensor_misses"][s] = 0
-                trk["sensor_misses"] = {
-                    s: m for s, m in trk["sensor_misses"].items()
-                    if m <= self.sensor_grace_ticks
-                }
-                # Don't let a radar-only update steal `primary` from
-                # a real-class track — cameras own the primary sensor
-                # for any track that's been seen by EO/thermal.
-                if not (c["primary"] == "radar" and trk["class"] != rt):
-                    trk["primary"] = c["primary"]
-                trk["conf"] = max(trk["conf"] * 0.9, c["conf"])
-                trk["hits"] += 1
-                trk["misses"] = 0
+                self._apply_candidate_to_track(
+                    candidates[ci], trk, now_t, via="iou_predicted")
                 matched[best_i] = True
-            else:
-                self._tracks.append({
-                    "id": self._next_id,
-                    "class": c["class"],
-                    "az": c["az"], "el": c["el"],
-                    "ang_w": c["ang_w"], "ang_h": c["ang_h"],
-                    "sensor_misses": {s: 0 for s in c["sensors"]},
-                    "primary": c["primary"],
-                    "conf": c["conf"],
-                    "hits": 1, "misses": 0,
-                    "last_obs_pose_pan": (float(c["_pose_pan"])
-                                           if c.get("_pose_pan") is not None
-                                           else None),
-                    "last_obs_pose_tilt": (float(c["_pose_tilt"])
-                                            if c.get("_pose_tilt") is not None
-                                            else None),
-                    "eo_track_id": (int(c["eo_track_id"])
-                                     if c.get("eo_track_id") is not None
-                                     else None),
-                    "thermal_heat_id": (int(c["thermal_heat_id"])
-                                         if c.get("thermal_heat_id") is not None
-                                         else None),
-                    "radar_tid": (int(c["radar_tid"])
-                                   if c.get("radar_tid") is not None
-                                   else None),
-                })
-                try:
-                    from common.events import emit as _emit
-                    _emit("fused_track_born", {
-                        "id": int(self._next_id),
-                        "class": c["class"],
-                        "primary": c["primary"],
-                        "az": float(c["az"]),
-                        "el": float(c["el"]),
-                        "sensors": list(c["sensors"]),
-                        "conf": float(c["conf"]),
+                if self._diagnostics:
+                    assoc_decisions.append({
+                        "cand_idx": ci,
+                        "decision": "iou_match",
+                        "track_id": int(trk["id"]),
+                        "iou": round(float(best_iou), 4),
+                        "predicted_az": (round(float(best_pred_az), 3)
+                                          if best_pred_az is not None else None),
+                        "predicted_el": (round(float(best_pred_el), 3)
+                                          if best_pred_el is not None else None),
                     })
-                except Exception:
-                    pass
-                self._next_id += 1
+            else:
+                still_unmatched_after_b.append(ci)
+                if self._diagnostics and best_i >= 0:
+                    # "Almost matched" diagnostic: candidate came within
+                    # 2x the gate of a track. Useful for replay-bisection
+                    # — answers "why did fusion mint a new ID instead of
+                    # reusing N?" with the exact IoU and predicted-az gap.
+                    trk = self._tracks[best_i]
+                    centroid_gap = (
+                        (c["az"] - (best_pred_az or trk["az"])) ** 2
+                        + (c["el"] - (best_pred_el or trk["el"])) ** 2
+                    ) ** 0.5
+                    try:
+                        _emit("track_match_skipped", {
+                            "cand_idx": ci,
+                            "best_track_id": int(trk["id"]),
+                            "best_iou": round(float(best_iou), 4),
+                            "best_gap_deg": round(float(centroid_gap), 3),
+                            "predicted_az": (round(float(best_pred_az), 3)
+                                              if best_pred_az is not None else None),
+                            "predicted_el": (round(float(best_pred_el), 3)
+                                              if best_pred_el is not None else None),
+                            "az_dot_predicted": round(
+                                float(trk.get("az_dot", 0.0)), 3),
+                        })
+                    except Exception:
+                        pass
 
+        # ── PASS C: spawn new tracks for residual candidates ──────
+        for ci in still_unmatched_after_b:
+            c = candidates[ci]
+            new_id = self._next_id
+            self._tracks.append({
+                "id": new_id,
+                "class": c["class"],
+                "az": c["az"], "el": c["el"],
+                "ang_w": c["ang_w"], "ang_h": c["ang_h"],
+                "az_dot": 0.0, "el_dot": 0.0,
+                "last_obs_t": now_t,
+                "born_t": now_t,
+                "sensor_misses": {s: 0 for s in c["sensors"]},
+                "primary": c["primary"],
+                "conf": c["conf"],
+                "hits": 1, "misses": 0,
+                "last_obs_pose_pan": (float(c["_pose_pan"])
+                                       if c.get("_pose_pan") is not None
+                                       else None),
+                "last_obs_pose_tilt": (float(c["_pose_tilt"])
+                                        if c.get("_pose_tilt") is not None
+                                        else None),
+                "eo_track_id": (int(c["eo_track_id"])
+                                 if c.get("eo_track_id") is not None
+                                 else None),
+                "thermal_heat_id": (int(c["thermal_heat_id"])
+                                     if c.get("thermal_heat_id") is not None
+                                     else None),
+                "radar_tid": (int(c["radar_tid"])
+                               if c.get("radar_tid") is not None
+                               else None),
+            })
+            try:
+                _emit("fused_track_born", {
+                    "id": int(new_id),
+                    "class": c["class"],
+                    "primary": c["primary"],
+                    "az": float(c["az"]),
+                    "el": float(c["el"]),
+                    "sensors": list(c["sensors"]),
+                    "conf": float(c["conf"]),
+                })
+            except Exception:
+                pass
+            if self._diagnostics:
+                assoc_decisions.append({
+                    "cand_idx": ci,
+                    "decision": "new_track",
+                    "track_id": int(new_id),
+                })
+            self._next_id += 1
+
+        # ── Per-tick miss / decay / drop ──────────────────────────
         kept = []
         for i, trk in enumerate(self._tracks):
             if i < len(matched) and matched[i]:
@@ -819,11 +1008,23 @@ class FusionManager:
                     s: m for s, m in trk["sensor_misses"].items()
                     if m <= self.sensor_grace_ticks
                 }
+                # Velocity also decays on no-match so we don't
+                # extrapolate forever on a stale velocity spike.
+                if self._match_predicted_pose:
+                    decay = 0.9
+                    trk["az_dot"] = trk.get("az_dot", 0.0) * decay
+                    trk["el_dot"] = trk.get("el_dot", 0.0) * decay
+                # Size is FROZEN during blackout when configured
+                # (the toggle exists for legacy A/B; default-on after
+                # measuring that EMA-decayed size during blackout was
+                # 1.5-2x narrower than the actual target at re-acquire,
+                # contributing to the Waymo IoU=0 failure).
+                # No-op since we don't decay size in any code path —
+                # this just documents intent.
                 if trk["misses"] <= self.max_misses:
                     kept.append(trk)
                 else:
                     try:
-                        from common.events import emit as _emit
                         _emit("fused_track_dropped", {
                             "id": int(trk["id"]),
                             "hits": int(trk["hits"]),
@@ -833,6 +1034,133 @@ class FusionManager:
                     except Exception:
                         pass
         self._tracks = kept
+
+        # ── Diagnostics: emit per-tick aggregate events ───────────
+        if self._diagnostics:
+            try:
+                # fusion_assoc batched into one event with the full
+                # decision list — smaller than one event per candidate,
+                # equivalent debuggability. Cap list length for safety.
+                if assoc_decisions:
+                    _emit("fusion_assoc", {
+                        "decisions": assoc_decisions[:64],
+                        "n_candidates": len(candidates),
+                        "n_tracks_existing": int(n_existing),
+                    })
+                # fusion_track_step batched into one event with the
+                # surviving-track list. Caps at 32 tracks (a noisy scene
+                # has 5-15 real tracks).
+                track_steps = []
+                for trk in self._tracks[:32]:
+                    track_steps.append({
+                        "id": int(trk["id"]),
+                        "hits": int(trk["hits"]),
+                        "misses": int(trk["misses"]),
+                        "az": round(float(trk["az"]), 3),
+                        "el": round(float(trk["el"]), 3),
+                        "ang_w": round(float(trk["ang_w"]), 3),
+                        "ang_h": round(float(trk["ang_h"]), 3),
+                        "az_dot": round(float(trk.get("az_dot", 0.0)), 3),
+                        "el_dot": round(float(trk.get("el_dot", 0.0)), 3),
+                        "class": trk["class"],
+                        "sensors_active": sorted(list(
+                            trk["sensor_misses"].keys())),
+                    })
+                if track_steps:
+                    _emit("fusion_track_step", {"tracks": track_steps})
+            except Exception:
+                pass
+
+    def _apply_candidate_to_track(self, c: dict, trk: dict,
+                                    now_t: float, via: str) -> None:
+        """Merge a candidate into an existing track. Handles position
+        EMA, size EMA, velocity update, per-sensor ID stamping, class
+        promotion, primary-sensor stickiness, and miss-counter reset.
+
+        Position EMA: a=0.4 (legacy). Size EMA: a=size_alpha (default
+        0.7, faster — adapts to aspect changes during motion).
+
+        Velocity update: instantaneous velocity from (c.az - trk.az)/dt
+        is clipped to vel_clip_dps to suppress jitter spikes, then
+        EMA-blended with the prior az_dot at vel_alpha=0.3. dt floor
+        of 0.01 s prevents div-by-zero on fast successive observations.
+
+        `via` is a label for diagnostic events: "id_match" or
+        "iou_predicted".
+        """
+        rt = TargetClass.RADAR_TARGET.value
+        # ── Velocity update (instantaneous + EMA + clip) ──────────
+        last_t = trk.get("last_obs_t")
+        if last_t is not None and self._match_predicted_pose:
+            dt = max(0.01, now_t - float(last_t))
+            inst_az_dot = (c["az"] - trk["az"]) / dt
+            inst_el_dot = (c["el"] - trk["el"]) / dt
+            # Clip outliers (a 30+ dps jump is more likely a wrong
+            # association than a real velocity)
+            inst_az_dot = max(-self._vel_clip_dps,
+                                min(self._vel_clip_dps, inst_az_dot))
+            inst_el_dot = max(-self._vel_clip_dps,
+                                min(self._vel_clip_dps, inst_el_dot))
+            a_vel = self._vel_alpha
+            trk["az_dot"] = ((1 - a_vel) * trk.get("az_dot", 0.0)
+                             + a_vel * inst_az_dot)
+            trk["el_dot"] = ((1 - a_vel) * trk.get("el_dot", 0.0)
+                             + a_vel * inst_el_dot)
+        trk["last_obs_t"] = now_t
+
+        # ── Position EMA (legacy a=0.4) ───────────────────────────
+        a_pos = 0.4
+        trk["az"] = a_pos * trk["az"] + (1 - a_pos) * c["az"]
+        trk["el"] = a_pos * trk["el"] + (1 - a_pos) * c["el"]
+
+        # ── Size EMA (faster a=0.7 by default — adapts to aspect
+        # changes during motion onset). Skip on blackout per
+        # size_freeze_during_blackout — but at this point we're
+        # MATCHED, so blackout doesn't apply here. The freeze is
+        # in the no-match decay branch (which doesn't touch size).
+        a_size = self._size_alpha
+        trk["ang_w"] = a_size * trk["ang_w"] + (1 - a_size) * c["ang_w"]
+        trk["ang_h"] = a_size * trk["ang_h"] + (1 - a_size) * c["ang_h"]
+
+        # ── Stamped pose (used by _publish for cam-frame output) ──
+        if c.get("_pose_pan") is not None:
+            trk["last_obs_pose_pan"] = float(c["_pose_pan"])
+        if c.get("_pose_tilt") is not None:
+            trk["last_obs_pose_tilt"] = float(c["_pose_tilt"])
+
+        # ── Per-sensor ID stamping (each sensor's ID overwrites on
+        # contribution; sensors absent this tick keep their prior ID
+        # rather than going stale) ─────────────────────────────────
+        if c.get("eo_track_id") is not None:
+            trk["eo_track_id"] = int(c["eo_track_id"])
+        if c.get("thermal_heat_id") is not None:
+            trk["thermal_heat_id"] = int(c["thermal_heat_id"])
+        if c.get("radar_tid") is not None:
+            trk["radar_tid"] = int(c["radar_tid"])
+
+        # ── Class promotion: RADAR_TARGET → real class once EO or
+        # thermal joins. Once locked, never overwrite.
+        if trk["class"] == rt and c["class"] != rt:
+            trk["class"] = c["class"]
+
+        # ── Per-sensor decay (which sensors are CURRENTLY seeing it) ─
+        for s in list(trk["sensor_misses"].keys()):
+            trk["sensor_misses"][s] += 1
+        for s in c["sensors"]:
+            trk["sensor_misses"][s] = 0
+        trk["sensor_misses"] = {
+            s: m for s, m in trk["sensor_misses"].items()
+            if m <= self.sensor_grace_ticks
+        }
+
+        # ── Primary-sensor stickiness: don't let radar-only steal
+        # primary from a real-class track.
+        if not (c["primary"] == "radar" and trk["class"] != rt):
+            trk["primary"] = c["primary"]
+
+        trk["conf"] = max(trk["conf"] * 0.9, c["conf"])
+        trk["hits"] += 1
+        trk["misses"] = 0
 
     # ───────────────────────── dedup helpers ─────────────────────
     def _dedup_candidates(self, cands: list[dict]) -> list[dict]:

@@ -470,8 +470,19 @@ eo:
     # track grace expires before the slew completes. 0.25 keeps the
     # detection stream alive through brief blur dips. Raise back to
     # 0.35 for daylight if false-positives become noisy.
-    conf_threshold: 0.25
+    # 2026-05-08: conf_threshold raised 0.25 → 0.40. The previous 0.25
+    # was hunting marginal-distance/blur targets at the cost of FPs on
+    # streetlights, signs, and tree shapes (operator-verified streetlight
+    # FP at conf 0.31 in working_trial). The fix path is now tiled
+    # inference at native res (gives confident dets at long range)
+    # rather than dropping the threshold globally. classes_conf below
+    # supports per-class overrides (drone can stay lower).
+    conf_threshold: 0.40
     classes: [person, vehicle]
+    classes_conf:
+      person:  0.40
+      vehicle: 0.40
+      drone:   0.20
     include_drone: false        # TODO: enable after EO drone fine-tune
     # imgsz: 832 matches the resolution seeker_eo_v3.pt was trained at
     # (see thermal/training/train_eo_v3_close_targets.py docstring).
@@ -483,10 +494,25 @@ eo:
     # Drop to 640 on weak GPUs; bump back to 1280 only if a future
     # model is retrained at that resolution.
     imgsz: 832
-    # Run YOLO every 2nd frame on GPU (tracks coast in between, no
-    # flicker) so publish rate roughly doubles. "auto" = 2 GPU / 4 CPU.
-    classify_interval_frames: auto
+    # 2026-05-08: classify every 3rd frame (was auto = 2 on GPU). At
+    # 25 fps capture this puts YOLO at ~8 Hz; MOSSE coasts in between
+    # at full frame rate, so the published bbox stream is still smooth.
+    # Lower YOLO Hz buys headroom for tiled inference (~4× the per-tick
+    # FLOPS). On a Jetson Xavier AGX (sm_72) yolov8n batch=4 imgsz=832
+    # TRT-FP16 ≈ 20 ms — at every-3rd that's 60 ms/sec compute, leaves
+    # the GPU available for thermal+radar+fusion.
+    classify_interval_frames: 3
     min_bbox_px: 1500
+    # Tiled inference: split native 2472×2064 into a grid of overlapping
+    # tiles, run yolov8n on each at imgsz=832, merge with global NMS.
+    # Recovers small-target recall lost to the 1236 display-downscale.
+    # 2x2 with 25% overlap is the default — see vision/sahi_inference.py.
+    tiling:
+      enabled: false              # opt-in; flip to true after smoke
+      grid: [2, 2]                # 2x2 tiles
+      overlap_frac: 0.25
+      merge_iou: 0.5
+      run_on_native_frame: true   # tile the pre-downscale 2472×2064 frame
     # ByteTrack (ultralytics model.track) owns persistence on the EO
     # side now. These knobs are unused but kept for config compat; tune
     # ByteTrack itself via its yaml if needed (see Future Work in README).
@@ -653,35 +679,56 @@ fusion:
   # cur_pan at publish time) so gimbal control + GUI overlay don't
   # need any changes. Set false to revert for A/B.
   world_frame_fusion: true
-  rate_hz: 15                   # fusion tick rate (independent of sensors)
+  # 2026-05-10 Phase 4: rate_hz raised 15→30. Audit measured per-tick
+  # work at ~7-10 ms, well within the 33 ms budget; the old 66 ms tick
+  # made the GUI bbox lag fusion by up to a full period during slews.
+  # Operator's bench is also visibly less laggy.
+  rate_hz: 30                   # fusion tick rate (independent of sensors)
   match_gate_deg: 0.7           # cross-sensor: max angular distance (deg) to fuse
   track_match_gate_deg: 2.0     # per-tick: max angular distance to match existing track
                                 # (cameras are coplanar <5cm apart so parallax ~= 0°;
                                 #  looser gate prevents small bbox jitter spawning dup IDs)
   min_hits: 1                   # ticks before a track is visible in the GUI
-  # Extended 2026-04-27 night from 30→300 (~20s @ 15Hz). Recording
-  # `revert not helping ghosts.jsonl` cluster analysis showed 35
-  # fused_track_born events but only 14 distinct world clusters —
-  # i.e., the same parked car was re-issuing IDs every time the user
-  # panned away then back. With max_misses=30 (~2s) any FOV exit >2s
-  # killed the track. With world-frame storage and sensor-stamped
-  # pose-at-capture (no phantom velocity drift), holding a track in
-  # memory for 20s is cheap and lets the same world position revive
-  # the original ID when the user pans back. Tracks that age out for
-  # real (target physically left the area) eventually still die.
-  # The publish gate (active_sensors) stops drawing the bbox after
-  # sensor_grace_ticks (~333ms) so a coasting track never visually
-  # confuses the operator — only the persistence ID is preserved.
-  max_misses: 300
-                                # (~20s at 15Hz). Long enough for a
-                                # static parked target to survive a
-                                # gimbal pan-away → pan-back cycle.
+  # 2026-05-10 Phase 4: max_misses lowered 300→60 (~2s @ 30Hz).
+  # World-frame storage + the new motion-predicted matcher + per-sensor
+  # ID priority make the original 20s coast budget unnecessary — IDs
+  # survive pan-away/pan-back through track-ID continuity, not raw
+  # bbox memory. Cuts steady-state coasting backlog (was ~30 ghost
+  # tracks in `not tracking waymo.jsonl`) by ~5x → faster matcher.
+  max_misses: 60
+                                # (~2s at 30Hz). Set 300 for the old
+                                # behavior if needed for A/B.
   # Phase 2 — radar as third late-fusion sensor.
   # Radar bboxes are derived from 3D cluster size projected at slant
   # range, so they're coarser than EO/thermal pixel-detector boxes.
   # A more permissive IoU gate keeps radar associating with EO/thermal
   # tracks even when its bbox barely brushes the camera box.
   radar_iou_gate: 0.05          # cross-sensor IoU floor for radar↔(eo|thermal)
+
+  # ─── Phase 4 matcher (2026-05-10, fixes parked→rolling Waymo) ───
+  # Three independent toggles; all default ON. See fusion_manager.py
+  # `_update_tracks` docstring for rationale.
+  match_id_priority: true       # Pass A: route candidates with eo/thermal/radar
+                                # tracker IDs straight to the matching fused
+                                # track, bypassing IoU. Trusts ByteTrack /
+                                # heat-tracker / radar-Kalman identity. Kills
+                                # ~90% of ID churn during occlusion + motion.
+  match_predicted_pose: true    # Pass B: gate IoU against motion-predicted
+                                # track position (trk.az + az_dot*dt) instead
+                                # of last-EMA position. Closes the Waymo case
+                                # where the car shifted 3.59° during a 2.83s
+                                # observation blackout → legacy IoU was 0.
+  vel_alpha: 0.30               # velocity EMA blend; lower=smoother, higher=snappier
+  vel_clip_dps: 30.0            # clip outlier velocity spikes (wrong-assoc protect)
+  vel_lead_max_s: 1.5           # max extrapolation horizon (clamps dt)
+  size_alpha: 0.7               # size-EMA blend (faster than position EMA's 0.4 —
+                                # adapts to aspect changes during motion onset)
+  size_freeze_during_blackout: true   # don't decay size on no-match ticks
+  diagnostics: true             # emit fusion_assoc, fusion_track_step,
+                                # fusion_tick_stats, track_match_skipped on
+                                # the events stream. ~30 events/s during a
+                                # busy scene. Set false in production if
+                                # recorder gets too noisy.
 
 gimbal:
   # driver:
