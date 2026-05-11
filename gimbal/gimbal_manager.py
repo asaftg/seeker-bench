@@ -892,6 +892,45 @@ class GimbalManager:
         self._track_grace_ticks = int(gcfg.get("track_grace_ticks", 20))
         self._track_miss = 0
 
+        # ─── Phase 4 engagement decoupling (2026-05-10) ──────────
+        # `_tracked_id` is a foreign key into FusionManager's `_next_id`
+        # space. When fusion re-issues an ID (motion-onset ID churn,
+        # occlusion, slow-roll transitions like the parked-Waymo case),
+        # gimbal can't tell "target gone" from "fusion lost ID
+        # continuity" and the engagement dies. The new
+        # `engagement_uid` is a stable identity OWNED BY GIMBAL —
+        # minted at TRACK-press, alive until operator release or
+        # hard-loss. The control loop now searches for the engaged
+        # target by (a) fused-id match (fast path, no change in
+        # steady state), and (b) FALLBACK by world-frame proximity
+        # to the last engaged position, class-compatible, within
+        # `engagement_search_radius_deg`. If fusion has lost ID
+        # continuity but the same physical target is back at the
+        # last known world position with the same class, the gimbal
+        # silently re-attaches to it via the new fused_id.
+        #
+        # SOFT REVERT: set `gimbal.engagement_decouple: false` in
+        # YAML — gimbal goes back to strict-fused-ID matching.
+        self._engagement_decouple: bool = bool(
+            gcfg.get("engagement_decouple", True))
+        self._engagement_search_radius_deg: float = float(
+            gcfg.get("engagement_search_radius_deg", 1.5))
+        # Monotonic engagement UID — minted at every set_track_target
+        # call. Old engagements stay logically distinct in the
+        # diagnostic event stream even if a fused_id gets reused.
+        self._engagement_uid: int = 0
+        self._engagement_uid_counter: int = 1
+        # Last world position observed for the current engagement.
+        # Used by the proximity fallback to find the target after
+        # fusion ID churn. Updated every tick the engaged target is
+        # tracked.
+        self._engagement_world_az: Optional[float] = None
+        self._engagement_world_el: Optional[float] = None
+        # Class of the engaged target — gates the proximity fallback
+        # so we don't re-attach to a different class at the same
+        # angular position.
+        self._engagement_class: Optional[str] = None
+
         # Thread
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
@@ -1006,6 +1045,13 @@ class GimbalManager:
             prev_id = self._tracked_id
             if track_id is None:
                 self._tracked_id = None
+                # Phase 4: clear engagement_uid + world position so
+                # the proximity fallback doesn't re-attach after the
+                # operator's explicit release.
+                self._engagement_uid = 0
+                self._engagement_world_az = None
+                self._engagement_world_el = None
+                self._engagement_class = None
                 log.info("Fused track lock cleared → manual")
                 return
             try:
@@ -1013,6 +1059,23 @@ class GimbalManager:
             except (TypeError, ValueError):
                 log.warning("Bad track_id: %r", track_id)
                 return
+            # Phase 4: mint a fresh engagement_uid. Each TRACK-press
+            # gets a unique uid, so re-engagements on the same fused
+            # ID are distinguishable in the event stream (helpful for
+            # post-hoc "did the operator release and re-press, or did
+            # fusion churn the ID?" forensics).
+            self._engagement_uid = self._engagement_uid_counter
+            self._engagement_uid_counter += 1
+            self._engagement_world_az = None
+            self._engagement_world_el = None
+            self._engagement_class = None
+            try:
+                emit_event("engagement_started", {
+                    "engagement_uid": int(self._engagement_uid),
+                    "fused_id": int(new_id),
+                })
+            except Exception:
+                pass
             # Switching from one target to another (or engaging while
             # a previous lock was still alive with tracked_id never
             # passing through None) must reset ALL predictor and
@@ -1443,6 +1506,48 @@ class GimbalManager:
                     if getattr(t, "id", None) == tracked_id:
                         trk = t
                         break
+                # Phase 4 engagement decoupling (2026-05-10): if the
+                # foreign-key fused-ID match failed, try a proximity
+                # fallback against the LAST KNOWN engagement world
+                # position. This recovers from fusion ID churn (e.g.
+                # the parked-Waymo case where fusion minted #435 for
+                # the same physical car after a 5.5 s observation
+                # blackout — strict ID match would let the engagement
+                # die, but proximity fallback finds #435 at the
+                # last engaged world position and re-attaches).
+                if (trk is None
+                        and self._engagement_decouple
+                        and self._engagement_world_az is not None):
+                    trk_alt = self._find_engaged_track_by_proximity(
+                        fused,
+                        self._engagement_world_az,
+                        self._engagement_world_el,
+                        self._engagement_class,
+                        self._engagement_search_radius_deg)
+                    if trk_alt is not None:
+                        new_id = int(getattr(trk_alt, "id"))
+                        try:
+                            emit_event("engagement_reattached", {
+                                "engagement_uid": int(self._engagement_uid),
+                                "from_fused_id": int(tracked_id),
+                                "to_fused_id": new_id,
+                                "world_az": float(self._engagement_world_az),
+                                "world_el": float(self._engagement_world_el),
+                                "search_radius_deg": float(
+                                    self._engagement_search_radius_deg),
+                            })
+                        except Exception:
+                            pass
+                        log.info(
+                            "Engagement #%d re-attached: fused #%d -> #%d "
+                            "via proximity (last known world %.2f, %.2f)",
+                            self._engagement_uid, tracked_id, new_id,
+                            self._engagement_world_az,
+                            self._engagement_world_el)
+                        with self._lock:
+                            self._tracked_id = new_id
+                        tracked_id = new_id
+                        trk = trk_alt
             if trk is not None:
                 # Use measured pose (encoder) on V2 instead of the
                 # controller's commanded pose. See pose_pan/pose_tilt
@@ -1825,6 +1930,25 @@ class GimbalManager:
                         diag.get("obs_world_az"), diag.get("obs_world_el"),
                         self._track_world_az_dot, self._track_world_el_dot,
                     )
+                    # Phase 4: remember the engagement's world position
+                    # so the proximity fallback can find the target if
+                    # fusion churns the ID. Class is also stored to
+                    # gate the fallback against same-class re-attaches
+                    # only.
+                    if self._engagement_decouple:
+                        if self._track_world_az is not None:
+                            self._engagement_world_az = float(
+                                self._track_world_az)
+                        if self._track_world_el is not None:
+                            self._engagement_world_el = float(
+                                self._track_world_el)
+                        try:
+                            cls = getattr(getattr(trk, "target_class", None),
+                                            "value", None)
+                            if cls is not None:
+                                self._engagement_class = str(cls)
+                        except Exception:
+                            pass
 
                 # Predictor returns sp = observed_world + capped predictive
                 # shift, OR (when extrap horizon exceeded) the last setpoint.
@@ -2290,6 +2414,60 @@ class GimbalManager:
         if bw <= 0 or bh <= 0:
             return None
         return (int(x), int(y), int(bw), int(bh))
+
+    def _find_engaged_track_by_proximity(
+        self, fused: list, last_world_az: float,
+        last_world_el: Optional[float], engaged_class: Optional[str],
+        radius_deg: float):
+        """Phase 4 engagement-decoupling fallback: when the strict
+        fused-ID lookup for the engaged target fails, find the
+        closest same-class fused track within `radius_deg` of the
+        engagement's last known world position.
+
+        Returns the FusedTrack object or None. Caller is responsible
+        for re-attaching the engagement (`_tracked_id = new_id`) and
+        emitting the diagnostic event.
+
+        Why same-class: a parked car and a person at the same
+        angular position would otherwise mis-attach. RADAR_TARGET
+        sentinel is wildcard-compatible per the existing fusion
+        class-promotion rule.
+        """
+        if not fused:
+            return None
+        from common.frames import TargetClass
+        radar_target = TargetClass.RADAR_TARGET.value
+        best = None
+        best_d = float("inf")
+        for t in fused:
+            try:
+                trk_cls = getattr(getattr(t, "target_class", None),
+                                    "value", None)
+            except Exception:
+                trk_cls = None
+            # Class compatibility — exact match OR either side is
+            # RADAR_TARGET (wildcard).
+            if (engaged_class is not None and trk_cls is not None
+                    and engaged_class != trk_cls
+                    and engaged_class != radar_target
+                    and trk_cls != radar_target):
+                continue
+            # Track's world position. Prefer world_az_deg /
+            # world_el_deg from FusedTrack (Phase 2); fall back to
+            # cam-frame az + cur_pan if absent.
+            wa = getattr(t, "world_az_deg", None)
+            we = getattr(t, "world_el_deg", None)
+            if wa is None:
+                continue
+            d_az = float(wa) - float(last_world_az)
+            d_el = (float(we) - float(last_world_el)
+                    if (we is not None and last_world_el is not None)
+                    else 0.0)
+            d = (d_az * d_az + d_el * d_el) ** 0.5
+            if d <= radius_deg and d < best_d:
+                best = t
+                best_d = d
+        return best
 
     def _resolve_heat_track(self, heat_id: int) -> Optional[_HeatObs]:
         """Look up the current az/el of a heat-blob tracker ID.

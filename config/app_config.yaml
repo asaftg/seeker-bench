@@ -914,6 +914,26 @@ gimbal:
   # holding a truly-dead lock so long that the operator notices.
   track_grace_ticks: 60
 
+  # ── Phase 4 engagement decoupling (2026-05-10) ────────────────
+  # Decouples the operator's engagement from fusion's per-tick ID
+  # continuity. When the strict fused-ID lookup fails (motion-onset
+  # ID churn, occlusion, slow-roll transitions like the parked-Waymo
+  # case), GimbalManager searches the latest fused list for any
+  # same-class track within `engagement_search_radius_deg` of the
+  # engagement's last known world position. If found, the engagement
+  # silently re-attaches to the new fused-id and emits an
+  # `engagement_reattached` event for forensics.
+  #
+  # SOFT REVERT: set engagement_decouple: false to fall back to
+  # strict-fused-ID engagement (legacy behaviour byte-equivalent).
+  engagement_decouple: true
+  # Radius (degrees in world frame) within which a re-attach is
+  # considered the same physical target. 1.5° at typical bench
+  # ranges (10-200 m) corresponds to physical distances of
+  # ~0.25 m (close) to ~5 m (far), well within "same target moved
+  # slightly" tolerances and far below "different target nearby."
+  engagement_search_radius_deg: 1.5
+
   # ── Lock mode (rock-solid persistent tracker) ──────────────────
   #
   # When the operator presses TRACK, spawn a dedicated per-sensor
