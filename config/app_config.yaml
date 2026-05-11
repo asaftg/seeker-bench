@@ -720,7 +720,10 @@ fusion:
                                 # observation blackout → legacy IoU was 0.
   vel_alpha: 0.30               # velocity EMA blend; lower=smoother, higher=snappier
   vel_clip_dps: 30.0            # clip outlier velocity spikes (wrong-assoc protect)
-  vel_lead_max_s: 1.5           # max extrapolation horizon (clamps dt)
+  vel_lead_max_s: 2.5           # max extrapolation horizon (clamps dt). Raised
+                                # 1.5->2.5 on 2026-05-10 to cover the Waymo
+                                # parked->rolling 2.84s blackout. vel_clip_dps
+                                # still protects against runaway spikes.
   size_alpha: 0.7               # size-EMA blend (faster than position EMA's 0.4 —
                                 # adapts to aspect changes during motion onset)
   size_freeze_during_blackout: true   # don't decay size on no-match ticks
