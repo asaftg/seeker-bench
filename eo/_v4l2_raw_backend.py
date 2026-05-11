@@ -205,6 +205,12 @@ class RawV4L2Backend:
         # Per-frame raw u16 stats — fed to seeker's eo_manager AE loop.
         # Same shape as LeopardSDKStreamCapture.last_raw_stats on Windows.
         self.last_raw_stats: Optional[dict] = None
+        # AGC alpha/beta EMA-smoothing state. On dim scenes the raw
+        # span can be <20 counts; even 1-count sensor noise on p1/p99
+        # swings alpha=255/span by ~10%, perceived as a 1-3 second
+        # brightness pulse on a static frame. Smoothed across recomputes.
+        self._agc_alpha_smooth: Optional[float] = None
+        self._agc_beta_smooth: Optional[float] = None
         # Cache the last successful frame so grab() can return it on a
         # transient DQBUF timeout instead of None. seeker's eo_manager
         # treats grab()==None as "device disconnected" and tears the cap
@@ -507,24 +513,31 @@ class RawV4L2Backend:
         # AGX (now ~6ms). Profiled 2026-05-08: cv2.convertScaleAbs at 6.3ms,
         # cv2.cvtColor mono->BGR at ~3ms, total ~9ms vs 32ms before.
         #
-        # Always-stretch AGC. Restored 2026-05-11 to match the
-        # pre-ea79b97 behavior that worked at pitch-black night.
-        # The intermediate degenerate-span fallback ("if span<32 use
-        # raw 12→8 mapping") was a misdirected attempt to make a
-        # uniform-saturated scene render WHITE instead of BLACK; in
-        # practice it caught common mid-range uniform regions (sky,
-        # wall, road through 11° HFOV) and posterized them to black
-        # on every small gimbal move whenever the strided percentile
-        # sampler missed bright pixels. Per the operator: the sensor
-        # is for detecting people at pitch-black night — always
-        # stretch what's there, never fall back to a 12→8 collapse.
-        # Saturated-bright edge case (lens covered, span literally 0)
-        # still produces dark output here (alpha=63, beta cancels);
-        # accept that as a "sensor saturated" cue rather than reintroduce
-        # the fallback.
+        # Always-stretch AGC (pre-ea79b97 formula): always stretch
+        # what is there, no fallback. Saturated-bright edge case (lens
+        # covered, span literally 0) renders dark — accept as a sensor
+        # cue rather than re-introduce the degenerate-span branch that
+        # posterized real scenes.
         span = max(s_p99 - s_p1, 4.0)
-        alpha = 255.0 / span
-        beta = -s_p1 * alpha
+        alpha_now = 255.0 / span
+        beta_now = -s_p1 * alpha_now
+
+        # EMA-smooth alpha/beta across recomputes (mix=0.2 → ~5
+        # recompute time-constant ≈ 2 s at 13 fps × every-5-frames).
+        # Damps the per-recompute jitter that comes from sensor noise
+        # on dim scenes (where span is <20 counts and 1-count p1/p99
+        # noise swings alpha by 10%). Real scene changes (gimbal sweep
+        # to a brighter region) still propagate within ~1 s.
+        if self._agc_alpha_smooth is None:
+            self._agc_alpha_smooth = alpha_now
+            self._agc_beta_smooth = beta_now
+        else:
+            mix = 0.2
+            self._agc_alpha_smooth = (1.0 - mix) * self._agc_alpha_smooth + mix * alpha_now
+            self._agc_beta_smooth  = (1.0 - mix) * self._agc_beta_smooth  + mix * beta_now
+        alpha = self._agc_alpha_smooth
+        beta  = self._agc_beta_smooth
+
         y8 = cv2.convertScaleAbs(u16, alpha=alpha, beta=beta)
 
         # Replicate luma to BGR — matches IMX568Capture's documented
