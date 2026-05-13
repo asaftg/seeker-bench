@@ -448,7 +448,7 @@ radar:
   # profileCfg (slope 8.883 MHz/µs, ADC 30 MHz) supports ~250 m max
   # unambiguous range — we pin max_range_m to the full capability.
   # If you ever need further: author a new .cfg with a shallower slope.
-  max_range_m: 250.0
+  max_range_m: 500.0
   # Narrow the useful azimuth window — the AWR2944P antenna has lobes
   # well off-boresight but most of that energy is sidelobe clutter at
   # long range. Gating to ±az_half_deg concentrates the displayed point

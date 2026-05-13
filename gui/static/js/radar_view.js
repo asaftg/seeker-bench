@@ -37,7 +37,7 @@ const STATIC_DOPPLER_MPS = 0.2;
 // reference — the whole reason we jump views instead of hugging the
 // farthest target is to keep that mark meaningful.
 const NEAR_VIEW_M   = 100;
-const FAR_VIEW_M    = 250;
+const FAR_VIEW_M    = 500;
 const SHRINK_FRAMES = 30;
 // Small dead-zone above 100 m so a bbox straddling the boundary
 // doesn't chatter between views.
