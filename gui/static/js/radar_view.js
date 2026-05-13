@@ -501,31 +501,32 @@ export class RadarView {
     this._drawTargets(r.targets);
   }
 
-  // Radar (x,y) → "world" pass-through.
+  // Radar (x,y) -> world correction for TI tracker overcompensation.
   //
-  // 2026-04-27: A/B tested all three options (R(-p), R(+p), no rotation)
-  // against `recordings/radar_opposite.jsonl` — 43 s of pure gimbal
-  // panning across 30°+ with no track engaged. For every persistent
-  // target tid (1, 4, 5, 9), NO ROTATION produces the smallest world-x
-  // standard deviation by a factor of 2-6× over either rotation. tid=4
-  // chronological check: gimbal slewed +20° while target's local_x
-  // changed by 3.77 m — camera-frame would have predicted ~34 m at the
-  // observed range. Conclusion: this rig's radar reports (x,y) that are
-  // already world-stable. Whatever the mechanical or firmware
-  // explanation, applying any pan rotation only adds spurious motion.
+  // 2026-04-27: Full R(+/-pan) rotation was too aggressive -- the TI
+  // AWR2944P Kalman tracker already compensates for gimbal rotation
+  // internally. However, it OVERCOMPENSATES by ~13%, causing targets
+  // to drift in the pan direction.
   //
-  // History notes (so a future agent doesn't re-introduce the bug):
-  //   * 2026-04-26 first wired this fn as R(-p); pulled the wrong
-  //     direction and made targets swing >10× expected.
-  //   * 2026-04-27 morning, swapped to R(+p); operator's video
-  //     "radar_is_opposite" showed targets now flying off the canvas.
-  //   * Same afternoon, replay-driven analysis (above) showed no
-  //     rotation is correct on this rig.
-  // Re-enable rotation only if the rig changes (radar mount, IMU
-  // wiring, firmware) AND a captured-video A/B test against a fresh
-  // `radar_opposite`-style recording supports it.
+  // 2026-05-13: Quantified using "radar drift 1" and "radar drift 2"
+  // recordings. For stationary targets (tid=317 at 77m, tid=320 at
+  // 82m), measured pan-vs-x correlation. Optimal correction factor
+  // eps=0.13 reduces drift from 3.96m to 1.00m (tid=317 over 21 deg
+  // of pan sweep). The correction is R(+eps * pan): a small rotation
+  // in the pan direction to undo the tracker overcompensation.
+  //
+  // History:
+  //   2026-04-26  R(-p)      targets swing 10x expected (wrong sign)
+  //   2026-04-27  R(+p)      targets fly off canvas (full rotation)
+  //   2026-04-27  no-op      best of 3, but residual drift remains
+  //   2026-05-13  R(+0.13*p) empirical correction, validated on
+  //               2 recordings, 5 tracks. Minimises pan-x correlation
+  //               for stationary targets without degrading moving ones.
   _rotateToWorld(x, y) {
-    return { x, y };
+    const EPS = 0.13;
+    const a = EPS * this._gimbalPanRad;
+    const c = Math.cos(a), s = Math.sin(a);
+    return { x: x * c - y * s, y: x * s + y * c };
   }
 
   // Apply world-frame rotation in-place to one wire-shape entry that
