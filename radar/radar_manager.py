@@ -198,6 +198,30 @@ class RadarManager:
             if el_bias_deg is not None:
                 self.el_bias_deg = float(el_bias_deg)
 
+    def get_extrinsic(self) -> dict:
+        """Return the live radar az/el biases.
+
+        Symmetric with `set_extrinsic`. The GUI's `extrinsic_save`
+        handler calls this to capture the operator's tuned values
+        BEFORE writing them to `config/calibration.json`.
+
+        Bug history (2026-05-12 fix): this method was missing for the
+        entire life of RadarManager. `gui/app.py:1075` calls
+        `rm.get_extrinsic()` inside a broad try/except — the
+        `AttributeError` was silently caught, the payload sent to
+        `calibration_store.save()` had no `radar_az`/`radar_el`
+        keys, the store's "leave-untouched" semantics never wrote
+        any radar bias to disk, and the operator's calibration
+        evaporated on every restart. Visible in the existing
+        `config/calibration.json`: `radar: {}` while `thermal` has
+        values.
+        """
+        with self._tune_lock:
+            return {
+                "az_bias_deg": float(self.az_bias_deg),
+                "el_bias_deg": float(self.el_bias_deg),
+            }
+
     def get_tuning(self) -> dict:
         cp = self._clusterer.params
         return {
@@ -342,7 +366,43 @@ class RadarManager:
         return None
 
     def _run_xds110_reset(self) -> bool:
-        """Pulse nRST on the AWR via XDS110 JTAG. Returns True on exit 0."""
+        """Pulse nRST on the AWR via the XDS110 debug bridge. Returns True
+        on success. Linux uses an in-tree pyusb-based pulser
+        (``tools/xds110reset_linux.py``); Windows shells out to TI's
+        ``xds110reset.exe`` shipped with CCS.
+
+        On Linux the AWR2944P's XDS110 is fully software-resettable via
+        libusb — no CCS install is required. The pyusb path was added
+        2026-05-08 when seeker moved from Windows to the Jetson; the
+        Windows-only path stayed in place for the bench laptop.
+        """
+        import sys as _sys
+        if _sys.platform.startswith("linux"):
+            try:
+                import os as _os2
+                _tools_dir = _os2.path.join(
+                    _os2.path.dirname(_os2.path.dirname(_os2.path.abspath(__file__))),
+                    "tools",
+                )
+                if _tools_dir not in _sys.path:
+                    _sys.path.insert(0, _tools_dir)
+                from xds110reset_linux import xds110_pulse_nrst
+            except Exception as e:
+                log.error(
+                    "[ISSUE2-RECOVERY] xds110reset_linux import failed: %s "
+                    "(install pyusb in the venv, then retry)", e,
+                )
+                return False
+            log.warning("[ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)")
+            try:
+                xds110_pulse_nrst(hold_ms=80)
+            except Exception as e:
+                log.error("[ISSUE2-RECOVERY] xds110reset_linux failed: %s", e)
+                return False
+            log.info("[ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting")
+            return True
+
+        # ---- Windows path (legacy) ----
         exe = self._find_xds110_reset()
         if exe is None:
             log.error(
