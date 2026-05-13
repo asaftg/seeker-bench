@@ -243,6 +243,29 @@ def main() -> int:
                 r_pos_m=float(_trk.get("r_pos_m", _defaults.r_pos_m)),
                 graveyard_ttl_s=float(_trk.get("graveyard_ttl_s", _defaults.graveyard_ttl_s)),
                 resurrect_radius_m=float(_trk.get("resurrect_radius_m", _defaults.resurrect_radius_m)),
+                # 2026-05-12 graveyard upgrades — read from tracker block.
+                bury_unconfirmed=bool(_trk.get(
+                    "bury_unconfirmed", _defaults.bury_unconfirmed)),
+                graveyard_unconfirmed_ttl_s=float(_trk.get(
+                    "graveyard_unconfirmed_ttl_s",
+                    _defaults.graveyard_unconfirmed_ttl_s)),
+                resurrect_radius_per_meter=float(_trk.get(
+                    "resurrect_radius_per_meter",
+                    _defaults.resurrect_radius_per_meter)),
+                # 2026-05-12 post-DBSCAN merge — under `radar:` not
+                # `radar.tracker:` because it's a cluster-stage concern.
+                post_dbscan_merge_enabled=bool(radar_cfg.get(
+                    "post_dbscan_merge_enabled",
+                    _defaults.post_dbscan_merge_enabled)),
+                cluster_merge_dist_m=float(radar_cfg.get(
+                    "cluster_merge_dist_m",
+                    _defaults.cluster_merge_dist_m)),
+                cluster_merge_dist_per_meter=float(radar_cfg.get(
+                    "cluster_merge_dist_per_meter",
+                    _defaults.cluster_merge_dist_per_meter)),
+                cluster_merge_max_doppler_diff_mps=float(radar_cfg.get(
+                    "cluster_merge_max_doppler_diff_mps",
+                    _defaults.cluster_merge_max_doppler_diff_mps)),
             )
             _ext = (radar_cfg.get("extrinsic") or {})
             radar = RadarManager(

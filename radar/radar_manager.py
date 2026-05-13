@@ -198,6 +198,30 @@ class RadarManager:
             if el_bias_deg is not None:
                 self.el_bias_deg = float(el_bias_deg)
 
+    def get_extrinsic(self) -> dict:
+        """Return the live radar az/el biases.
+
+        Symmetric with `set_extrinsic`. The GUI's `extrinsic_save`
+        handler calls this to capture the operator's tuned values
+        BEFORE writing them to `config/calibration.json`.
+
+        Bug history (2026-05-12 fix): this method was missing for the
+        entire life of RadarManager. `gui/app.py` calls
+        `rm.get_extrinsic()` inside a broad try/except — the
+        `AttributeError` was silently caught, the payload sent to
+        `calibration_store.save()` had no `radar_az`/`radar_el`
+        keys, the store's "leave-untouched" partial-update semantics
+        never wrote any radar bias to disk, and the operator's
+        hand-tuned calibration evaporated on every restart. Visible
+        in `config/calibration.json`: `radar: {}` while `thermal`
+        has values.
+        """
+        with self._tune_lock:
+            return {
+                "az_bias_deg": float(self.az_bias_deg),
+                "el_bias_deg": float(self.el_bias_deg),
+            }
+
     def get_tuning(self) -> dict:
         cp = self._clusterer.params
         return {

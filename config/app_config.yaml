@@ -485,6 +485,25 @@ radar:
   # confirmation below kills the rare 2-point coincidence false positive.
   cluster_min_samples: 2
 
+  # 2026-05-12 — post-DBSCAN cluster-merge pass. Fixes operator-
+  # reported "multiple bboxes on one physical target" (FedEx truck
+  # at any range, human at close range). DBSCAN splits one physical
+  # target into 2-4 fragments when surfaces have different
+  # micro-doppler (wheels spin, body translates). Each fragment
+  # becomes its own track in the GUI.
+  #
+  # The merge pass runs AFTER DBSCAN: pairs of clusters merge if
+  # (a) their bounding boxes overlap in 3D, OR (b) their centroid
+  # distance is below `cluster_merge_dist_m + per_meter * range`
+  # AND their mean doppler diff is below max_doppler_diff_mps
+  # (so opposing traffic doesn't merge).
+  #
+  # SOFT REVERT: set post_dbscan_merge_enabled: false.
+  post_dbscan_merge_enabled: true
+  cluster_merge_dist_m: 4.0
+  cluster_merge_dist_per_meter: 0.04
+  cluster_merge_max_doppler_diff_mps: 3.0
+
   # Kalman tracker — stabilises bboxes through flicker and brief dropouts.
   # The clusterer runs a 6D constant-velocity Kalman filter per tracklet,
   # predicts forward on frames with no association (coasting), and only
@@ -539,6 +558,25 @@ radar:
     # changing direction) comes back with a fresh ID.
     graveyard_ttl_s: 4.0
     resurrect_radius_m: 12.0
+    # 2026-05-12 graveyard upgrades — fix operator-reported
+    # "targets fading + new IDs born a lot" on big trucks at
+    # close range. Two changes, both gated by YAML knobs:
+    #
+    # bury_unconfirmed: bury ALSO unconfirmed-but-coasting tracks
+    #   (was: confirmed-only). The original policy left short-lived
+    #   clusters that fragmented (FedEx truck) without ID
+    #   preservation — each new fragment minted a fresh tid.
+    #   Unconfirmed entries get a SHORTER TTL so noise doesn't clog
+    #   the dict. Default ON.
+    bury_unconfirmed: true
+    graveyard_unconfirmed_ttl_s: 1.5
+    # resurrect_radius_per_meter: scale resurrect radius with the
+    # buried track's last slant range. At long range a small
+    # angular shift projects to a larger physical distance, so a
+    # flat 12m gate misses re-acquires. 0.05 -> +5cm per meter of
+    # range -> at 200m the effective radius is 12 + 10 = 22m.
+    # Set 0 to keep flat `resurrect_radius_m` only (legacy).
+    resurrect_radius_per_meter: 0.05
 
 fusion:
   # Cross-sensor fusion (Ticket 5). Reads Thermal + EO (+ Radar when
