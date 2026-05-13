@@ -834,13 +834,19 @@ class RadarManager:
                and abs(d.doppler_mps) >= speed_gate
         ]
 
-        # 2. DBSCAN + tracklet association.
-        gated, targets = self._clusterer.step(gated)
-
-        self._frame_id += 1
-        # See ThermalManager._process_and_publish — bind gimbal pose
-        # at frame ingest so fusion can convert to world-frame using
-        # the pose at capture, not at fusion-tick time.
+        # 2a. Rotate detections from sensor frame to world frame.
+        #
+        # The AWR2944P outputs in sensor frame (+y = boresight).
+        # Rotating BEFORE the Kalman tracker means the tracker
+        # operates in world frame, so target positions stay
+        # stable when the gimbal pans.
+        #
+        # 2026-05-13: Validated with radar drift 1/2 and
+        # radar drift teal line recordings — raw points in
+        # sensor frame confirmed (R(-pan) reduces world-x drift
+        # by 30%). Kalman-in-world-frame eliminates the lag/
+        # overcompensation artifact that made display-side
+        # rotation fail.
         gs_for_capture = BUS.get_latest(Topic.GIMBAL)
         if isinstance(gs_for_capture, GimbalState):
             gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
@@ -848,6 +854,20 @@ class RadarManager:
         else:
             gimbal_pan_at_capture = None
             gimbal_tilt_at_capture = None
+
+        if gimbal_pan_at_capture is not None:
+            pan_rad = _m.radians(gimbal_pan_at_capture)
+            cos_p = _m.cos(pan_rad)
+            sin_p = _m.sin(pan_rad)
+            for d in gated:
+                sx, sy = d.x_m, d.y_m
+                d.x_m = sx * cos_p + sy * sin_p
+                d.y_m = -sx * sin_p + sy * cos_p
+
+        # 2b. DBSCAN + tracklet association (now in world frame).
+        gated, targets = self._clusterer.step(gated)
+
+        self._frame_id += 1
         rf = RadarFrame(
             timestamp=time.time(),
             frame_id=self._frame_id,

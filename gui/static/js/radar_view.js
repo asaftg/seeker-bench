@@ -501,32 +501,24 @@ export class RadarView {
     this._drawTargets(r.targets);
   }
 
-  // Radar (x,y) -> world correction for TI tracker overcompensation.
+  // Radar (x,y) -> world: pass-through.
   //
-  // 2026-04-27: Full R(+/-pan) rotation was too aggressive -- the TI
-  // AWR2944P Kalman tracker already compensates for gimbal rotation
-  // internally. However, it OVERCOMPENSATES by ~13%, causing targets
-  // to drift in the pan direction.
-  //
-  // 2026-05-13: Quantified using "radar drift 1" and "radar drift 2"
-  // recordings. For stationary targets (tid=317 at 77m, tid=320 at
-  // 82m), measured pan-vs-x correlation. Optimal correction factor
-  // eps=0.13 reduces drift from 3.96m to 1.00m (tid=317 over 21 deg
-  // of pan sweep). The correction is R(+eps * pan): a small rotation
-  // in the pan direction to undo the tracker overcompensation.
+  // The radar pipeline now rotates detections from sensor
+  // frame to world frame BEFORE the Kalman tracker
+  // (radar_manager.py, 2026-05-13). So the wire carries
+  // world-frame coordinates and no display-side rotation
+  // is needed.
   //
   // History:
-  //   2026-04-26  R(-p)      targets swing 10x expected (wrong sign)
-  //   2026-04-27  R(+p)      targets fly off canvas (full rotation)
-  //   2026-04-27  no-op      best of 3, but residual drift remains
-  //   2026-05-13  R(+0.13*p) empirical correction, validated on
-  //               2 recordings, 5 tracks. Minimises pan-x correlation
-  //               for stationary targets without degrading moving ones.
+  //   2026-04-26  R(-p)      wrong sign, targets swung 10x
+  //   2026-04-27  R(+p)      targets flew off canvas
+  //   2026-04-27  no-op      best of 3, residual drift
+  //   2026-05-13  R(+0.13*p) display-side partial correction
+  //              (wrong: helped some tracks, hurt others)
+  //   2026-05-13  no-op      server now rotates detections
+  //              to world frame before Kalman tracker
   _rotateToWorld(x, y) {
-    const EPS = 0.13;
-    const a = EPS * this._gimbalPanRad;
-    const c = Math.cos(a), s = Math.sin(a);
-    return { x: x * c - y * s, y: x * s + y * c };
+    return { x, y };
   }
 
   // Apply world-frame rotation in-place to one wire-shape entry that
