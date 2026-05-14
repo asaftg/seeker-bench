@@ -434,8 +434,8 @@ class CompositeRadarBackend:
         # cfarCfg -1 1 <mode> <noiseWin> ... <thresholdScale> ...
         def replace_range_cfar(m):
             fields = m.group(0).split()
-            # fields[7] is thresholdScale for range CFAR
-            fields[7] = f"{threshold_db:.1f}"
+            # fields[8] is thresholdScale for range CFAR (fields[0]=cfarCfg)
+            fields[8] = f"{threshold_db:.1f}"
             return " ".join(fields)
 
         new_text = _re.sub(
