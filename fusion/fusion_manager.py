@@ -700,7 +700,22 @@ class FusionManager:
         # one bbox-width). Re-introducing either fix needs a multi-
         # vehicle-scene replay test, not just a YOLO-id-swap one.
         for c in candidates:
-            best_i, best_iou = -1, 0.0
+            # ── radar_tid forced re-association ──
+            # If this candidate carries a radar_tid matching an existing
+            # fused track, force-match there. Prevents new fused tracks
+            # from spawning when radar briefly coasts then reappears
+            # with slightly different angles.
+            rtid = c.get("radar_tid")
+            forced_i = -1
+            if rtid is not None and "radar" in c.get("sensors", []):
+                for _fi in range(n_existing):
+                    if not matched[_fi] and self._tracks[_fi].get("radar_tid") == rtid:
+                        forced_i = _fi
+                        break
+            if forced_i >= 0:
+                best_i, best_iou = forced_i, 1.0
+            else:
+                best_i, best_iou = -1, 0.0
             for i in range(n_existing):
                 trk = self._tracks[i]
                 if matched[i] or not self._class_compatible(trk["class"], c["class"]):
