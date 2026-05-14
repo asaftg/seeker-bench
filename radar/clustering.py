@@ -97,6 +97,12 @@ class ClusterParams:
     # first cluster claims the real track, the orphan is its split
     # sibling, not a separate object.
     merge_overlap_m: float = 5.0
+    # Track-level merge: after per-frame association, merge
+    # confirmed tracks whose centroids are within this gate.
+    # Catches split-siblings that already established separate
+    # tracks (DBSCAN splits that self-perpetuate because each
+    # cluster matches its own track every frame).
+    track_merge_dist_m: float = 6.0
     # Tracker persistence
     coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
     # Proportional coast: a track must accumulate this many hits to
@@ -484,6 +490,10 @@ class RadarClusterer:
 
             cid_to_tid[cid] = tid
 
+        # Merge confirmed tracks that are too close to be separate
+        # objects. Catches self-perpetuating DBSCAN split-siblings.
+        self._merge_close_tracks(matched_tracks)
+
         # Age un-matched tracklets.
         for tid, trk in list(self._tracks.items()):
             if tid not in matched_tracks:
@@ -535,6 +545,57 @@ class RadarClusterer:
                 best_d2 = d2
                 best_tid = tid
         return best_tid
+
+    def _merge_close_tracks(self, active_tids: set) -> None:
+        """Merge confirmed tracks that are too close to be separate objects.
+
+        After the per-frame association loop, two DBSCAN-split siblings
+        can each match their own existing track — the overlap check
+        never fires. This pass catches that case: for each pair of
+        active (hit-this-frame) confirmed tracks, if their centroids
+        are within track_merge_dist_m, absorb the weaker one.
+        """
+        gate2 = self.params.track_merge_dist_m ** 2
+        tids = [t for t in active_tids
+                if t in self._tracks and self._tracks[t].confirmed]
+        absorbed: set = set()
+        for i_idx in range(len(tids)):
+            a_tid = tids[i_idx]
+            if a_tid in absorbed:
+                continue
+            trk_a = self._tracks.get(a_tid)
+            if trk_a is None:
+                continue
+            for j_idx in range(i_idx + 1, len(tids)):
+                b_tid = tids[j_idx]
+                if b_tid in absorbed:
+                    continue
+                trk_b = self._tracks.get(b_tid)
+                if trk_b is None:
+                    continue
+                d = trk_a.centroid - trk_b.centroid
+                if float(d @ d) < gate2:
+                    # Merge: keep the track with more hits
+                    if trk_a.hits >= trk_b.hits:
+                        winner, loser_tid = trk_a, b_tid
+                    else:
+                        winner, loser_tid = trk_b, a_tid
+                    loser = self._tracks[loser_tid]
+                    # Transfer peak SNR
+                    winner.peak_snr = max(winner.peak_snr, loser.peak_snr)
+                    # Bury the loser for ID resurrection later
+                    now_t = self._last_step_t or time.time()
+                    self._graveyard[loser_tid] = _GraveyardEntry(
+                        centroid=loser.centroid.copy(),
+                        velocity=loser.velocity.copy(),
+                        buried_t=now_t,
+                        was_confirmed=bool(loser.confirmed),
+                        hits_at_burial=int(loser.hits),
+                        last_range_m=float(np.linalg.norm(loser.centroid)),
+                    )
+                    del self._tracks[loser_tid]
+                    absorbed.add(loser_tid)
+                    break  # trk_a state may have changed
 
     def _overlaps_matched(
         self, centroid: np.ndarray, matched: set[int]
