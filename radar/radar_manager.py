@@ -33,7 +33,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import serial
 
@@ -122,6 +122,19 @@ class RadarManager:
         self._data_ser: Optional[serial.Serial] = None
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
+
+        # Gimbal angle history for timing compensation.
+        # Radar data arrives ~40-80 ms after the chirp was captured.
+        # Reading BUS.get_latest(Topic.GIMBAL) at process time uses
+        # an angle that is stale by that pipeline delay. During pan
+        # at 15-20 deg/s that is 0.6-1.6 deg of angle error = drift.
+        #
+        # Fix: sample gimbal angle into a ring buffer from the capture
+        # loop (runs at ~20 Hz), queue packets with their receive
+        # timestamp, and interpolate the gimbal angle at rx_time in
+        # the process thread.
+        self._gimbal_history: "deque[Tuple[float, float, float]]" = deque(maxlen=200)
+        self._gimbal_history_lock = threading.Lock()
 
         # Optional hook fired AFTER a successful xds110reset chip recovery
         # but BEFORE _push_profile pushes the cfg. Composite registers a
@@ -718,6 +731,44 @@ class RadarManager:
                 pass
             self._data_ser = None
 
+    # --- gimbal angle timing compensation ---
+    def _sample_gimbal(self) -> None:
+        """Snapshot current gimbal angle into the history ring buffer."""
+        gs = BUS.get_latest(Topic.GIMBAL)
+        if isinstance(gs, GimbalState):
+            with self._gimbal_history_lock:
+                self._gimbal_history.append(
+                    (gs.timestamp, float(gs.pan_deg), float(gs.tilt_deg))
+                )
+
+    def _interp_gimbal(self, target_t: float) -> Tuple[Optional[float], Optional[float]]:
+        """Interpolate gimbal pan/tilt at *target_t* from the history.
+
+        Returns (pan_deg, tilt_deg) or (None, None) if history is empty.
+        Linear interpolation between the two bracketing samples.
+        """
+        with self._gimbal_history_lock:
+            hist = list(self._gimbal_history)
+        if not hist:
+            return None, None
+        # Clamp to bounds
+        if target_t <= hist[0][0]:
+            return hist[0][1], hist[0][2]
+        if target_t >= hist[-1][0]:
+            return hist[-1][1], hist[-1][2]
+        # Linear scan (typically <20 entries back from tail)
+        for i in range(len(hist) - 1, 0, -1):
+            t1, p1, tl1 = hist[i]
+            t0, p0, tl0 = hist[i - 1]
+            if t0 <= target_t <= t1:
+                dt = t1 - t0
+                alpha = (target_t - t0) / dt if dt > 0 else 0.0
+                return (
+                    p0 + alpha * (p1 - p0),
+                    tl0 + alpha * (tl1 - tl0),
+                )
+        return hist[-1][1], hist[-1][2]
+
     # ─────────────────────── capture loop ────────────────────
     def _capture_loop(self) -> None:
         stream = TLVStream()
@@ -750,13 +801,19 @@ class RadarManager:
                 continue
 
             now = time.monotonic()
+            # Sample gimbal into history on every loop iteration
+            # (~20 Hz when chip is streaming). This builds the angle
+            # timeline that _interp_gimbal looks up against.
+            self._sample_gimbal()
+
             if chunk:
                 for pkt in stream.feed(chunk):
+                    rx_time = time.time()  # host clock at UART receive
                     with self._pkt_cond:
                         # deque(maxlen=8) auto-evicts oldest on overflow
                         # — that's the back-pressure behaviour we want
                         # if process_and_publish ever lags chip rate.
-                        self._pkt_queue.append(pkt)
+                        self._pkt_queue.append((pkt, rx_time))
                         self._pkt_cond.notify()
                     last_pkt_time = now
 
@@ -803,14 +860,14 @@ class RadarManager:
                     self._pkt_cond.wait(timeout=0.5)
                 if self._stop.is_set():
                     break
-                pkt = self._pkt_queue.popleft()
+                pkt, rx_time = self._pkt_queue.popleft()
             try:
-                self._process_and_publish(pkt)
+                self._process_and_publish(pkt, rx_time)
             except Exception as e:
                 log.exception("Radar process loop error: %s", e)
         log.info("RadarProcess thread stopped")
 
-    def _process_and_publish(self, pkt: RadarPacket) -> None:
+    def _process_and_publish(self, pkt: RadarPacket, rx_time: float = 0.0) -> None:
         # 1. SNR + range gate. Points whose SNR is NaN (this build of
         #    mmw_demoDDM does not emit the SideInfo TLV) pass the SNR
         #    test automatically — we can't reject on a signal we don't
@@ -841,19 +898,17 @@ class RadarManager:
         # operates in world frame, so target positions stay
         # stable when the gimbal pans.
         #
-        # 2026-05-13: Validated with radar drift 1/2 and
-        # radar drift teal line recordings — raw points in
-        # sensor frame confirmed (R(-pan) reduces world-x drift
-        # by 30%). Kalman-in-world-frame eliminates the lag/
-        # overcompensation artifact that made display-side
-        # rotation fail.
-        gs_for_capture = BUS.get_latest(Topic.GIMBAL)
-        if isinstance(gs_for_capture, GimbalState):
-            gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
-            gimbal_tilt_at_capture = float(gs_for_capture.tilt_deg)
-        else:
-            gimbal_pan_at_capture = None
-            gimbal_tilt_at_capture = None
+        # 2026-05-13 v1: Validated with drift recordings. Kalman-
+        # in-world-frame eliminates the lag/overcompensation
+        # artifact that made display-side rotation fail.
+        #
+        # 2026-05-13 v2: Timing compensation. The chirp is captured
+        # ~40-80 ms before we process it here. Using the gimbal
+        # angle at process-time caused 0.17-0.30 m/deg residual
+        # drift during pan. Now we interpolate the gimbal angle
+        # at the UART receive time from a ring buffer sampled in
+        # the capture loop.
+        gimbal_pan_at_capture, gimbal_tilt_at_capture = self._interp_gimbal(rx_time)
 
         if gimbal_pan_at_capture is not None:
             pan_rad = _m.radians(gimbal_pan_at_capture)

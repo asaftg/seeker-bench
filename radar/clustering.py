@@ -110,7 +110,7 @@ class ClusterParams:
     # position near where the target actually is when it reappears.
     coast_vel_halflife_s: float = 1.0
     # Kalman
-    q_accel_mps2: float = 3.0           # higher = tracks pivots faster
+    q_accel_mps2: float = 6.0           # higher = tracks pivots faster (was 3.0, bumped for pan-drift)
     r_pos_m: float = 0.4
     # Track graveyard — reaped tracks are stashed for this many seconds
     # before being fully forgotten. When a would-be new track's centroid
