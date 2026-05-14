@@ -184,7 +184,7 @@ class _Tracklet:
 
     __slots__ = (
         "tid", "x", "P", "size_half", "hits", "misses",
-        "hit_history", "confirmed", "last_hit_t",
+        "hit_history", "confirmed", "last_hit_t", "peak_snr",
     )
 
     def __init__(
@@ -210,6 +210,7 @@ class _Tracklet:
         self.misses = 0
         self.hit_history: List[bool] = [True]
         self.confirmed = False
+        self.peak_snr = 0.0
         self.last_hit_t = now_t
 
     def predict(
@@ -414,7 +415,12 @@ class RadarClusterer:
             r = max(float(np.linalg.norm(centroid)), 1e-3)
             dir_hat = centroid / r
             vel = dir_hat * float(ds.mean())
-            frame_clusters.append((cid, centroid, half, vel, len(idxs)))
+            # Max SNR of constituent detections for coast budget.
+            _snrs = [float(detections[ii].snr_db) for ii in idxs
+                     if detections[ii].snr_db is not None
+                     and detections[ii].snr_db == detections[ii].snr_db]  # skip NaN
+            max_snr = max(_snrs) if _snrs else 0.0
+            frame_clusters.append((cid, centroid, half, vel, len(idxs), max_snr))
 
         # Associate largest clusters first (greedy).
         frame_clusters.sort(key=lambda t: -t[4])
@@ -422,7 +428,7 @@ class RadarClusterer:
         matched_tracks: set[int] = set()
         cid_to_tid: Dict[int, int] = {}
 
-        for cid, centroid, half, vel, n_pts in frame_clusters:
+        for cid, centroid, half, vel, n_pts, max_snr in frame_clusters:
             tid = self._find_best_track(centroid, exclude=matched_tracks)
             if tid is None:
                 # Before creating a new track, check if this cluster is
@@ -459,6 +465,7 @@ class RadarClusterer:
                 # visible again would show a brief "gap" in the trail.
                 if resurrected_tid is not None:
                     new_trk.confirmed = True
+                new_trk.peak_snr = max_snr
                 self._tracks[tid] = new_trk
             else:
                 trk = self._tracks[tid]
@@ -472,6 +479,7 @@ class RadarClusterer:
                     self.params.confirm_min_hits,
                 )
                 trk.last_hit_t = now_t
+                trk.peak_snr = max(0.3 * trk.peak_snr + 0.7 * max_snr, trk.peak_snr)
                 matched_tracks.add(tid)
 
             cid_to_tid[cid] = tid
@@ -657,6 +665,9 @@ class RadarClusterer:
             speed = float(np.linalg.norm(trk.velocity[:2]))
             if speed > self.params.coast_moving_speed_mps:
                 base = max(base, self.params.coast_moving_floor_frames)
+            # High-SNR targets are strong returns (vehicles) — give extra coast
+            if trk.peak_snr > 15.0:  # strong return
+                base = max(base, 20)
             return base
         dead = [tid for tid, trk in self._tracks.items()
                 if trk.misses > _effective_coast(trk)]
@@ -813,6 +824,7 @@ class RadarClusterer:
             coasting=bool(coasting),
             hits=int(trk.hits),
             misses=int(trk.misses),
+            snr_db=float(trk.peak_snr),
         )
 
 
