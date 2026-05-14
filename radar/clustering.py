@@ -106,6 +106,13 @@ class ClusterParams:
     # This kills false-confirmation ghosts: a clutter cluster that
     # scored 2/3 hits coasts ~5 frames instead of 30.
     coast_maturity_hits: int = 10
+    # Moving-target coast floor: if the track's 2D ground speed
+    # exceeds this threshold, it gets at least this many frames of
+    # coast even with few hits. Distinguishes walking humans
+    # (~1 m/s) from static clutter (~0 m/s) which both have low
+    # hit counts early in life.
+    coast_moving_speed_mps: float = 0.5
+    coast_moving_floor_frames: int = 15  # ~1.2s at 13 Hz
     confirm_min_hits: int = 2
     confirm_window: int = 3
     # Velocity half-life during coast (seconds). The Kalman's velocity
@@ -642,11 +649,15 @@ class RadarClusterer:
     def _reap(self) -> None:
         now_t = self._last_step_t or time.time()
         def _effective_coast(trk) -> int:
-            """Proportional coast: immature tracks get shorter budget."""
+            """Proportional coast + velocity floor."""
             mh = self.params.coast_maturity_hits
             if trk.hits >= mh:
                 return self.params.coast_max_frames
-            return max(3, self.params.coast_max_frames * trk.hits // mh)
+            base = max(3, self.params.coast_max_frames * trk.hits // mh)
+            speed = float(np.linalg.norm(trk.velocity[:2]))
+            if speed > self.params.coast_moving_speed_mps:
+                base = max(base, self.params.coast_moving_floor_frames)
+            return base
         dead = [tid for tid, trk in self._tracks.items()
                 if trk.misses > _effective_coast(trk)]
         for tid in dead:
