@@ -99,6 +99,13 @@ class ClusterParams:
     merge_overlap_m: float = 5.0
     # Tracker persistence
     coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
+    # Proportional coast: a track must accumulate this many hits to
+    # earn the full coast budget.  Immature tracks (hits < this)
+    # get a proportionally shorter budget:
+    #   effective = max(3, coast_max_frames * hits / coast_maturity_hits)
+    # This kills false-confirmation ghosts: a clutter cluster that
+    # scored 2/3 hits coasts ~5 frames instead of 30.
+    coast_maturity_hits: int = 10
     confirm_min_hits: int = 2
     confirm_window: int = 3
     # Velocity half-life during coast (seconds). The Kalman's velocity
@@ -634,8 +641,14 @@ class RadarClusterer:
 
     def _reap(self) -> None:
         now_t = self._last_step_t or time.time()
+        def _effective_coast(trk) -> int:
+            """Proportional coast: immature tracks get shorter budget."""
+            mh = self.params.coast_maturity_hits
+            if trk.hits >= mh:
+                return self.params.coast_max_frames
+            return max(3, self.params.coast_max_frames * trk.hits // mh)
         dead = [tid for tid, trk in self._tracks.items()
-                if trk.misses > self.params.coast_max_frames]
+                if trk.misses > _effective_coast(trk)]
         for tid in dead:
             trk = self._tracks[tid]
             # 2026-05-12: bury BOTH confirmed and unconfirmed tracks.
