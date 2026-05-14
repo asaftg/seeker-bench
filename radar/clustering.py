@@ -102,7 +102,8 @@ class ClusterParams:
     # Catches split-siblings that already established separate
     # tracks (DBSCAN splits that self-perpetuate because each
     # cluster matches its own track every frame).
-    track_merge_dist_m: float = 6.0
+    track_merge_base_m: float = 5.0
+    track_merge_per_meter: float = 0.04  # +4cm/m of range
     # Tracker persistence
     coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
     # Proportional coast: a track must accumulate this many hits to
@@ -553,9 +554,12 @@ class RadarClusterer:
         can each match their own existing track — the overlap check
         never fires. This pass catches that case: for each pair of
         active (hit-this-frame) confirmed tracks, if their centroids
-        are within track_merge_dist_m, absorb the weaker one.
+        are within a range-adaptive gate (base + per_m * range),
+        absorb the weaker one. At 200m the gate is ~13m,
+        matching the angular resolution spread.
         """
-        gate2 = self.params.track_merge_dist_m ** 2
+        base_gate = self.params.track_merge_base_m
+        per_m = self.params.track_merge_per_meter
         tids = [t for t in active_tids
                 if t in self._tracks and self._tracks[t].confirmed]
         absorbed: set = set()
@@ -574,7 +578,11 @@ class RadarClusterer:
                 if trk_b is None:
                     continue
                 d = trk_a.centroid - trk_b.centroid
-                if float(d @ d) < gate2:
+                d2 = float(d @ d)
+                avg_range = 0.5 * (float(np.linalg.norm(trk_a.centroid))
+                                   + float(np.linalg.norm(trk_b.centroid)))
+                gate = base_gate + per_m * avg_range
+                if d2 < gate * gate:
                     # Merge: keep the track with more hits
                     if trk_a.hits >= trk_b.hits:
                         winner, loser_tid = trk_a, b_tid
