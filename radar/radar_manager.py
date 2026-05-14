@@ -911,7 +911,7 @@ class RadarManager:
         # Subtract estimated hardware pipeline delay (radar CFAR + UART
         # transfer) so we use the angle when the chirp was actually
         # captured, not when the bytes arrived at the host.
-        _RADAR_HW_DELAY_S = 0.045  # ~45 ms — tunable
+        _RADAR_HW_DELAY_S = 0.0  # disabled — rx_time alone is sufficient — tunable
         gimbal_pan_at_capture, gimbal_tilt_at_capture = self._interp_gimbal(
             rx_time - _RADAR_HW_DELAY_S
         )
