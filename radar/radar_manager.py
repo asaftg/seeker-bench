@@ -33,7 +33,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import serial
 
@@ -88,6 +88,7 @@ class RadarManager:
         self.range_min_m = float(range_min_m)
         self.profile_name = str(profile_name)
         self._tune_lock = threading.Lock()
+        self._cli_lock = threading.Lock()     # serialize CLI port access
         self.stream_timeout_s = float(stream_timeout_s)
         # Software extrinsic — applied to each radar target's az/el before
         # projection onto EO/thermal panels. Tuned live from GUI sliders
@@ -123,18 +124,12 @@ class RadarManager:
         self._frame_id: int = 0
         self._clusterer = RadarClusterer(cluster_params)
 
-        # Gimbal angle history for timing compensation.
-        # Radar data arrives ~40-80 ms after the chirp was captured.
-        # Reading BUS.get_latest(Topic.GIMBAL) at process time uses
-        # an angle that is stale by that pipeline delay. During pan
-        # at 15-20 deg/s that is 0.6-1.6 deg of angle error = drift.
-        #
-        # Fix: sample gimbal angle into a ring buffer from the capture
-        # loop (runs at ~20 Hz), queue packets with their receive
-        # timestamp, and interpolate the gimbal angle at rx_time in
-        # the process thread.
-        self._gimbal_history: "deque[Tuple[float, float, float]]" = deque(maxlen=200)
-        self._gimbal_history_lock = threading.Lock()
+        # Set by reconfigure() after a successful chip cfg push.
+        # The capture loop checks this on reconnect — when set, it
+        # skips _push_profile() (which would send sensorStop to an
+        # already-running chip, wedging the CLI on this firmware)
+        # and just reopens the data port.
+        self._reconfigure_done = threading.Event()
 
         # Optional hook fired AFTER a successful xds110reset chip recovery
         # but BEFORE _push_profile pushes the cfg. Composite registers a
@@ -219,15 +214,15 @@ class RadarManager:
         BEFORE writing them to `config/calibration.json`.
 
         Bug history (2026-05-12 fix): this method was missing for the
-        entire life of RadarManager. `gui/app.py` calls
+        entire life of RadarManager. `gui/app.py:1075` calls
         `rm.get_extrinsic()` inside a broad try/except — the
         `AttributeError` was silently caught, the payload sent to
         `calibration_store.save()` had no `radar_az`/`radar_el`
-        keys, the store's "leave-untouched" partial-update semantics
-        never wrote any radar bias to disk, and the operator's
-        hand-tuned calibration evaporated on every restart. Visible
-        in `config/calibration.json`: `radar: {}` while `thermal`
-        has values.
+        keys, the store's "leave-untouched" semantics never wrote
+        any radar bias to disk, and the operator's calibration
+        evaporated on every restart. Visible in the existing
+        `config/calibration.json`: `radar: {}` while `thermal` has
+        values.
         """
         with self._tune_lock:
             return {
@@ -526,6 +521,8 @@ class RadarManager:
     def _push_profile(self) -> bool:
         """Open CLI UART, bring sensor to STARTED, close. True on success.
 
+        Acquires ``_cli_lock`` so this cannot collide with ``reconfigure()``.
+
         Field test 2026-04-29 nailed down a chip-firmware quirk in
         ``mmw_demoDDM`` (SDK 4.7.2.1): the ``sensorStart`` command
         when issued FROM STATE INIT accepts the command and emits a
@@ -551,6 +548,10 @@ class RadarManager:
         proved works continuously. We never use plain ``sensorStart``
         from INIT — that's the path that emits a few frames and dies.
         """
+        with self._cli_lock:
+            return self._push_profile_locked()
+
+    def _push_profile_locked(self) -> bool:
         # Probe + auto-recover from post-Ctrl+C wedge before we push any
         # cfg. Returns an OPEN Serial we own — close it ourselves.
         ser = self._probe_and_recover()
@@ -612,13 +613,56 @@ class RadarManager:
                                 "will retry", tail.strip()[:120])
                     return False
 
-                # Final step on every path: sensorStart 0. This is the
-                # ONLY sensorStart variant we trust on this firmware
-                # build. Skips the buggy INIT-time path even when
-                # state was 0 — even if the cfg's own sensorStart
-                # somehow succeeded, sensorStart 0 is a no-op-ish
-                # call (chip moves through STOPPED then back to
-                # STARTED) that lands us in the known-good state.
+                # State 1 = CONFIGURED: cfg is loaded but chip hasn't
+                # started streaming. Try sensorStart first; if that
+                # fails, force the chip back to INIT via sensorStop +
+                # flushCfg and then push the full cfg — this escapes
+                # the state=1 loop instead of returning False forever.
+                if state == 1:
+                    # Try bare sensorStart first (chip already configured).
+                    resp = self._cli_send(ser, "sensorStart", wait_s=2.0)
+                    if "Done" in resp or "0xffe" in resp:
+                        log.info("sensorStart from CONFIGURED state OK")
+                        return True
+                    # Try sensorStart 0 (warm-restart variant).
+                    resp = self._cli_send(ser, "sensorStart 0", wait_s=2.0)
+                    if "Done" in resp or "0xffe" in resp:
+                        log.info("sensorStart 0 from CONFIGURED state OK")
+                        return True
+                    log.warning(
+                        "sensorStart from CONFIGURED failed: %r — "
+                        "forcing full cfg push", resp.strip()[:80],
+                    )
+                    # Force chip back to INIT via sensorStop + flushCfg.
+                    # NOTE: sensorStop is partially broken on this FW
+                    # (DPMstopSemHandle removed), but flushCfg may still
+                    # clear config state. Give the chip extra settle time.
+                    self._cli_send(ser, "sensorStop", wait_s=1.0)
+                    self._cli_send(ser, "flushCfg", wait_s=1.0)
+                    time.sleep(0.5)
+                    # Push full cfg (starts with its own sensorStop +
+                    # flushCfg, so the chip gets a double-reset attempt).
+                    responses = send_cfg(ser, self.cfg_path)
+                    tail = responses[-1] if responses else ""
+                    n_rejected = sum(
+                        1 for r in responses
+                        if ("Error" in r or "error" in r)
+                    )
+                    full_cal = ("0xffe" in tail or "Done" in tail)
+                    if n_rejected == 0 and full_cal:
+                        log.info("State=1 recovery: full cfg push OK "
+                                 "(tail=%r)", tail.strip()[:80])
+                        return True
+                    # If cfg push itself failed, the chip is wedged.
+                    # Log clearly so operator knows a power cycle is needed.
+                    log.error("State=1 recovery FAILED (%d rejected). "
+                              "Chip may need power cycle.", n_rejected)
+                    return False
+
+                # sensorStart 0 is the warm-restart variant that works
+                # from STOPPED (state 3) or STARTED (state 2, after a
+                # sensorStop). It's the most reliable path on this
+                # firmware build.
                 if state == 2:  # STARTED — must stop first
                     self._cli_send(ser, "sensorStop", wait_s=1.0)
                     time.sleep(0.05)
@@ -629,6 +673,102 @@ class RadarManager:
                 return True
         except serial.SerialException as e:
             log.warning("Could not open CLI port %s: %s", self.cli_port, e)
+            return False
+
+    # ─────────────────────── hot cfg swap (mode switch) ─────────────────
+    def reconfigure(self, cfg_path: "str | Path") -> bool:
+        """Push a different chirp profile to a running chip.
+
+        The cfg file MUST start with ``sensorStop`` + ``flushCfg`` (which
+        is standard TI convention). That forces the chip's state machine
+        through STARTED → STOPPED → INIT → CONFIGURED → STARTED, loading
+        the new profile in the process.
+
+        Used by ``CompositeRadarBackend.set_mode()`` when switching between
+        Stock (253 m) and A/G (500 m) modes which need different chirp
+        slopes.
+
+        Updates ``self.cfg_path`` on success so subsequent reconnect /
+        recovery cycles push the correct profile. On failure the old
+        cfg_path is preserved so the next reconnect restores the last
+        known-good config.
+
+        Returns True on success.
+        """
+        with self._cli_lock:
+            return self._reconfigure_locked(cfg_path)
+
+    def _reconfigure_locked(self, cfg_path: "str | Path") -> bool:
+        """Hot-swap chirp profile via xds110 hardware reset.
+
+        The AWR2944P's demoDDM firmware does not reliably support live
+        reconfiguration — sensorStop + flushCfg from STARTED leaves the
+        chip in a partial state where subsequent cfg pushes time out or
+        get rejected.
+
+        Reliable path: xds110 hardware reset → chip boots to default
+        flash profile (state=2) → our sensorStop (in the cfg) moves it
+        to state=0 → full cfg push → sensorStart → state=2 with new
+        profile.  Same sequence the app uses on normal startup, proven
+        to work.
+
+        After success, sets ``_reconfigure_done`` so the capture loop
+        skips its own ``_push_profile()`` call and just reopens the data
+        port.  Without this, the capture loop's reconnect sends
+        sensorStop to the already-running chip, which wedges the CLI
+        (known DPMstopSemHandle firmware bug).
+        """
+        new_path = str(cfg_path)
+        old_path = self.cfg_path
+        log.info("reconfigure: %s → %s (via xds110 reset)",
+                 Path(old_path).name, Path(new_path).name)
+
+        # Clear the flag in case a previous reconfigure left it set.
+        self._reconfigure_done.clear()
+
+        # ── Step 1: hardware-reset the chip ──
+        # Don't close data port here — the capture loop is reading from
+        # it and closing from another thread crashes it (TypeError on
+        # NoneType fd). The xds110 reset stops the TLV stream; the
+        # capture loop will detect the timeout and reconnect itself.
+        if not self._run_xds110_reset():
+            log.error("reconfigure: xds110 reset failed")
+            return False
+        log.info("reconfigure: xds110 reset OK, waiting for chip boot")
+
+        # Wait for chip to fully boot from flash (~2s).
+        time.sleep(2.5)
+
+        # ── Step 2: push new cfg (starts with sensorStop + flushCfg) ──
+        try:
+            ser = self._open_cli_with_break()
+            if ser is None:
+                log.error("reconfigure: could not open CLI after reset")
+                return False
+            with ser:
+                responses = send_cfg(ser, new_path)
+                tail = responses[-1] if responses else ""
+                n_rejected = sum(
+                    1 for r in responses
+                    if ("Error" in r or "error" in r)
+                )
+                if n_rejected == 0:
+                    self.cfg_path = new_path
+                    self._reconfigure_done.set()
+                    log.info("reconfigure: SUCCESS — cfg_path now %s "
+                             "(tail=%r, rejected=0)",
+                             Path(new_path).name, tail.strip()[:80])
+                    return True
+
+                log.warning("reconfigure: %d rejected after clean reset"
+                            " — rolling back to %s",
+                            n_rejected, Path(old_path).name)
+                # Rollback
+                send_cfg(ser, old_path)
+                return False
+
+        except serial.SerialException as e:
+            log.warning("reconfigure: CLI port error: %s", e)
             return False
 
     # ─────────────────────── chip kick (LVDS recovery) ─────────────────
@@ -643,6 +783,10 @@ class RadarManager:
         normal CLI port for the duration. Returns the CLI's
         responses so the caller can see whether the chip ack'd.
         """
+        with self._cli_lock:
+            return self._kick_lvds_locked()
+
+    def _kick_lvds_locked(self) -> dict:
         out: dict = {"sensorStop": None, "sensorStart_0": None}
         # First try the cheap path: just sensorStop + sensorStart 0.
         # If chip is in STARTED but DMA stalled, this resets it.
@@ -731,44 +875,6 @@ class RadarManager:
                 pass
             self._data_ser = None
 
-    # --- gimbal angle timing compensation ---
-    def _sample_gimbal(self) -> None:
-        """Snapshot current gimbal angle into the history ring buffer."""
-        gs = BUS.get_latest(Topic.GIMBAL)
-        if isinstance(gs, GimbalState):
-            with self._gimbal_history_lock:
-                self._gimbal_history.append(
-                    (gs.timestamp, float(gs.pan_deg), float(gs.tilt_deg))
-                )
-
-    def _interp_gimbal(self, target_t: float) -> Tuple[Optional[float], Optional[float]]:
-        """Interpolate gimbal pan/tilt at *target_t* from the history.
-
-        Returns (pan_deg, tilt_deg) or (None, None) if history is empty.
-        Linear interpolation between the two bracketing samples.
-        """
-        with self._gimbal_history_lock:
-            hist = list(self._gimbal_history)
-        if not hist:
-            return None, None
-        # Clamp to bounds
-        if target_t <= hist[0][0]:
-            return hist[0][1], hist[0][2]
-        if target_t >= hist[-1][0]:
-            return hist[-1][1], hist[-1][2]
-        # Linear scan (typically <20 entries back from tail)
-        for i in range(len(hist) - 1, 0, -1):
-            t1, p1, tl1 = hist[i]
-            t0, p0, tl0 = hist[i - 1]
-            if t0 <= target_t <= t1:
-                dt = t1 - t0
-                alpha = (target_t - t0) / dt if dt > 0 else 0.0
-                return (
-                    p0 + alpha * (p1 - p0),
-                    tl0 + alpha * (tl1 - tl0),
-                )
-        return hist[-1][1], hist[-1][2]
-
     # ─────────────────────── capture loop ────────────────────
     def _capture_loop(self) -> None:
         stream = TLVStream()
@@ -778,7 +884,16 @@ class RadarManager:
         while not self._stop.is_set():
             # Connect / reconnect.
             if self._data_ser is None:
-                if not self._push_profile():
+                # After a successful reconfigure(), the chip is already
+                # running with the new cfg.  Skip _push_profile() — it
+                # would send sensorStop to the running chip, which
+                # wedges the CLI on this firmware (DPMstopSemHandle
+                # removed).  Just reopen the data port.
+                if self._reconfigure_done.is_set():
+                    self._reconfigure_done.clear()
+                    log.info("Capture loop: reconfigure just finished — "
+                             "skipping _push_profile, reopening data port")
+                elif not self._push_profile():
                     self._publish_disconnected()
                     self._stop.wait(self.reconnect_interval_s)
                     continue
@@ -801,19 +916,19 @@ class RadarManager:
                 continue
 
             now = time.monotonic()
-            # Sample gimbal into history on every loop iteration
-            # (~20 Hz when chip is streaming). This builds the angle
-            # timeline that _interp_gimbal looks up against.
-            self._sample_gimbal()
-
             if chunk:
                 for pkt in stream.feed(chunk):
-                    rx_time = time.time()  # host clock at UART receive
+                    # Snapshot gimbal state NOW (capture time), not at
+                    # process time. The queue can lag by 1-3 frames; at
+                    # 30°/s pan that's 1.5-4.5° of stale rotation — the
+                    # single biggest source of "targets drift when
+                    # gimbal moves" after the basic rotation was added.
+                    gs_snap = BUS.get_latest(Topic.GIMBAL)
                     with self._pkt_cond:
                         # deque(maxlen=8) auto-evicts oldest on overflow
                         # — that's the back-pressure behaviour we want
                         # if process_and_publish ever lags chip rate.
-                        self._pkt_queue.append((pkt, rx_time))
+                        self._pkt_queue.append((pkt, gs_snap))
                         self._pkt_cond.notify()
                     last_pkt_time = now
 
@@ -860,14 +975,21 @@ class RadarManager:
                     self._pkt_cond.wait(timeout=0.5)
                 if self._stop.is_set():
                     break
-                pkt, rx_time = self._pkt_queue.popleft()
+                item = self._pkt_queue.popleft()
             try:
-                self._process_and_publish(pkt, rx_time)
+                # Queue items are (pkt, gimbal_snapshot) tuples — the
+                # gimbal state was captured in the capture thread at the
+                # moment the TLV packet arrived, not at process time.
+                if isinstance(item, tuple):
+                    pkt, gs_snap = item
+                else:
+                    pkt, gs_snap = item, None  # backward compat
+                self._process_and_publish(pkt, gs_snap)
             except Exception as e:
                 log.exception("Radar process loop error: %s", e)
         log.info("RadarProcess thread stopped")
 
-    def _process_and_publish(self, pkt: RadarPacket, rx_time: float = 0.0) -> None:
+    def _process_and_publish(self, pkt: RadarPacket, gs_snap=None) -> None:
         # 1. SNR + range gate. Points whose SNR is NaN (this build of
         #    mmw_demoDDM does not emit the SideInfo TLV) pass the SNR
         #    test automatically — we can't reject on a signal we don't
@@ -891,32 +1013,20 @@ class RadarManager:
                and abs(d.doppler_mps) >= speed_gate
         ]
 
-        # 2a. Rotate detections from sensor frame to world frame.
-        #
-        # The AWR2944P outputs in sensor frame (+y = boresight).
-        # Rotating BEFORE the Kalman tracker means the tracker
-        # operates in world frame, so target positions stay
-        # stable when the gimbal pans.
-        #
-        # 2026-05-13 v1: Validated with drift recordings. Kalman-
-        # in-world-frame eliminates the lag/overcompensation
-        # artifact that made display-side rotation fail.
-        #
-        # 2026-05-13 v2: Timing compensation. The chirp is captured
-        # ~40-80 ms before we process it here. Using the gimbal
-        # angle at process-time caused 0.17-0.30 m/deg residual
-        # drift during pan. Now we interpolate the gimbal angle
-        # at the UART receive time from a ring buffer sampled in
-        # the capture loop.
-        # Subtract estimated hardware pipeline delay (radar CFAR + UART
-        # transfer) so we use the angle when the chirp was actually
-        # captured, not when the bytes arrived at the host.
-        _RADAR_HW_DELAY_S = 0.0  # disabled — rx_time alone is sufficient — tunable
-        gimbal_pan_at_capture, gimbal_tilt_at_capture = self._interp_gimbal(
-            rx_time - _RADAR_HW_DELAY_S
-        )
+        # 2a. Rotate detections from sensor frame → world frame using
+        # the gimbal pose captured AT THE SAME INSTANT as the TLV packet
+        # (in the capture thread). Using the process-time BUS.get_latest
+        # introduced 1-3 frames of gimbal lag — at 30°/s pan that's
+        # 1.5-4.5° of stale rotation, visible as target drift.
+        gs_for_capture = gs_snap if gs_snap is not None else BUS.get_latest(Topic.GIMBAL)
+        if isinstance(gs_for_capture, GimbalState):
+            gimbal_pan_at_capture = float(gs_for_capture.pan_deg)
+            gimbal_tilt_at_capture = float(gs_for_capture.tilt_deg)
+        else:
+            gimbal_pan_at_capture = None
+            gimbal_tilt_at_capture = None
 
-        if gimbal_pan_at_capture is not None:
+        if gimbal_pan_at_capture is not None and abs(gimbal_pan_at_capture) > 0.01:
             pan_rad = _m.radians(gimbal_pan_at_capture)
             cos_p = _m.cos(pan_rad)
             sin_p = _m.sin(pan_rad)
@@ -924,6 +1034,12 @@ class RadarManager:
                 sx, sy = d.x_m, d.y_m
                 d.x_m = sx * cos_p + sy * sin_p
                 d.y_m = -sx * sin_p + sy * cos_p
+            if self._frame_id % 200 == 0:
+                log.info("World-frame rotation active: pan=%.2f° pts=%d",
+                         gimbal_pan_at_capture, len(gated))
+        elif self._frame_id % 200 == 0 and gated:
+            log.info("World-frame rotation SKIPPED: pan=%s",
+                     gimbal_pan_at_capture)
 
         # 2b. DBSCAN + tracklet association (now in world frame).
         gated, targets = self._clusterer.step(gated)

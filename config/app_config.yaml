@@ -173,7 +173,7 @@ eo:
   # everything above that gets thrown away client-side. 900 is still
   # 1.4x oversampled for the display, well within sharpness budget,
   # and saves ~50% JPEG encode CPU per frame.
-  display_max_width: 900
+  display_max_width: 900  # 2026-05-13: GUI stays at 900 (canvas-limited); classifier path uses native via tiling
 
   # Exposure profiles — auto-selected from scene brightness, hysteretic.
   # SAVgood 850nm VCSEL illuminator is manually controlled by the operator
@@ -386,8 +386,14 @@ eo:
     # EO currently forces COCO fallback (person/car/truck/bus/motorcycle)
     # until a dedicated EO model exists. TODO: train EO drone detector.
     model: models/yolov8n.pt
-    conf_threshold: 0.45
+    # 2026-05-13: conf 0.45 -> 0.40, add per-class gate (drone stays permissive), enable tiling
+    # 2026-05-14: floor 0.40 -> 0.20 — model floor must be <= MIN(per-class) so per-class gate matters
+    conf_threshold: 0.20
     classes: [person, vehicle]
+    classes_conf:
+      person:  0.25
+      vehicle: 0.25
+      drone:   0.20
     include_drone: false        # TODO: enable after EO drone fine-tune
     # imgsz: 832 matches the resolution seeker_eo_v3.pt was trained at
     # (see thermal/training/train_eo_v3_close_targets.py docstring).
@@ -402,7 +408,17 @@ eo:
     # Run YOLO every 2nd frame on GPU (tracks coast in between, no
     # flicker) so publish rate roughly doubles. "auto" = 2 GPU / 4 CPU.
     classify_interval_frames: auto
-    min_bbox_px: 1500
+    min_bbox_px: 100    # 2026-05-14: was 1500 -> 200; SAHI tiling produces small bboxes for far persons/vehicles in native coords
+    # 2026-05-13: tiled (SAHI) inference. Splits the 1236x1032 frame into
+    # 2x2 overlapping tiles, runs yolov8n on each at imgsz=832 then merges
+    # with global NMS. Gives the model ~2x pixel density on far targets
+    # (vehicle 500m, human 300m) for ~1.5x compute cost.
+    tiling:
+      enabled: true   # 2026-05-14: batch=4 TRT engine rebuilt, SAHI active
+      grid: [2, 2]
+      overlap_frac: 0.25
+      merge_iou: 0.3  # 2026-05-14: was 0.5, lowered to merge cross-tile duplicates of a single object
+      run_on_native_frame: true
     # ByteTrack (ultralytics model.track) owns persistence on the EO
     # side now. These knobs are unused but kept for config compat; tune
     # ByteTrack itself via its yaml if needed (see Future Work in README).

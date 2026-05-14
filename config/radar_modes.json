@@ -24,12 +24,8 @@
     "snr_min_db": 0,
     "az_half_deg": 50,
     "speed_min_mps": 0.4,
-    "range_min_m": 4.5,
+    "range_min_m": 1,
     "cluster_eps_pos_m": 8,
-    "cluster_min_samples": 4,
-    "integrate_chirps": 512,
-    "cfar_algo": "os",
-    "cfar_threshold_db": 20,
-    "capon_bf": true
+    "cluster_min_samples": 2
   }
 }

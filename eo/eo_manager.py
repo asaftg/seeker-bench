@@ -337,6 +337,18 @@ class EOManager:
         # half quarters the per-frame pixel work everywhere.
         self._display_max_width = int(ecfg.get("display_max_width", 1236))
 
+        # Digital zoom (1 / 2 / 4 / 8). At 1×, the pipeline behaves
+        # exactly as before: tiled SAHI on the full native frame.
+        # At 2×, we center-crop native to 1/2 width and the classifier
+        # still tiles that crop (wide-ish FOV + sharper pixels).
+        # At 4× / 8×, the crop is small enough that tiling no longer
+        # helps — we feed the crop straight to YOLO at imgsz=832
+        # (single inference, narrow FOV, biggest model-px-on-target).
+        # Display + recording always get the cropped+upscaled view so
+        # operator and offline analysis see what the classifier saw.
+        # Controlled via /api/config/eo POST {"zoom_level": N}.
+        self._zoom_level: int = 1
+
         # JPEG-encode the final BGR frame ONCE on this thread, attach to
         # EOFrame.jpeg_bytes, so the asyncio WS sender doesn't pay the
         # cv2.imencode + base64 cost on every tick. Same quality knob
@@ -403,6 +415,30 @@ class EOManager:
             # targets) while keeping person/vehicle strict (FP-prone on
             # streetlights/poles).
             _classes_conf = ccfg.get("classes_conf") or {}
+            # Per-class HI override (new, optional). Default = same as
+            # global conf_hi for all classes.
+            _classes_conf_hi = ccfg.get("classes_conf_hi") or {}
+            # Schmitt gate defaults (mutable at runtime via /api/config/eo_schmitt).
+            _schmitt_cfg = ccfg.get("schmitt") or {}
+            self._track_cfg = {
+                "conf_hi":     float(_schmitt_cfg.get("conf_hi",     0.55)),
+                "conf_lo":     float(_schmitt_cfg.get("conf_lo",     0.25)),
+                "k_persist":   int(_schmitt_cfg.get("k_persist",   4)),
+                "window":      int(_schmitt_cfg.get("window",      20)),
+                "coast_ticks": int(_schmitt_cfg.get("coast_ticks", 3)),
+            }
+            # Per-class conf_hi map (HI is what triggers instant-pass).
+            # Defaults to global conf_hi if not specified per-class.
+            self._classes_conf_hi = {
+                "person":  float(_classes_conf_hi.get("person",  self._track_cfg["conf_hi"])),
+                "vehicle": float(_classes_conf_hi.get("vehicle", self._track_cfg["conf_hi"])),
+                "drone":   float(_classes_conf_hi.get("drone",   self._track_cfg["conf_hi"])),
+            }
+            # Schmitt state (per-track accumulator). Mutable in-place
+            # from the classifier worker — initialized here so the lazy
+            # init in _classifier_loop is no longer needed.
+            self._track_state: dict = {}
+            self._track_tick: int = 0
             # Tiled (SAHI) inference config. See vision/sahi_inference.py.
             _tiling_cfg = ccfg.get("tiling") or {}
             self._tiling_enabled: bool = bool(_tiling_cfg.get("enabled", False))
@@ -484,7 +520,24 @@ class EOManager:
         self._trusted_tilt: Optional[float] = None
         # Width of the downsampled phase-correlation window. Small for
         # speed; sub-pixel precision via Hanning window keeps it sensitive.
-        self._of_target_w: int = 256
+        self._of_target_w: int = 192  # 2026-05-14: 256->192 (44% fewer px, ~1.3ms saved per phaseCorrelate)
+        # Phase-correlation cache for slew compensation. Single source of
+        # truth: publish thread computes, classifier worker consumes
+        # accumulator. State-gated (only runs when any track exists) so
+        # cold-start empty-scene case pays zero compute. See plan doc
+        # "EO bbox correctness + DEV-tab tuning UI".
+        import threading as _threading
+        self._pc_dx_disp_accum: float = 0.0  # writer: publish, reader+zero: classifier
+        self._pc_dy_disp_accum: float = 0.0
+        self._pc_last_dx_tick: float = 0.0   # writer+reader: publish thread only
+        self._pc_last_dy_tick: float = 0.0
+        self._pc_cache_lock = _threading.Lock()
+        # 2026-05-14: separate raw-BUS tracker for bbox-shift derivation.
+        # Independent of _prev_bus_pan (which gets suppressed by
+        # _trusted_pan when phase-corr can't confirm motion — a feedback
+        # loop that locks _prev_bus_pan when phase-corr undermeasures).
+        self._pc_bus_prev_pan: Optional[float] = None
+        self._pc_bus_prev_tilt: Optional[float] = None
         # Thresholds for "BUS reported motion not confirmed by optics".
         # If BUS says we moved >= 0.3° in either axis but optics say <0.1°,
         # we trust optics. 0.3° is the smallest BUS step under the gate
@@ -1244,11 +1297,10 @@ class EOManager:
             if self._classifier is None:
                 continue
             try:
+                _zoom_lvl = int(getattr(self, "_zoom_level", 1) or 1)
                 if self._tiling_enabled:
-                    # Tiled (SAHI) path: native frame in, per-tile
-                    # batched predict, global NMS, returned as plain
-                    # detections (no ByteTrack IDs — MOSSE pool below
-                    # owns continuity for tiled output).
+                    # 2026-05-14: SAHI on FULL NATIVE at ALL zoom levels.
+                    # Cropping at high zoom collapses model conf.
                     from vision.sahi_inference import tiled_predict
                     raw = tiled_predict(
                         self._classifier._hv._model,
@@ -1261,8 +1313,52 @@ class EOManager:
                         per_class_conf=self._classifier._hv.per_class_conf
                             or None,
                     )
+                elif False:
+                    # 2026-05-14: at zoom 2x+, the cropped frame is
+                    # already small (1236, 618, 309 wide for 2/4/8x).
+                    # Tiling into 2x2 makes each tile ~155x130 at 8x —
+                    # letterboxed to 832 = mostly padding -> conf collapses.
+                    # Single-pass on the whole crop is far better.
+                    # Engine is fixed batch=4 so we pad the batch with
+                    # 3 frame copies and take only result[0].
+                    _model = self._classifier._hv._model
+                    _conf_floor = float(self._classifier._hv.conf_threshold)
+                    _imgsz = int(self._classifier._hv.imgsz)
+                    _pcc = self._classifier._hv.per_class_conf or None
+                    _batch = [frame, frame, frame, frame]
+                    _results = _model.predict(
+                        _batch, conf=_conf_floor, imgsz=_imgsz,
+                        verbose=False, batch=4,
+                    )
+                    raw = []
+                    r0 = _results[0] if _results else None
+                    if r0 is not None and r0.boxes is not None and len(r0.boxes) > 0:
+                        _xyxy = r0.boxes.xyxy.cpu().numpy()
+                        _confs = r0.boxes.conf.cpu().numpy()
+                        _clss = r0.boxes.cls.cpu().numpy().astype(int)
+                        _names = _model.names or {}
+                        for (x1, y1, x2, y2), c, cid in zip(_xyxy, _confs, _clss):
+                            cls_name = _names.get(int(cid), str(int(cid)))
+                            if _pcc is not None:
+                                floor = _pcc.get(cls_name)
+                                if floor is not None and float(c) < floor:
+                                    continue
+                            raw.append({
+                                "bbox": (int(max(0, x1)), int(max(0, y1)),
+                                         int(max(1, x2 - x1)),
+                                         int(max(1, y2 - y1))),
+                                "class": cls_name,
+                                "conf": float(c),
+                            })
+                    log.info("EO single-pass zoom=%dx frame=%s raw_dets=%d",
+                              _zoom_lvl, frame.shape, len(raw))
+                else:
+                    raw = self._classifier.track(frame)
+
+                if self._tiling_enabled:
                     # Tiled path doesn't carry ByteTrack IDs (the
                     # tracker can't reason across tile-frames sensibly).
+                    log.debug("EO tiled_predict (fid=%d) frame=%s tiles=%s raw_dets=%d zoom=%dx hfov_eff=%.2f", fid, frame.shape, self._tiling_grid, len(raw), int(getattr(self, "_zoom_level", 1) or 1), self._hfov / float(max(1, getattr(self, "_zoom_level", 1))))
                     # MOSSE pool uses track_id as a dict key, so we
                     # synthesize unique monotonically-decreasing IDs.
                     # Each tile-tick spawns fresh MOSSE trackers; old
@@ -1272,15 +1368,281 @@ class EOManager:
                     # job. If this churn shows up as MOSSE-pool memory
                     # growth, we add an LRU cap on the pool size.
                     if not hasattr(self, "_tile_id_seq"):
-                        self._tile_id_seq = -100000
+                        self._tile_id_seq = 1000000
+                        # IoU tracker state: list of (track_id, cls, bbox_xywh)
+                        # from the previous tick. We match current-tick dets
+                        # against this so a vehicle detected on every tick
+                        # keeps its stable ID (kills GUI flicker).
+                        self._tile_prev_tracks: list = []
+                    # 2026-05-14: rescale bboxes from FULL NATIVE -> DISPLAY,
+                    # accounting for the zoom crop. Drop dets whose center
+                    # is outside the visible crop region.
+                    if frame is not None:
+                        full_h, full_w = frame.shape[:2]
+                    else:
+                        full_h = full_w = 0
+                    zl = max(1, _zoom_lvl)
+                    crop_w = full_w // zl
+                    crop_h = full_h // zl
+                    crop_x0 = (full_w - crop_w) // 2
+                    crop_y0 = (full_h - crop_h) // 2
+                    if crop_w > 0 and self._display_max_width > 0:
+                        scale = self._display_max_width / float(crop_w)
+                    else:
+                        scale = 1.0
+                    _kept = []
                     for d in raw:
-                        self._tile_id_seq -= 1
-                        d.setdefault("track_id", self._tile_id_seq)
-                else:
-                    raw = self._classifier.track(frame)
+                        bx, by, bw, bh = d["bbox"]
+                        cx, cy = bx + bw/2, by + bh/2
+                        if not (crop_x0 <= cx <= crop_x0 + crop_w):
+                            continue
+                        if not (crop_y0 <= cy <= crop_y0 + crop_h):
+                            continue
+                        nx = int(round((bx - crop_x0) * scale))
+                        ny = int(round((by - crop_y0) * scale))
+                        nw = max(1, int(round(bw * scale)))
+                        nh = max(1, int(round(bh * scale)))
+                        d["bbox"] = (nx, ny, nw, nh)
+                        _kept.append(d)
+                    raw = _kept
+
+                    # ── Phase-corr accumulator consume (slew compensation) ──
+                    # Publish thread runs phaseCorrelate every tick when
+                    # any track is in flight, and accumulates (dx, dy)
+                    # in display pixel space into _pc_dx/dy_disp_accum.
+                    # We read-and-zero the accumulator here under lock —
+                    # whatever image translation happened across the N
+                    # publish ticks since our last iteration. Apply it
+                    # to _tile_prev_tracks BEFORE IoU matching so fresh
+                    # YOLO dets (at the new panned position) still IoU-
+                    # match the (shifted) prev tracks → same tid kept.
+                    try:
+                        with self._pc_cache_lock:
+                            _dx_acc = self._pc_dx_disp_accum
+                            _dy_acc = self._pc_dy_disp_accum
+                            self._pc_dx_disp_accum = 0.0
+                            self._pc_dy_disp_accum = 0.0
+                        if (abs(_dx_acc) > 1.0 or abs(_dy_acc) > 1.0) and self._tile_prev_tracks:
+                            self._tile_prev_tracks = [
+                                (ptid, pcls,
+                                 (pbb[0]+_dx_acc, pbb[1]+_dy_acc, pbb[2], pbb[3]))
+                                for ptid, pcls, pbb in self._tile_prev_tracks
+                            ]
+                    except Exception as _e:
+                        log.debug("prev-tracks accum-consume skip: %s", _e)
+
+
+                    # IoU-based ID inheritance to kill flicker
+                    def _bbox_iou(a, b):
+                        ax1, ay1 = a[0], a[1]
+                        ax2, ay2 = a[0]+a[2], a[1]+a[3]
+                        bx1, by1 = b[0], b[1]
+                        bx2, by2 = b[0]+b[2], b[1]+b[3]
+                        ix = max(0, min(ax2, bx2) - max(ax1, bx1))
+                        iy = max(0, min(ay2, by2) - max(ay1, by1))
+                        inter = ix * iy
+                        if inter <= 0: return 0.0
+                        return inter / (a[2]*a[3] + b[2]*b[3] - inter)
+                    used_prev = set()
+                    inherited_tids = set()
+                    new_prev = []
+                    for d in raw:
+                        best_iou = 0.0
+                        best_idx = -1
+                        for i, (ptid, pcls, pbb) in enumerate(self._tile_prev_tracks):
+                            if i in used_prev: continue
+                            if pcls != d["class"]: continue
+                            io = _bbox_iou(d["bbox"], pbb)
+                            if io > best_iou and io >= 0.3:
+                                best_iou = io
+                                best_idx = i
+                        if best_idx >= 0:
+                            used_prev.add(best_idx)
+                            tid = self._tile_prev_tracks[best_idx][0]
+                            inherited_tids.add(int(tid))
+                        else:
+                            self._tile_id_seq += 1
+                            tid = self._tile_id_seq
+                        d.setdefault("track_id", tid)
+                        new_prev.append((tid, d["class"], d["bbox"]))
+                    self._tile_prev_tracks = new_prev
             except Exception as e:
                 log.warning("EO async inference failed (fid=%d): %s", fid, e)
                 continue
+
+            # ── Two-tier Schmitt confirmation gate ─────────────────────
+            # Per-track state accumulates evidence across YOLO ticks.
+            # Confirmation rule (either path):
+            #   HI: a single tick with conf >= conf_hi  → instant publish
+            #   LO: K_PERSIST ticks with conf >= conf_lo within last WINDOW
+            #       ticks → publish (slow path, kills isolated noise)
+            # Once confirmed, the track stays sticky and is emitted with
+            # last-known bbox for COAST_TICKS ticks of no fresh hit, so
+            # MOSSE can coast it visually between YOLO ticks. After
+            # COAST_TICKS ticks of no hit the track dies.
+            #
+            # This runs on the tiled-IoU-stable track_id path. For the
+            # non-tiled fallback (self._classifier.track), 'raw' carries
+            # ByteTrack IDs which behave identically in this gate.
+            # _track_cfg/state initialized in __init__ (see ccfg.schmitt)
+            cfg = self._track_cfg
+            self._track_tick += 1
+            tick = self._track_tick
+
+            fresh_tids = set()
+            for d in raw:
+                tid = d.get("track_id")
+                if tid is None: continue
+                tid = int(tid)
+                fresh_tids.add(tid)
+                conf = float(d.get("conf", 0.0))
+                st = self._track_state.get(tid)
+                if st is None:
+                    st = {"hits": [], "conf_max": 0.0, "confirmed": False,
+                          "last_class": d.get("class","?"),
+                          "last_conf":  conf,
+                          "conf_ema":   conf,  # 2026-05-14: smoothed conf for stable display label
+                          "last_bbox":  d.get("bbox"),
+                          "last_seen":  tick}
+                    self._track_state[tid] = st
+                st["last_seen"]  = tick
+                st["last_class"] = d.get("class", st["last_class"])
+                st["last_conf"]  = conf
+                # EMA smoothing — alpha=0.3 means new conf has 30% weight,
+                # smoothed retains 70%. Slow enough to ride out single-frame
+                # swings 0.30->0.90; fast enough to track real conf trends.
+                st["conf_ema"] = 0.3 * conf + 0.7 * st.get("conf_ema", conf)
+                st["last_bbox"]  = d.get("bbox", st["last_bbox"])
+                if conf > st["conf_max"]: st["conf_max"] = conf
+                if conf >= cfg["conf_lo"]: st["hits"].append(tick)
+                # prune hits outside window
+                st["hits"] = [t for t in st["hits"] if tick - t < cfg["window"]]
+                if not st["confirmed"]:
+                    # Per-class HI threshold (instant pass). Default = global cfg["conf_hi"].
+                    _cls_hi = self._classes_conf_hi.get(
+                        d.get("class","?"), cfg["conf_hi"]
+                    )
+                    if conf >= _cls_hi or len(st["hits"]) >= cfg["k_persist"]:
+                        st["confirmed"] = True
+
+            # Build out_dets = confirmed tracks (fresh this tick) +
+            # confirmed-but-coasted tracks (last bbox, MOSSE will move
+            # it between YOLO ticks). Garbage collect stale state.
+            out_dets = []
+            for tid, st in list(self._track_state.items()):
+                if st["confirmed"]:
+                    if tid in fresh_tids:
+                        for d in raw:
+                            if int(d.get("track_id", -1)) == tid:
+                                # Override the displayed conf with the EMA-smoothed
+                                # value to stop label-text flicker on YOLO conf
+                                # swings (e.g., 0.30 <-> 0.90 frame-to-frame).
+                                d["conf"] = float(st["conf_ema"])
+                                out_dets.append(d)
+                                break
+                    elif (tick - st["last_seen"]) <= cfg["coast_ticks"]:
+                        # Coast: synth det at last-known bbox. MOSSE
+                        # in publish thread will template-match the bbox
+                        # forward across the captured frames between
+                        # YOLO ticks — handles moving targets correctly.
+                        # 2026-05-14b: mark coasted=True so the MOSSE
+                        # reseed in _process_and_publish does NOT yank
+                        # the template back to this stale bbox — MOSSE
+                        # is the source of truth for bbox position
+                        # between YOLO ticks.
+                        out_dets.append({
+                            "bbox":     st["last_bbox"],
+                            "class":    st["last_class"],
+                            "conf":     float(st["conf_ema"]),  # smoothed
+                            "track_id": tid,
+                            "coasted":  True,
+                        })
+                    else:
+                        del self._track_state[tid]
+                else:
+                    # Unconfirmed: drop state after WINDOW ticks of no hit
+                    if (tick - st["last_seen"]) > cfg["window"]:
+                        del self._track_state[tid]
+
+            # Re-seed _tile_prev_tracks with confirmed coasted entries
+            # so next-tick IoU matching can re-bind the same tid.
+            if hasattr(self, "_tile_prev_tracks"):
+                _seen_prev = {p[0] for p in self._tile_prev_tracks}
+                for d in out_dets:
+                    tid = int(d["track_id"])
+                    if tid not in fresh_tids and tid not in _seen_prev:
+                        self._tile_prev_tracks.append(
+                            (tid, d["class"], d["bbox"]))
+
+            # ── Containment-drop pass ─────────────────────────
+            # SAHI cross-tile NMS uses IoU which fails when a small
+            # bbox sits inside a larger one (IoU is small because the
+            # bigger box has lots of area outside the small one). Drop
+            # the smaller-area bbox when >=50% of its area is inside a
+            # higher-conf bbox of the same class. Kills the twin-bbox
+            # "vehicle detected in two tiles" artifact.
+            def _contain_frac(a, b):
+                # fraction of a area inside b
+                ix = max(0, min(a[0]+a[2], b[0]+b[2]) - max(a[0], b[0]))
+                iy = max(0, min(a[1]+a[3], b[1]+b[3]) - max(a[1], b[1]))
+                inter = ix * iy
+                aw = a[2] * a[3]
+                return inter / aw if aw > 0 else 0.0
+            # 2026-05-14: tid-aware sort. Stabilize containment-drop
+            # across consecutive ticks by preferring candidates whose
+            # tid was IoU-inherited from _tile_prev_tracks this tick.
+            # Without this, the "big-box / small-box wins" alternation
+            # between ticks causes track_id flips and GUI label flicker.
+            _inherited = inherited_tids if 'inherited_tids' in dir() else set()
+            def _tid_priority(d):
+                # Lower sort key wins (Python sort is ascending).
+                # 0 = inherited tid (stable identity from prev tick)
+                # 1 = newly-minted tid
+                # Tiebreaker: higher conf wins (negate for ascending sort)
+                tid = int(d.get("track_id", -1))
+                pri = 0 if tid in _inherited else 1
+                return (pri, -float(d.get("conf", 0)))
+            _sorted = sorted(out_dets, key=_tid_priority)
+            _kept = []
+            for d in _sorted:
+                bb_d = d["bbox"]
+                a_d  = (bb_d[2] * bb_d[3]) if isinstance(bb_d, tuple) else (bb_d.get("w",0) * bb_d.get("h",0))
+                subsumed = False
+                for k in _kept:
+                    if k.get("class") != d.get("class"): continue
+                    bb_k = k["bbox"]
+                    a_k = (bb_k[2] * bb_k[3]) if isinstance(bb_k, tuple) else (bb_k.get("w",0) * bb_k.get("h",0))
+                    # k is in _kept (came earlier in priority order).
+                    # If they containment-overlap, drop d.
+                    if a_k < a_d:
+                        # k smaller than d — k is contained in d, not vice versa.
+                        # But we still want to drop the LATER one (d) IF
+                        # they overlap heavily, because k won priority.
+                        if _contain_frac(bb_k, bb_d) >= 0.5:
+                            subsumed = True; break
+                    else:
+                        if _contain_frac(bb_d, bb_k) >= 0.5:
+                            subsumed = True; break
+                if not subsumed:
+                    _kept.append(d)
+            out_dets = _kept
+
+            # Periodic gate summary (every ~5s at 8Hz YOLO = 40 ticks).
+            if (tick % 40) == 0:
+                n_pending = sum(1 for st in self._track_state.values()
+                                if not st["confirmed"])
+                n_conf_fresh = sum(1 for d in out_dets
+                                   if not d.get("coasted"))
+                n_conf_coast = sum(1 for d in out_dets
+                                   if d.get("coasted"))
+                log.info("EO Schmitt gate (tick=%d): "
+                         "conf_fresh=%d conf_coast=%d pending=%d "
+                         "raw_in=%d -> out=%d",
+                         tick, n_conf_fresh, n_conf_coast, n_pending,
+                         len(fresh_tids), len(out_dets))
+
+            raw = out_dets
+
             # Same size gate + per-class NMS as the previous synchronous
             # path. Runs on the worker thread, off the publish critical
             # path, so a 50-100 ms inference spike no longer stalls the
@@ -1294,7 +1656,85 @@ class EOManager:
                 self._cls_out_dets_fresh_flag = True
         log.info("EOManager classify thread stopped")
 
-    # ───────────────────────── pipeline ──────────────────────────────
+    def get_schmitt_config(self) -> dict:
+        """Snapshot of the Schmitt gate config (global + per-class HI + per-class LO).
+
+        Used by gui/sensor_bridge to hydrate DEV-tab sliders on every WS tick.
+        Safe to call from any thread — returns a dict copy.
+        """
+        out = dict(self._track_cfg)  # copy globals
+        out["per_class"] = {
+            cls: {
+                "hi": float(self._classes_conf_hi.get(cls, self._track_cfg["conf_hi"])),
+                "lo": float((self._classifier._hv.per_class_conf or {}).get(
+                    cls, self._track_cfg["conf_lo"]
+                )) if self._classifier and getattr(self._classifier, "_hv", None) else 0.0,
+            }
+            for cls in ("person", "vehicle", "drone")
+        }
+        return out
+
+    def set_schmitt_config(self, **kw) -> None:
+        """Mutate Schmitt config in place. Thread-safe via in-place dict
+        item assignment (atomic in CPython).
+
+        Accepts: conf_hi, conf_lo, k_persist, window, coast_ticks (globals);
+        per_class={cls: {hi?, lo?}} (per-class overrides).
+
+        INVARIANT: only mutates existing keys. Never rebinds the dict,
+        never adds new keys. Worker thread reads keys directly without
+        a lock, relying on this invariant.
+        """
+        for k in ("conf_hi", "conf_lo"):
+            if k in kw:
+                v = max(0.0, min(1.0, float(kw[k])))
+                self._track_cfg[k] = v
+        for k in ("k_persist", "window", "coast_ticks"):
+            if k in kw:
+                v = max(1, min(50, int(kw[k])))
+                self._track_cfg[k] = v
+        pc = kw.get("per_class") or {}
+        for cls in ("person", "vehicle", "drone"):
+            c = pc.get(cls) or {}
+            if "hi" in c:
+                self._classes_conf_hi[cls] = max(0.0, min(1.0, float(c["hi"])))
+            if "lo" in c and self._classifier and getattr(self._classifier, "_hv", None):
+                pcc = self._classifier._hv.per_class_conf
+                if pcc is None:
+                    self._classifier._hv.per_class_conf = pcc = {}
+                pcc[cls] = max(0.0, min(1.0, float(c["lo"])))
+        log.info("EO Schmitt cfg updated: %s", {**self._track_cfg, "per_class": self._classes_conf_hi})
+
+    def set_zoom_level(self, level: int) -> None:
+        """Set EO digital zoom. Valid: 1, 2, 4, 8.
+
+        1× / 2× → classifier tiles the (possibly cropped) native frame.
+        4× / 8× → classifier sees only the crop, single-tile at imgsz=832.
+        Display + recording always show the cropped+upscaled view.
+        """
+        if level not in (1, 2, 4, 8):
+            log.warning("EO set_zoom_level: invalid level %s (must be 1/2/4/8)", level)
+            return
+        prev = self._zoom_level
+        self._zoom_level = int(level)
+        if prev != self._zoom_level:
+            # Reset tile-tracker state — bbox coords change reference
+            # frame so previous-tick IoU matching is meaningless across
+            # the zoom transition.
+            try:
+                self._tile_prev_tracks = []
+                self._track_state = {}
+                # 2026-05-14b: also kill the publish-thread
+                # cache so stale bboxes from the old zoom don't
+                # render briefly on the new cropped frame.
+                with self._cls_out_lock:
+                    self._cls_out_dets = []
+                    self._cls_out_dets_fresh_flag = True
+            except Exception:
+                pass
+            log.info("EO zoom: %dx -> %dx", prev, self._zoom_level)
+
+        # ───────────────────────── pipeline ──────────────────────────────
     def _process_and_publish(self, frame: np.ndarray) -> None:
         self._frame_id += 1
         ts = time.time()
@@ -1331,14 +1771,17 @@ class EOManager:
         # long-distance targets). Display path still uses 1236-wide.
         # The native frame is NOT cached past _process_and_publish,
         # so memory cost is one extra 2472×2064×3 ≈ 15 MB per tick.
+        # ALWAYS keep a reference to the native frame BEFORE the downscale —
+        # used by (a) the tiled classifier path when tiling is enabled
+        # and (b) the JSONL recorder to record native frames regardless
+        # of the display_max_width setting (so on-disk recordings are
+        # full fidelity for offline analysis). The downscale below
+        # produces a NEW resize buffer so this reference stays valid
+        # for the rest of the publish tick.
         native_frame: Optional[np.ndarray] = None
         if self._sensor_backend == "imx568":
             if self._display_max_width > 0 and frame.shape[1] > self._display_max_width:
-                if self._tiling_enabled:
-                    # Hold a reference to the native frame for the
-                    # classifier path — no copy, the downscale below
-                    # produces a NEW buffer so this stays valid.
-                    native_frame = frame
+                native_frame = frame
                 scale = self._display_max_width / float(frame.shape[1])
                 new_w = self._display_max_width
                 new_h = int(round(frame.shape[0] * scale))
@@ -1348,6 +1791,30 @@ class EOManager:
                 import cv2 as _cv2
                 frame = _cv2.resize(frame, (new_w, new_h),
                                     interpolation=_cv2.INTER_AREA)
+            # ── Digital zoom (center crop) ──────────────────────────
+            # Apply AFTER the display downscale so cross-sensor projection
+            # math (which assumes display-coord bboxes scaled by the
+            # capture's real HFOV/level) can read self._zoom_level. The
+            # crop is taken from the native frame to preserve maximum
+            # detail, then upscaled to display width (LINEAR for fewer
+            # ringing artifacts on hard target edges).
+            # 2026-05-14: preserve FULL native (pre-crop) for classifier.
+            full_native_frame = native_frame
+            zl = int(getattr(self, "_zoom_level", 1) or 1)
+            if zl > 1 and native_frame is not None:
+                import cv2 as _cv2
+                nh, nw = native_frame.shape[:2]
+                cw, ch = nw // zl, nh // zl
+                x0 = (nw - cw) // 2
+                y0 = (nh - ch) // 2
+                # native_frame is replaced with the crop — classifier
+                # below sees the cropped region as its "native".
+                native_frame = native_frame[y0:y0+ch, x0:x0+cw].copy()
+                # Display frame: crop+upscale to display_max_width.
+                disp_w = self._display_max_width if self._display_max_width > 0 else cw
+                disp_h = int(round(ch * (disp_w / cw)))
+                frame = _cv2.resize(native_frame, (disp_w, disp_h),
+                                    interpolation=_cv2.INTER_LINEAR)
             mean = scene_mean(frame)
             # Skip the selector entirely when WE are driving exposure.
             # Reason: scene_mean on the displayed frame is a function of
@@ -1459,8 +1926,10 @@ class EOManager:
                 # NATIVE 2472×2064 frame so per-tile inference gets
                 # full sensor resolution. Otherwise hand it the
                 # already-downscaled 1236-wide display frame.
-                cls_input = native_frame if (self._tiling_enabled and
-                                              native_frame is not None) else frame
+                # 2026-05-14: classifier ALWAYS sees full native, never cropped.
+                _full_native = locals().get("full_native_frame", native_frame)
+                cls_input = _full_native if (self._tiling_enabled and
+                                              _full_native is not None) else frame
                 self._cls_in_pending = (self._frame_id, cls_input)
                 self._cls_in_cond.notify()
         # Publish the worker's latest result (or empty list before any
@@ -1482,13 +1951,158 @@ class EOManager:
         # Between classifier ticks: tracker output replaces the stale
         # bbox in _last_dets. ByteTrack ID, conf, and class are
         # preserved — only the bbox is corrected by MOSSE.
-        if self._mosse_pool.enabled and self._last_dets:
+        # ── Phase-correlation slew compensation (single source) ─────
+        # Camera motion shifts the image globally; without compensation,
+        # bboxes lag the actual target during gimbal pan. Measure the
+        # true image-pixel shift via cv2.phaseCorrelate on a 192-wide
+        # downsample (~1.7 ms on Xavier).
+        #
+        # GATING: state-based, NOT motion-based. We run phase-corr
+        # every publish tick when there's anything to compensate (any
+        # entry in _last_dets or any pending entry in _track_state).
+        # We do NOT condition on "is the camera currently moving" —
+        # by the time we observe motion, we've already published a
+        # stale bbox for that frame. This is the architectural insight
+        # from the post-mortem.
+        #
+        # Outputs:
+        #   - _pc_last_dx_tick / _pc_last_dy_tick  (publish-thread only)
+        #   - _pc_dx_disp_accum / _pc_dy_disp_accum (lock-protected,
+        #     consumed and zeroed by the classifier worker before its
+        #     next IoU match — preserves track IDs across pans).
+        # Side effect: every entry in _last_dets has its bbox shifted
+        # by (dx_tick, dy_tick) BEFORE MOSSE runs below — so MOSSE
+        # reseed templates land on the actual target.
+        _has_state = bool(self._last_dets) or bool(getattr(self, "_track_state", {}))
+        _pc_dx = _pc_dy = 0.0
+        try:
+            if frame is not None and frame.size > 0:
+                # Always compute small_gray when we have a frame, so
+                # _prev_frame_small stays warm for the next tick when
+                # state might appear. ~1 ms cost (resize+cvtColor).
+                hh, ww = frame.shape[:2]
+                target_w = self._of_target_w
+                if ww > target_w:
+                    scl = target_w / float(ww)
+                    nw, nh = target_w, max(1, int(round(hh * scl)))
+                    small = cv2.resize(frame, (nw, nh),
+                                       interpolation=cv2.INTER_AREA)
+                else:
+                    small = frame
+                    nw = ww
+                if small.ndim == 3:
+                    small_gray = cv2.cvtColor(
+                        small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                else:
+                    small_gray = small.astype(np.float32)
+                # phaseCorrelate only when we have state AND a prev
+                # frame of matching shape. Skipped at cold-start
+                # (next tick will have prev_frame_small populated).
+                if (_has_state
+                        and self._prev_frame_small is not None
+                        and self._prev_frame_small.shape == small_gray.shape):
+                    (dx_s, dy_s), _resp = cv2.phaseCorrelate(
+                        self._prev_frame_small, small_gray)
+                    scale_back = ww / float(nw)
+                    _pc_dx_optical = float(dx_s) * scale_back
+                    _pc_dy_optical = float(dy_s) * scale_back
+                else:
+                    _pc_dx_optical = _pc_dy_optical = 0.0
+                # ALWAYS update prev (single source of truth).
+                self._prev_frame_small = small_gray
+
+                # 2026-05-14: BUS-derived shift is PRIMARY. Phase-corr
+                # at fast slew undermeasures (AGC/blur degrades the
+                # correlation peak). Independent _pc_bus_prev tracker
+                # updated EVERY tick — NEVER suppressed by _trusted_pan.
+                _pc_dx_bus = _pc_dy_bus = 0.0
+                if (_has_state and bus_pan is not None and bus_tilt is not None
+                        and self._pc_bus_prev_pan is not None
+                        and self._pc_bus_prev_tilt is not None):
+                    _bus_dpan  = float(bus_pan)  - float(self._pc_bus_prev_pan)
+                    _bus_dtilt = float(bus_tilt) - float(self._pc_bus_prev_tilt)
+                    zl = max(1, int(getattr(self, "_zoom_level", 1) or 1))
+                    hfov_eff = float(self._hfov) / float(zl)
+                    vfov_eff = float(self._vfov) / float(zl)
+                    if hfov_eff > 0.01 and vfov_eff > 0.01:
+                        _pc_dx_bus = -_bus_dpan  * (ww / hfov_eff)
+                        _pc_dy_bus = -_bus_dtilt * (frame.shape[0] / vfov_eff)
+                if bus_pan is not None and bus_tilt is not None:
+                    self._pc_bus_prev_pan  = float(bus_pan)
+                    self._pc_bus_prev_tilt = float(bus_tilt)
+
+                # 2026-05-14: Cross-confirmation rule. Phase-corr at
+                # 192-wide has ~5 px noise floor — phantom shifts at
+                # rest cause overshoot. BUS over-reports motion (servo
+                # commanded != actual). Use the smaller of the two
+                # when they AGREE (same sign, magnitudes within 3x).
+                # When they disagree → zero shift (defensive — bbox
+                # stays put until both signals confirm motion).
+                def _agree(a, b, max_ratio=3.0):
+                    if a * b < 0: return False   # opposite signs
+                    am, bm = abs(a), abs(b)
+                    if am < 1.0 and bm < 1.0: return True  # both zero -> OK (no shift)
+                    if am < 1.0 or bm < 1.0: return False  # one zero, other not
+                    return max(am, bm) / max(min(am, bm), 0.001) <= max_ratio
+                if _agree(_pc_dx_bus, _pc_dx_optical):
+                    # Same sign, magnitudes consistent — trust the smaller.
+                    _pc_dx = _pc_dx_optical if abs(_pc_dx_optical) <= abs(_pc_dx_bus) else _pc_dx_bus
+                else:
+                    _pc_dx = 0.0   # disagreement -> no shift
+                if _agree(_pc_dy_bus, _pc_dy_optical):
+                    _pc_dy = _pc_dy_optical if abs(_pc_dy_optical) <= abs(_pc_dy_bus) else _pc_dy_bus
+                else:
+                    _pc_dy = 0.0
+            self._pc_last_dx_tick = _pc_dx
+            self._pc_last_dy_tick = _pc_dy
+            with self._pc_cache_lock:
+                self._pc_dx_disp_accum += _pc_dx
+                self._pc_dy_disp_accum += _pc_dy
+            # Apply shift to every det in _last_dets BEFORE MOSSE.
+            # MOSSE reseeds at d["bbox"]; if we don't shift first,
+            # MOSSE re-anchors at the stale (pre-pan) position and
+            # immediately drifts.
+            if (abs(_pc_dx) > 1.0 or abs(_pc_dy) > 1.0) and self._last_dets:
+                hh, ww = frame.shape[:2]
+                kept = []
+                _n_shifted = 0
+                for d in self._last_dets:
+                    bx, by, bw, bh = d["bbox"]
+                    nx = int(round(bx + _pc_dx))
+                    ny = int(round(by + _pc_dy))
+                    # Drop tracks that panned off-screen.
+                    if (nx + bw < 0 or nx > ww or
+                            ny + bh < 0 or ny > hh):
+                        continue
+                    d["bbox"] = (nx, ny, bw, bh)
+                    kept.append(d)
+                    _n_shifted += 1
+                self._last_dets = kept
+                # Diagnostic: when shifted >5px, log both signals
+                # and which path was chosen.
+                if abs(_pc_dx) > 5.0 or abs(_pc_dy) > 5.0:
+                    log.info("EO optflow: bus=(%.1f,%.1f) opt=(%.1f,%.1f) used=(%.1f,%.1f) n=%d fid=%d",
+                              _pc_dx_bus, _pc_dy_bus,
+                              _pc_dx_optical, _pc_dy_optical,
+                              _pc_dx, _pc_dy, _n_shifted, self._frame_id)
+        except Exception as _e:
+            log.debug("phase-corr slew-comp skip: %s", _e)
+
+
+
+        if self._mosse_pool.enabled:
             from vision.correlation_tracker_set import DetectorHit
-            if fresh_dets_this_tick:
+            if fresh_dets_this_tick and self._last_dets:
                 hits = []
                 for d in self._last_dets:
                     raw_tid = d.get("track_id")
                     if raw_tid is None or int(raw_tid) < 0:
+                        continue
+                    # 2026-05-14b: Schmitt-emitted coast dets carry
+                    # a stale YOLO bbox. Skipping them here keeps
+                    # MOSSE template-matching from its last visual
+                    # position, which is correct for moving targets.
+                    if d.get("coasted"):
                         continue
                     bx, by, bw, bh = d["bbox"]
                     hits.append(DetectorHit(
@@ -1499,15 +2113,29 @@ class EOManager:
                     frame, hits, self._frame_id)
             else:
                 pool_out = self._mosse_pool.on_frame(frame, self._frame_id)
-            # Override stale bboxes with MOSSE's frame-rate output.
-            # IDs the pool dropped (lost streak) silently leave
-            # _last_dets untouched — fusion's max_misses handles them.
-            for d in self._last_dets:
-                tid = d.get("track_id")
-                if tid is None or int(tid) < 0:
-                    continue
-                if int(tid) in pool_out.bboxes:
-                    d["bbox"] = pool_out.bboxes[int(tid)]
+            # 2026-05-14: MOSSE bypass on big shifts. When the image
+            # has shifted >30 px in this tick (rapid gimbal slew), the
+            # MOSSE template search window walks off-target and PSR
+            # collapses. The MOSSE-reported bbox is unreliable. Leave
+            # _last_dets at the phase-corr-shifted position (from the
+            # block above) — MOSSE re-spawns fresh trackers on the next
+            # YOLO tick via on_detector_tick automatically.
+            # 2026-05-14: bypass threshold raised 30 -> 200 px so MOSSE
+            # gets to refine the OPT-based shift at moderate pans where
+            # MOSSE template-match still works. MOSSE template walks off
+            # only at very fast pans (>200 px shift between frames).
+            _bypass_mosse = (abs(self._pc_last_dx_tick) > 200.0
+                              or abs(self._pc_last_dy_tick) > 200.0)
+            if not _bypass_mosse:
+                # Override stale bboxes with MOSSE's frame-rate output.
+                # IDs the pool dropped (lost streak) silently leave
+                # _last_dets untouched — fusion's max_misses handles them.
+                for d in self._last_dets:
+                    tid = d.get("track_id")
+                    if tid is None or int(tid) < 0:
+                        continue
+                    if int(tid) in pool_out.bboxes:
+                        d["bbox"] = pool_out.bboxes[int(tid)]
 
         # 2. Republish last detection list every frame so overlays hold
         #    steady between YOLO ticks. ByteTrack's internal Kalman
@@ -1603,64 +2231,39 @@ class EOManager:
         # because fusion's world conversion uses the lying pose.
         # ('still not working.jsonl' showed 0→1.5° pan published with
         # zero pixel motion in the EO image content.)
-        if frame is not None and frame.size > 0:
+        # ── BUS-trust override (uses phase-corr from earlier block) ─
+        # Trust optical-flow over BUS pose: when BUS reports motion but
+        # the image content didn't shift (lazy-servo deadband, stuck
+        # servo), suppress the BUS update for the stamped pose-at-capture.
+        # Reads _pc_last_dx_tick / _pc_last_dy_tick computed by the
+        # single-source phase-corr block earlier in this method — no
+        # re-compute, no second cv2.phaseCorrelate call.
+        if (bus_pan is not None and bus_tilt is not None
+                and self._prev_bus_pan is not None
+                and self._prev_bus_tilt is not None
+                and frame is not None and frame.size > 0):
             try:
-                # Downsample to a small grayscale for cheap phaseCorrelate.
-                hh, ww = frame.shape[:2]
-                target_w = self._of_target_w
-                if ww > target_w:
-                    scale = target_w / float(ww)
-                    nw, nh = target_w, max(1, int(round(hh * scale)))
-                    small = cv2.resize(frame, (nw, nh),
-                                        interpolation=cv2.INTER_AREA)
-                else:
-                    small = frame
-                if small.ndim == 3:
-                    small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                else:
-                    small_gray = small
-                small_gray = small_gray.astype(np.float32)
-
-                if (self._prev_frame_small is not None
-                        and self._prev_frame_small.shape == small_gray.shape
-                        and bus_pan is not None and bus_tilt is not None
-                        and self._prev_bus_pan is not None
-                        and self._prev_bus_tilt is not None):
-                    bus_dpan = bus_pan - self._prev_bus_pan
-                    bus_dtilt = bus_tilt - self._prev_bus_tilt
-                    # phaseCorrelate is ~3 ms per call on a 256-wide
-                    # downsample. The override below only fires when
-                    # |bus_d*| > bus_motion_min_deg, so on a static
-                    # gimbal (the common case) the phaseCorrelate
-                    # output is computed and discarded. Skip it when
-                    # neither axis crossed the motion gate. We still
-                    # update self._prev_frame_small below so the very
-                    # next frame after motion-start has a fresh prev.
+                bus_dpan = bus_pan - self._prev_bus_pan
+                bus_dtilt = bus_tilt - self._prev_bus_tilt
+                if (abs(bus_dpan) > self._bus_motion_min_deg
+                        or abs(bus_dtilt) > self._bus_motion_min_deg):
+                    # _pc_last_d{x,y}_tick are in DISPLAY pixel space.
+                    # Convert to degrees via display HFOV/VFOV.
+                    fh, fw = frame.shape[:2]
+                    zl = max(1, int(getattr(self, "_zoom_level", 1) or 1))
+                    hfov_eff = float(self._hfov) / float(zl)
+                    vfov_eff = float(self._vfov) / float(zl)
+                    deg_per_px_h = hfov_eff / float(fw)
+                    deg_per_px_v = vfov_eff / float(fh)
+                    # Camera pan-right shifts content left, so dpan = -dx*deg/px.
+                    dpan_optical = -self._pc_last_dx_tick * deg_per_px_h
+                    dtilt_optical = self._pc_last_dy_tick * deg_per_px_v
                     if (abs(bus_dpan) > self._bus_motion_min_deg
-                            or abs(bus_dtilt) > self._bus_motion_min_deg):
-                        # phaseCorrelate returns (dx, dy) of CURR relative
-                        # to PREV (positive dx = image moved right).
-                        # Camera motion is opposite the image content motion.
-                        sh = cv2.phaseCorrelate(self._prev_frame_small,
-                                                 small_gray)
-                        dx_px, dy_px = sh[0]
-                        nh, nw = small_gray.shape
-                        # Downsampled FOV → deg/px on the small image.
-                        deg_per_px_h = self._hfov / float(nw)
-                        deg_per_px_v = self._vfov / float(nh)
-                        # Camera pan-right shifts content left, so dpan = -dx*deg/px.
-                        # Camera tilt-up shifts content down, so dtilt = +dy*deg/px.
-                        dpan_optical = -float(dx_px) * deg_per_px_h
-                        dtilt_optical = float(dy_px) * deg_per_px_v
-                        # Reject BUS updates that aren't backed by optics.
-                        if (abs(bus_dpan) > self._bus_motion_min_deg
-                                and abs(dpan_optical) < self._optical_confirm_deg):
-                            gimbal_pan_at_capture = self._prev_bus_pan
-                        if (abs(bus_dtilt) > self._bus_motion_min_deg
-                                and abs(dtilt_optical) < self._optical_confirm_deg):
-                            gimbal_tilt_at_capture = self._prev_bus_tilt
-
-                self._prev_frame_small = small_gray
+                            and abs(dpan_optical) < self._optical_confirm_deg):
+                        gimbal_pan_at_capture = self._prev_bus_pan
+                    if (abs(bus_dtilt) > self._bus_motion_min_deg
+                            and abs(dtilt_optical) < self._optical_confirm_deg):
+                        gimbal_tilt_at_capture = self._prev_bus_tilt
                 # Remember what we ACCEPTED as the bus pose so the next
                 # comparison is against the override (not the raw BUS).
                 self._prev_bus_pan = (gimbal_pan_at_capture
@@ -1671,6 +2274,9 @@ class EOManager:
                                         else bus_tilt)
             except Exception as _opt_e:
                 log.debug("EO optical pose feedback skipped: %r", _opt_e)
+        elif bus_pan is not None and self._prev_bus_pan is None:
+            self._prev_bus_pan = bus_pan
+            self._prev_bus_tilt = bus_tilt
 
         # Encode the JPEG once, here, on the EO process thread. Removes
         # the dominant per-tick cost from the asyncio WS sender — see
@@ -1697,13 +2303,14 @@ class EOManager:
             connected=True,
             bgr=frame,
             detections=out_dets,
-            hfov_deg=self._hfov,
-            vfov_deg=self._vfov,
+            hfov_deg=self._hfov / float(max(1, getattr(self, "_zoom_level", 1))),
+            vfov_deg=self._vfov / float(max(1, getattr(self, "_zoom_level", 1))),
             source_device=dev_idx,
             gimbal_pan_at_capture=gimbal_pan_at_capture,
             gimbal_tilt_at_capture=gimbal_tilt_at_capture,
             jpeg_bytes=jpeg_bytes,
             jpeg_quality=int(self._eo_jpeg_quality),
+            native_bgr=native_frame,
         )
         BUS.publish(Topic.EO, ef)
 

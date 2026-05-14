@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from common.logging_setup import get_logger
@@ -58,11 +59,13 @@ _MODE_FILTERS: Dict[str, Dict[str, float]] = {
         "speed_min_mps": 0.0,
     },
     "ag": {
-        # Air-to-ground: narrow FoV (matches AWR2944P antenna main lobe)
-        # and dynamic-only filter (drops parked vehicles / standing
-        # humans that we'll catch with EO+thermal anyway).
+        # Air-to-ground long range: slope halved (4.5 MHz/µs) to reach
+        # 500m R_max. Needs a chip cfg push (awr2944P_ag.cfg).
+        # Host-side filters stay at operator-tuned values — the mode
+        # switch only changes max_range_m to open the 500m gate.
         "az_half_deg": 25.0,
         "speed_min_mps": 0.5,
+        "max_range_m": 500.0,
     },
     "aa": {
         # Air-to-air: same TLV filter as stock (we still want full
@@ -296,12 +299,24 @@ class CompositeRadarBackend:
 
     # ─────────────────────── mode dispatch ──────────────────────────────
     def set_mode(self, mode: str) -> str:
-        """Change the host-side mode filter. Returns the mode that was
+        """Change the radar operating mode. Returns the mode that was
         actually applied (echoes the input on success, returns the
-        previous mode if the input was invalid).
+        previous mode on failure or invalid input).
 
-        No chip interaction. No power-cycle. Idempotent — calling with
-        the current mode is a no-op and returns the current mode."""
+        **Stock ↔ A/G transitions push a new chip cfg** because the two
+        modes use different chirp slopes (8.883 vs 4.5 MHz/µs). The cfg
+        file itself starts with sensorStop + flushCfg, so the push
+        handles the chip state-machine transitions.
+
+        Stock ↔ A/A and A/A ↔ Stock are still host-side-only (same chirp
+        profile, different display pipeline).
+
+        On cfg-push failure the mode stays unchanged and the previous
+        cfg is restored — the chip never ends up in a half-configured
+        state.
+
+        Idempotent — calling with the current mode is a no-op.
+        """
         target = (mode or "").lower()
         if target not in ("stock", "ag", "aa"):
             log.warning("set_mode: unknown mode %r — keeping %s", mode, self._mode)
@@ -309,18 +324,59 @@ class CompositeRadarBackend:
         with self._lock:
             if target == self._mode:
                 return self._mode
-            log.info("Composite: mode %s → %s (host-side, no chip change, sliders untouched)",
-                     self._mode, target)
+
+            old_mode = self._mode
+            entering_ag = (target == "ag" and old_mode != "ag")
+            leaving_ag = (old_mode == "ag" and target != "ag")
+
+            # ── chip cfg push for A/G transitions ──
+            if entering_ag or leaving_ag:
+                cfg_dir = Path(self._radar.cfg_path).parent
+                if entering_ag:
+                    new_cfg = cfg_dir / "awr2944P_ag.cfg"
+                else:
+                    new_cfg = cfg_dir / "awr2944P_unified.cfg"
+
+                log.info(
+                    "Composite: mode %s → %s — pushing chip cfg %s",
+                    old_mode, target, new_cfg.name,
+                )
+                ok = self._radar.reconfigure(new_cfg)
+                if not ok:
+                    log.error(
+                        "Composite: cfg push for %s failed — staying in %s",
+                        new_cfg.name, old_mode,
+                    )
+                    return old_mode
+
+                # Open / close the range gate to match the new chirp.
+                if entering_ag:
+                    self._stock_max_range_m = self._radar.max_range_m
+                    self._radar.max_range_m = 500.0
+                    log.info("Composite: max_range_m → 500 m (A/G long range)")
+                else:
+                    restored = getattr(self, "_stock_max_range_m", 250.0)
+                    self._radar.max_range_m = restored
+                    log.info("Composite: max_range_m → %.0f m (restored)", restored)
+
+                # Re-arm DCA if we just re-enabled LVDS (leaving AG → unified cfg).
+                if leaving_ag:
+                    self._rearm_dca_after_chip_reset()
+            else:
+                log.info(
+                    "Composite: mode %s → %s (host-side only, no chip change)",
+                    old_mode, target,
+                )
+
             self._mode = target
+
             # Forward mode to the DCA pipeline so its _publish gate works.
-            # Was previously writing _publish_enabled which the pipeline
-            # never reads — dead code, the gate didn't fire and PMM hits
-            # flooded the GUI in stock mode.
             if self._dca_pipeline is not None:
                 try:
                     self._dca_pipeline.set_mode(target)
                 except Exception:
                     log.exception("dca_pipeline.set_mode(%s) failed", target)
+
         return self._mode
 
     # ─────────────────────── live-tune knobs ────────────────────────────
@@ -350,6 +406,63 @@ class CompositeRadarBackend:
         for k in ("integrate_chirps", "cfar_algo", "cfar_threshold_db", "capon_bf"):
             if k in kwargs:
                 setattr(self._dca_pipeline, "_ag_" + k, kwargs[k])
+
+    def apply_ag_cfar(self, threshold_db: float) -> bool:
+        """Modify the AG cfg's range-CFAR threshold and reconfigure
+        the chip if currently in A/G mode.
+
+        The cfarCfg line for range direction (procDirection=1) has the
+        threshold at position 7 (0-indexed). We rewrite that field
+        in the cfg file on disk, then trigger a reconfigure.
+
+        Returns True if the reconfigure succeeded (or if not in AG mode,
+        in which case the new threshold takes effect on next AG entry).
+        """
+        import re as _re
+        from pathlib import Path as _Path
+
+        cfg_dir = _Path(self._radar.cfg_path).parent
+        ag_cfg = cfg_dir / "awr2944P_ag.cfg"
+
+        if not ag_cfg.exists():
+            log.error("apply_ag_cfar: %s not found", ag_cfg)
+            return False
+
+        text = ag_cfg.read_text()
+
+        # Match range-direction cfarCfg (procDirection=1, second field)
+        # cfarCfg -1 1 <mode> <noiseWin> ... <thresholdScale> ...
+        def replace_range_cfar(m):
+            fields = m.group(0).split()
+            # fields[7] is thresholdScale for range CFAR
+            fields[7] = f"{threshold_db:.1f}"
+            return " ".join(fields)
+
+        new_text = _re.sub(
+            r"^cfarCfg\s+-1\s+1\s+.*$",
+            replace_range_cfar,
+            text,
+            flags=_re.MULTILINE,
+        )
+
+        if new_text == text:
+            log.warning("apply_ag_cfar: no range cfarCfg line matched")
+            return False
+
+        ag_cfg.write_text(new_text)
+        log.info("apply_ag_cfar: wrote %.1f dB to %s", threshold_db, ag_cfg.name)
+
+        # If in AG mode, reconfigure to apply immediately
+        if self._mode == "ag":
+            log.info("apply_ag_cfar: in AG mode — reconfiguring chip")
+            ok = self._radar.reconfigure(str(ag_cfg))
+            if ok and self._dca_pipeline is not None:
+                # LVDS is off in AG; no DCA re-arm needed
+                pass
+            return ok
+
+        # Not in AG — threshold stored for next AG entry
+        return True
 
     # ─────────────────────── diagnostics ────────────────────────────────
     def diagnostics(self) -> Dict[str, Any]:

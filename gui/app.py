@@ -314,6 +314,20 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 emit_event("device_changed", {"sensor": "eo", "idx": idx})
             except Exception:
                 pass
+        if "zoom_level" in body:
+            try:
+                level = int(body["zoom_level"])
+            except (TypeError, ValueError):
+                return Response(status_code=400, content="zoom_level must be int")
+            if level not in (1, 2, 4, 8):
+                return Response(status_code=400, content="zoom_level must be one of 1, 2, 4, 8")
+            em.set_zoom_level(level)
+            log.info("EO zoom_level -> %dx", level)
+            try:
+                emit_event("eo_zoom_changed", {"level": level})
+            except Exception:
+                pass
+        return {"device_index": em.device_index, "zoom_level": getattr(em, "_zoom_level", 1)}
         return {"device_index": em.device_index}
 
     @app.post("/api/config/eo_exposure")
@@ -442,6 +456,29 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
             "max_detections": cfg.max_detections,
         }
 
+    @app.post("/api/config/eo_schmitt")
+    async def set_eo_schmitt(request: Request):
+        em = app.state.eo_manager
+        if em is None or not hasattr(em, "set_schmitt_config"):
+            return Response(status_code=503, content="EO manager not running")
+        body = await request.json()
+        try:
+            em.set_schmitt_config(**body)
+        except Exception as e:
+            return Response(status_code=400, content=f"bad schmitt cfg: {e}")
+        try:
+            emit_event("eo_schmitt_changed", em.get_schmitt_config())
+        except Exception:
+            pass
+        return em.get_schmitt_config()
+
+    @app.get("/api/config/eo_schmitt")
+    async def get_eo_schmitt():
+        em = app.state.eo_manager
+        if em is None or not hasattr(em, "get_schmitt_config"):
+            return Response(status_code=503, content="EO manager not running")
+        return em.get_schmitt_config()
+
     @app.websocket("/ws/sensors")
     async def sensors(ws: WebSocket) -> None:
         await ws.accept()
@@ -562,6 +599,10 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         radar_el_bias_deg=r_el,
                         thermal_az_bias_deg=t_az,
                         thermal_el_bias_deg=t_el,
+                        eo_schmitt_config=(em.get_schmitt_config()
+                                            if (em := app.state.eo_manager)
+                                            and hasattr(em, "get_schmitt_config")
+                                            else None),
                     )
                     _prof_build += (time.perf_counter() - _t_build0)
                     # `default=str` is a safety net for numpy scalars that
@@ -642,15 +683,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 try:
                     _t_send0 = time.perf_counter()
                     await ws.send_text(text)
-                    _send_dt = time.perf_counter() - _t_send0
-                    _prof_send += _send_dt
-                    # Phase 1 fix #3: TCP backpressure spike (browser
-                    # slow to drain canvas redraws). Yield event loop
-                    # briefly so _eo_sender + other tasks can run while
-                    # the kernel TCP buffer drains. Threshold 80ms ~=
-                    # 2x our normal 40ms WS period at ws_fps=40.
-                    if _send_dt > 0.080:
-                        await asyncio.sleep(0.005)
+                    _prof_send += (time.perf_counter() - _t_send0)
                 except WebSocketDisconnect:
                     raise
                 except RuntimeError as e:
@@ -916,23 +949,37 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         log.warning("set_radar_mode: unknown mode %r", mode)
 
                 elif command == "ag_tune":
-                    # A/G (mmHawkeye long-range) DSP knobs: integrate_chirps,
-                    # cfar_algo, cfar_threshold_db, capon_bf. Pushes into
-                    # the composite if available; the AG host-side processor
-                    # consumes them at frame time.
+                    # Legacy A/G DSP knobs — kept for event recording
+                    # compatibility. No host-side A/G DSP pipeline exists
+                    # yet; values are stored but not consumed.
                     try:
                         params = {k: v for k, v in cmd.items()
                                   if k != "command" and v is not None}
                         state.setdefault("ag_tuning", {}).update(params)
-                        rm = app.state.radar_manager
-                        if rm is not None and hasattr(rm, "update_ag_params"):
-                            try:
-                                rm.update_ag_params(**params)
-                            except Exception:
-                                log.exception("composite.update_ag_params failed")
                         emit_event("ag_tune", params)
                     except Exception:
                         log.exception("ag_tune")
+
+                elif command == "ag_cfar_apply":
+                    # Push a new on-chip CFAR threshold to the AWR2944P.
+                    # This modifies the AG cfg's cfarCfg line and triggers
+                    # a full chip reconfigure (~5 s via xds110 reset).
+                    try:
+                        thresh = float(cmd.get("cfar_threshold_db", 26.0))
+                        thresh = max(10.0, min(40.0, thresh))  # safety clamp
+                        state.setdefault("ag_tuning", {})["cfar_threshold_db"] = thresh
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "apply_ag_cfar"):
+                            try:
+                                ok = rm.apply_ag_cfar(thresh)
+                                log.info("ag_cfar_apply: %.1f dB → %s",
+                                         thresh, "OK" if ok else "FAILED")
+                            except Exception:
+                                log.exception("ag_cfar_apply failed")
+                        emit_event("ag_cfar_apply",
+                                   {"cfar_threshold_db": thresh})
+                    except Exception:
+                        log.exception("ag_cfar_apply")
 
                 elif command == "aa_tune":
                     # A/A (PMM drone) DSP knobs: pmm_band_low_hz, pmm_band_high_hz,
@@ -1014,6 +1061,15 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         except Exception as e:
                             log.warning("radar_tune failed: %s", e)
 
+                elif command == "eo_schmitt_tune":
+                    em = app.state.eo_manager
+                    if em is not None and hasattr(em, "set_schmitt_config"):
+                        try:
+                            em.set_schmitt_config(**{k: v for k, v in cmd.items() if k != "command"})
+                            try: emit_event("eo_schmitt_changed", em.get_schmitt_config())
+                            except Exception: pass
+                        except Exception as _e:
+                            log.warning("eo_schmitt_tune failed: %s", _e)
                 elif command == "extrinsic_tune":
                     # Live-update software extrinsic (az/el bias) used
                     # to align radar + thermal to EO (ground truth).

@@ -212,6 +212,10 @@ class CorrelationTrackerSet:
         out = TrackerPoolUpdate()
         if not self._cfg.enabled:
             return out
+        # 2026-05-14: early-return when no trackers — skips the
+        # BGR->GRAY conversion (~1-2 ms on Xavier per call).
+        if not self._tracks:
+            return out
         # Convert BGR→gray ONCE for the entire pool. See _to_gray_once.
         gray = self._to_gray_once(frame)
         to_prune: List[int] = []

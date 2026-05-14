@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SEEKER-01 Bench · Phase B</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ─────────── TOP BAR ─────────── -->
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="brand">SEEKER-01 · <span class="brand-accent">BENCH</span></span>
+    <span class="subtitle">v2 · Phase B</span>
+  </div>
+  <div class="pills">
+    <span id="pill-thermal" class="pill pill-off"><span class="dot"></span>THERMAL</span>
+    <span id="pill-eo"      class="pill pill-off"><span class="dot"></span>EO</span>
+    <span id="pill-radar"   class="pill pill-off"><span class="dot"></span>RADAR</span>
+    <span id="pill-gimbal"  class="pill pill-off"><span class="dot"></span>GIMBAL</span>
+    <span id="pill-rec"     class="pill pill-off" role="button" title="Toggle recording (stub — writes nothing to disk yet)"><span class="dot"></span>REC</span>
+  </div>
+  <span id="ws-status" class="ws-badge">WS: connecting…</span>
+</div>
+
+<!-- ─────────── TAB BAR ─────────── -->
+<div class="tabbar">
+  <button class="tab-btn active" data-tab="main">MAIN</button>
+  <button class="tab-btn" data-tab="dev">DEVELOPERS</button>
+</div>
+
+<div class="stage">
+
+  <!-- ═════════════════════ MAIN TAB ═════════════════════ -->
+  <section class="tab-content" data-tab="main">
+
+    <!-- Legend banner removed 2026-04-25 per operator request — the
+         color codes are self-evident from the bbox + label, and the
+         banner was eating ~32 px of vertical space we needed to fit
+         the dashboard in one no-scroll viewport. -->
+
+    <!-- ─────────── ROW 1: sensors ─────────── -->
+    <div class="row-sensors">
+
+      <!-- THERMAL PANEL -->
+      <div class="panel">
+        <div class="panel-head">
+          <span>THERMAL · Boson 640</span>
+          <span class="hz mono" id="thermal-hz">— Hz</span>
+        </div>
+        <div class="panel-subbar">
+          <button class="zoom-btn active" data-zoom="full">75°</button>
+          <button class="zoom-btn" data-zoom="wide">37°</button>
+          <button class="zoom-btn" data-zoom="mid">18°</button>
+          <button class="zoom-btn" data-zoom="narrow">12°</button>
+          <span class="fov-label" id="thermal-fov">75° HFOV</span>
+          <button class="draw-target-btn" id="draw-target-btn"
+                  title="Drag a bbox on the thermal feed to seed a synthetic OF-only track (ESC cancels)">
+            DRAW TARGET
+          </button>
+          <button class="clear-target-btn" id="clear-target-btn"
+                  title="Clear the current synthetic target">
+            CLEAR
+          </button>
+        </div>
+        <div class="panel-canvas">
+          <canvas id="thermal-canvas"></canvas>
+          <div id="thermal-disconnected" class="disconnected-overlay">
+            <span class="disc-icon">⚡</span>
+            <span>THERMAL · DISCONNECTED</span>
+          </div>
+          <div class="panel-overlay-tl" id="thermal-meta"></div>
+          <div class="panel-overlay-br" id="thermal-track-count"></div>
+        </div>
+      </div>
+
+      <!-- EO PANEL -->
+      <div class="panel">
+        <div class="panel-head">
+          <span id="eo-title">EO · IMX568 · 35mm NIR · 11°</span>
+          <span class="hz mono" id="eo-hz">— Hz</span>
+        </div>
+        <div class="panel-subbar">
+          <span class="fov-label" id="eo-fov">11° HFOV</span>
+          <!-- DISTANCE ESTIMATE: drag a bbox across a target's WIDTH,
+               release, we compute distance from the assumed real-world
+               width + HFOV via the pinhole formula. The class selector
+               picks which width to assume:
+                 vehicle ≈ 1.8 m  (shoulder width / car broadside)
+                 person  ≈ 0.45 m (adult shoulder width)
+                 custom  → user-typed metres
+               Pick BEFORE clicking DISTANCE ESTIMATE. -->
+          <select id="eo-measure-class"
+                  class="select-compact"
+                  style="margin-left:auto;"
+                  title="What's the target? Sets the assumed real-world width.">
+            <option value="vehicle" data-width="1.8" selected>vehicle (1.8 m)</option>
+            <option value="person"  data-width="0.45">person (0.45 m)</option>
+            <option value="custom"  data-width="">custom…</option>
+          </select>
+          <input type="number" id="eo-measure-custom-m"
+                 class="num-compact"
+                 min="0.05" max="50" step="0.05"
+                 placeholder="m"
+                 title="Custom real-world width in metres"
+                 style="display:none;width:64px;">
+          <button class="draw-target-btn" id="eo-measure-btn"
+                  title="Drag a bbox across the target's WIDTH — release for distance">
+            DISTANCE ESTIMATE
+          </button>
+          <button class="clear-target-btn" id="eo-measure-clear"
+                  title="Clear the current estimate">
+            CLEAR
+          </button>
+        </div>
+        <div class="panel-canvas">
+          <canvas id="eo-canvas"></canvas>
+          <div id="eo-disconnected" class="disconnected-overlay">
+            <span class="disc-icon">📷</span>
+            <span id="eo-disconnected-label">EO · DISCONNECTED</span>
+          </div>
+          <div class="panel-overlay-tl" id="eo-measure-status"></div>
+        </div>
+      </div>
+
+      <!-- RADAR PANEL -->
+      <div class="panel">
+        <div class="panel-head">
+          <span>RADAR · AWR2944P</span>
+          <span class="hz mono" id="radar-hz">— Hz</span>
+        </div>
+        <div class="panel-canvas">
+          <canvas id="radar-canvas"></canvas>
+          <div id="radar-disconnected" class="disconnected-overlay">
+            <span class="disc-icon">📡</span>
+            <span>RADAR · DISCONNECTED</span>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /.row-sensors -->
+
+    <!-- ─────────── ROW 2: target list + gimbal dpad ─────────── -->
+    <div class="row-main">
+
+      <!-- TOP TARGETS LIST — ranked by sensor-count + confidence.
+           Each row has a TRACK button that tells the gimbal to auto-
+           track that fused ID. Only one target can be tracked at a time.
+           When nothing is tracked, the gimbal is manual (dpad to the right). -->
+      <div class="targets-card" id="targets-card">
+        <div class="targets-head">
+          <span class="targets-label">TARGETS · TOP 5</span>
+          <span class="targets-sub" id="targets-lock-state">no lock · gimbal manual</span>
+        </div>
+        <div class="targets-list" id="targets-list">
+          <div class="targets-empty">no fused targets</div>
+        </div>
+      </div>
+
+      <!-- GIMBAL SLIDERS (manual control — absolute angle setpoints).
+           Replaced the dpad on 2026-04-25: operator wanted finer-grain
+           control than the ±5° step buttons gave. Sliders send the
+           target angle directly via the 'gimbal_absolute' WS command;
+           the manager then slews to that setpoint under the existing
+           rate-limit. Slider RANGES come from the YAML calibration
+           limits and are populated by JS on connect. -->
+      <div class="ctrl-card gimbal-card">
+        <div class="ctrl-head">
+          <span class="ctrl-title">GIMBAL</span>
+          <span class="ctrl-val mono">pan <b id="gimbal-pan">—</b>° · tilt <b id="gimbal-tilt">—</b>°</span>
+        </div>
+        <div class="gimbal-sliders">
+          <div class="gslider-row">
+            <span class="gslider-label">PAN</span>
+            <input class="gslider" type="range" id="gimbal-pan-slider"
+                   min="-60" max="60" step="0.5" value="0"
+                   title="Drag to absolute pan angle (deg). Range comes from app_config.yaml">
+            <span class="gslider-val mono" id="gimbal-pan-slider-val">0°</span>
+          </div>
+          <div class="gslider-row">
+            <span class="gslider-label">TILT</span>
+            <input class="gslider" type="range" id="gimbal-tilt-slider"
+                   min="0" max="90" step="0.5" value="0"
+                   title="Drag to absolute tilt angle (deg). 0 = horizon, 90 = vertical up">
+            <span class="gslider-val mono" id="gimbal-tilt-slider-val">30°</span>
+          </div>
+          <button class="gslider-home" id="gimbal-home-btn" title="Snap to home pose">HOME</button>
+        </div>
+        <div class="gimbal-hint" id="gimbal-hint">manual · press TRACK on a target to lock</div>
+      </div>
+
+    </div><!-- /.row-main -->
+
+  </section><!-- /.tab-content[main] -->
+
+
+  <!-- ═════════════════════ DEVELOPERS TAB ═════════════════════ -->
+  <section class="tab-content hidden" data-tab="dev">
+
+    <div class="dev-banner">
+      Developer controls · tuning parameters, fusion overlay toggles, heat-blob debug tracker.
+      Nothing here affects headless operation.
+    </div>
+
+    <!-- Top row of live previews — Thermal | EO | Radar (matches MAIN tab order).
+         Sits at the top so the operator sees the sensor outputs FIRST,
+         then scrolls into the per-sensor controls below. -->
+    <div class="row-dev-previews">
+      <div class="ctrl-card dev-preview-card">
+        <div class="mini-preview-label">LIVE · thermal</div>
+        <canvas id="thermal-mini-canvas"></canvas>
+      </div>
+      <div class="ctrl-card dev-preview-card">
+        <div class="mini-preview-label">LIVE · EO (calibration reference)</div>
+        <canvas id="eo-mini-canvas"></canvas>
+      </div>
+      <div class="ctrl-card dev-preview-card">
+        <div class="mini-preview-label">LIVE · radar</div>
+        <canvas id="radar-mini-canvas"></canvas>
+      </div>
+    </div>
+
+    <!-- Scrollable controls area — previews row above stays fixed in
+         view so the operator always sees the live displays while
+         scrolling through controls. -->
+    <div class="dev-scroll-area">
+
+    <!-- Globals row: cross-sensor knobs + the shared SAVE for extrinsic
+         biases. Slim, ~50 px, sits above the per-sensor cards. -->
+    <div class="row-ctrl-globals">
+      <!-- HEAT-BLOB DEBUG TOGGLE (was the top-bar DEV button) -->
+      <div class="ctrl-card globals-tile">
+        <div class="ctrl-head">
+          <span class="ctrl-title">HEAT-BLOB DEBUG</span>
+          <button id="dev-toggle" class="dev-toggle-big" style="margin-left:auto;">OFF</button>
+        </div>
+      </div>
+
+      <!-- OVERLAY SCREEN · source-centric cross-sensor toggles.
+           Each toggle controls whether that sensor's tracks project onto
+           the OTHER panels. Native detections on a sensor's own panel
+           are never affected. Default: all on. -->
+      <div class="ctrl-card globals-tile">
+        <div class="ctrl-head">
+          <span class="ctrl-title">OVERLAYS</span>
+        </div>
+        <div class="fusion-sub" style="gap:8px;">
+          <label class="fusion-toggle"><input type="checkbox" id="overlay-radar"   checked><span>Radar</span></label>
+          <label class="fusion-toggle"><input type="checkbox" id="overlay-thermal" checked><span>Thermal</span></label>
+          <label class="fusion-toggle"><input type="checkbox" id="overlay-eo"      checked><span>EO</span></label>
+        </div>
+      </div>
+
+      <!-- Shared SAVE for extrinsic biases. Persists ALL bias sliders
+           (radar AZ/EL + thermal AZ/EL) to config/calibration.json. -->
+      <div class="ctrl-card globals-tile">
+        <div class="ctrl-head">
+          <span class="ctrl-title">EXTRINSIC · SAVE</span>
+          <button id="ext-save" class="dev-toggle-big" style="margin-left:auto;padding:4px 14px;font-size:11px;letter-spacing:1px;">SAVE</button>
+        </div>
+        <div class="stat-line" id="ext-save-status" style="color:var(--text-3);font-size:10px;min-height:13px;">
+          Persists thermal/radar biases to config/calibration.json.
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-sensor row: 3 panels in EO / THERMAL / RADAR order.
+         Each panel groups its own controls + bias sliders + a same-sized
+         live preview so the operator can calibrate each sensor in place
+         without scrolling between sections. EO ground-truth preview lives
+         in the EO panel for direct visual reference while dragging biases
+         on the OTHER panels (thermal/radar overlays project onto the EO
+         frame so changes to those biases are visible there in real time). -->
+    <div class="row-ctrl-sensors">
+
+      <!-- ─────── EO PANEL ─────── -->
+      <div class="ctrl-card sensor-card" id="dev-eo">
+        <div class="ctrl-head">
+          <span class="ctrl-title">EO · IMX568 · 35mm NIR</span>
+        </div>
+        <div class="sensor-body">
+          <!-- EXPOSURE: auto/manual switch for the SDK RAW12 stream.
+               AUTO = software AE drives ExposureExt automatically.
+               MANUAL = lock to a specific ExposureExt (engineering /
+               repeatability). Switching restarts the SDK helper (~1.5s).
+            -->
+          <div class="sensor-section">
+            <div class="section-label">EXPOSURE</div>
+            <div class="fusion-sub">
+              <label class="fusion-toggle">
+                <input type="radio" name="eo-exp-mode" id="eo-exp-auto" value="auto" checked>
+                <span>Auto (software AE)</span>
+              </label>
+              <label class="fusion-toggle">
+                <input type="radio" name="eo-exp-mode" id="eo-exp-manual" value="manual">
+                <span>Manual</span>
+              </label>
+            </div>
+            <div class="slider-row" style="margin-top:6px;">
+              <label class="slider-label">EXP EXT</label>
+              <input id="eo-exp-value" type="number" min="1" max="50000" step="1" value="1264"
+                     style="width:78px;background:#111;color:#ddd;border:1px solid #333;padding:3px 6px;font-family:inherit;font-size:11px;">
+              <button id="eo-exp-apply" class="dev-toggle-big" style="margin-left:auto;padding:4px 12px;font-size:10px;letter-spacing:1px;">APPLY</button>
+            </div>
+            <div class="stat-line" id="eo-exp-status" style="margin-top:4px;color:var(--text-3);font-size:10px;min-height:13px;">
+              Daylight+NIR ≈ 5–15. Low light ≈ 8000–25000.
+            </div>
+          </div>
+
+          <!-- LOW-LIGHT BOOST: AGC stretch + gamma. Live, no restart. -->
+          <div class="sensor-section">
+            <div class="section-label">LOW-LIGHT</div>
+            <div class="fusion-sub">
+              <label class="fusion-toggle">
+                <input type="checkbox" id="eo-lowlight-enable">
+                <span>Boost (AGC + gamma 1.6)</span>
+              </label>
+            </div>
+            <div class="stat-line" id="eo-lowlight-status" style="margin-top:4px;color:var(--text-3);font-size:10px;min-height:13px;">
+              OFF = passthrough. ON = stretch dim scenes (noisier look).
+            </div>
+          </div>
+
+          <!-- EO is ground truth for extrinsic calibration — its preview
+               sits here at the same size as the thermal/radar minis so
+               the operator sees fused/projected bboxes shifting on the
+               same canvas while dragging the bias sliders elsewhere. -->
+        </div>
+      </div>
+
+      <!-- ─────── THERMAL PANEL ─────── -->
+      <div class="ctrl-card sensor-card" id="dev-thermal">
+        <div class="ctrl-head">
+          <span class="ctrl-title">THERMAL · Boson 640</span>
+          <label class="fusion-toggle" style="margin-left:auto;">
+            <input type="checkbox" id="thermal-invert">
+            <span>Black hot</span>
+          </label>
+        </div>
+        <div class="sensor-body">
+          <div class="sensor-section">
+            <div class="section-label">DETECTION TUNING</div>
+            <div class="slider-row">
+              <label class="slider-label">SENSITIVITY</label>
+              <input id="thr-slider" type="range" min="2" max="100" step="0.5" value="2" data-invert="1">
+              <span class="slider-val" id="thr-val">—</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">MIN BLOB</label>
+              <input id="minarea-slider" type="range" min="3" max="500" step="1" value="3" data-invert="1">
+              <span class="slider-val" id="minarea-val">—</span>
+            </div>
+            <div class="stat-line" style="margin-top:4px;color:var(--text-3);font-size:10px;">
+              Right = more sensitive / smaller blobs accepted.
+            </div>
+          </div>
+
+          <div class="sensor-section">
+            <div class="section-label">EXTRINSIC vs EO</div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts thermal fused box right on EO">AZ</label>
+              <input id="ext-thermal-az" type="range" min="-2" max="2" step="0.05" value="0">
+              <span class="slider-val" id="ext-thermal-az-val">— °</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts thermal fused box up on EO">EL</label>
+              <input id="ext-thermal-el" type="range" min="-2" max="2" step="0.05" value="0">
+              <span class="slider-val" id="ext-thermal-el-val">— °</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- ─────── RADAR PANEL ─────── -->
+      <div class="ctrl-card sensor-card" id="dev-radar">
+        <div class="ctrl-head">
+          <span class="ctrl-title">RADAR · AWR2944P</span>
+          <span id="radar-backend-status" class="ctrl-substatus mono"
+                style="margin-left:auto;color:var(--text-3);font-size:10px;">
+            …
+          </span>
+        </div>
+        <div class="sensor-body">
+          <!-- RADAR MODE picker. Each mode reveals its own DSP controls
+               below the stock detection-tuning sliders. -->
+          <div class="sensor-section">
+            <div class="section-label" title="Selects which radar pipeline runs and which mode-specific DSP knobs are exposed below. Switching modes does not push a new chirp cfg to the chip and does not power-cycle.">MODE
+              <button id="radar-save-mode-config" class="save-mode-btn"
+                      title="Save the current slider values for THIS mode to disk (config/radar_modes.json). Restored on next Seeker startup. Each mode has its own snapshot."
+                      style="margin-left:auto;float:right;font-size:10px;padding:2px 8px;border-radius:4px;background:transparent;border:1px solid var(--cyan);color:var(--cyan);cursor:pointer;letter-spacing:1px;">SAVE CONFIG</button>
+            </div>
+            <div class="fusion-sub">
+              <label class="fusion-toggle" title="Stock: TLV point cloud over UART → DBSCAN → Kalman tracker. Identical to today's Seeker behaviour. Uses the existing detection-tuning sliders below.">
+                <input type="radio" name="radar-backend" id="radar-backend-stock" value="stock" checked>
+                <span>Stock</span>
+              </label>
+              <label class="fusion-toggle" title="A/G (Air-to-Ground): mmHawkeye-style raw-ADC pipeline with long coherent integration (+27 dB at 512 chirps), OS-CFAR for non-Gaussian foliage clutter, Capon beamformer over the virtual array (+8–10 dB spatial gain). Goal: extend detection range on dynamic vehicles and humans (~1.4× stock).">
+                <input type="radio" name="radar-backend" id="radar-backend-ag" value="ag">
+                <span>A/G</span>
+              </label>
+              <label class="fusion-toggle" title="A/A (Air-to-Air): raw-ADC slow-time + propeller micro-motion (PMM) drone classifier. Looks for symmetric sideband pair around the body Doppler at the blade-pass frequency. Output: drone class label + confidence overlaid on the standard point cloud.">
+                <input type="radio" name="radar-backend" id="radar-backend-aa" value="aa">
+                <span>A/A</span>
+              </label>
+            </div>
+            <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
+              STOCK = TLV + DBSCAN (today's chain).
+              A/G = mmHawkeye-style raw-ADC long-integration (+27 dB) + OS-CFAR + Capon BF for dynamic vehicles/humans.
+              A/A = raw-ADC slow-time + propeller-sideband (PMM) drone classifier.
+            </div>
+          </div>
+          <div class="sensor-section">
+            <div class="section-label">DETECTION TUNING · live</div>
+            <div class="slider-row">
+              <label class="slider-label" title="Drop points below this SNR — higher = cleaner, lower = more returns">SNR MIN</label>
+              <input id="radar-snr" type="range" min="0" max="25" step="0.5" value="6">
+              <span class="slider-val" id="radar-snr-val">— dB</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Azimuth half-angle — concentrate on-axis; sidelobes excluded">FOV ±</label>
+              <input id="radar-az" type="range" min="5" max="60" step="1" value="60">
+              <span class="slider-val" id="radar-az-val">— °</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Minimum |doppler|. 0 = include static. Bump to suppress walls/trees.">SPEED MIN</label>
+              <input id="radar-speed" type="range" min="0" max="5" step="0.1" value="0.4">
+              <span class="slider-val" id="radar-speed-val">— m/s</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Near-range blanking — drop detections closer than this.">RANGE MIN</label>
+              <input id="radar-range-min" type="range" min="0" max="30" step="0.5" value="0">
+              <span class="slider-val" id="radar-range-min-val">— m</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="DBSCAN position epsilon — larger stitches scattered returns.">CLUSTER ε</label>
+              <input id="radar-eps" type="range" min="0.3" max="10.0" step="0.1" value="6.0">
+              <span class="slider-val" id="radar-eps-val">— m</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="DBSCAN minimum cluster size.">MIN PTS</label>
+              <input id="radar-minpts" type="range" min="2" max="8" step="1" value="3">
+              <span class="slider-val" id="radar-minpts-val">—</span>
+            </div>
+          </div>
+
+          <!-- A/G-only controls — on-chip CFAR threshold.
+               The AWR2944P runs CFAR on its DSP; the threshold is
+               set in cfarCfg before sensorStart. Changing it requires
+               a chip reconfigure (~5 s). The slider stores the value;
+               APPLY pushes it to the chip. -->
+          <div class="sensor-section radar-mode-extra" data-mode="ag" hidden>
+            <div class="section-label">A/G · long range</div>
+            <div class="slider-row">
+              <label class="slider-label" title="On-chip CFAR detection threshold (dB above noise floor). Lower = more detections + more false alarms. Default 26 dB. Range 20–32.">CFAR THRESH</label>
+              <input id="ag-cfar-thresh" type="range" min="20" max="32" step="1" value="26">
+              <span class="slider-val" id="ag-cfar-thresh-val">26 dB</span>
+            </div>
+            <div class="slider-row" style="justify-content:flex-end;">
+              <button id="ag-cfar-apply" class="btn-small" title="Push new CFAR threshold to the AWR chip (~5 s reconfigure)">APPLY</button>
+            </div>
+          </div>
+
+          <!-- A/A-only controls — PMM (propeller micro-motion) drone classifier
+               on raw-ADC slow-time. Visible only when MODE = A/A. -->
+          <div class="sensor-section radar-mode-extra" data-mode="aa" hidden>
+            <div class="section-label">A/A · raw-ADC · PMM drone</div>
+            <!-- Dual-thumb range slider for the PMM blade-pass band.
+                 Two <input type=range> overlaid on the same track, both
+                 spanning the full 20–3000 Hz range; JS clamps so low
+                 stays at least one step below high. The two existing
+                 IDs (aa-pmm-low / aa-pmm-high) are preserved so the
+                 backend WS contract (pmm_band_low_hz / pmm_band_high_hz)
+                 doesn't change.
+
+                 References: DJI Mavic blade-pass ≈ 217 Hz, FPV racers
+                 land aliased near 2.5 kHz with our PRF — covering both
+                 in one band needs the full 20–3000 sweep. -->
+            <div class="slider-row">
+              <label class="slider-label" title="Propeller blade-pass-frequency band the PMM detector scans. Drag both ends. DJI-class ≈ 200–600 Hz, FPV racers alias near 2 kHz.">PMM BAND</label>
+              <div class="dual-range" data-dual="aa-pmm">
+                <div class="dual-range-track"></div>
+                <div class="dual-range-fill" id="aa-pmm-fill"></div>
+                <input id="aa-pmm-low"  type="range" min="20" max="3000" step="10" value="50"  class="dual-range-thumb">
+                <input id="aa-pmm-high" type="range" min="20" max="3000" step="10" value="500" class="dual-range-thumb">
+              </div>
+              <span class="slider-val" id="aa-pmm-band-val">— Hz</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="PMM detection threshold (sideband-pair power above noise floor). Default 12 dB. Below ~10 dB the pure-noise statistics of 'best score over hundreds of candidate offsets' produce ~50% false alarm rate per range bin — bench-tested on 2026-04-29. Real propellers land at +20–40 dB.">PMM THRESH</label>
+              <input id="aa-pmm-thresh" type="range" min="10" max="30" step="0.5" value="18">
+              <span class="slider-val" id="aa-pmm-thresh-val">— dB</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Slow-time window length (chirps) used for PMM FFT. Longer = better blade-rate resolution, slower update.">SLOW-TIME WIN</label>
+              <input id="aa-pmm-win" type="range" min="64" max="512" step="64" value="256">
+              <span class="slider-val" id="aa-pmm-win-val">— chirps</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="Staggered-PRF Doppler unfolding. Alternates two PRFs frame-by-frame, CRT-unfolds true Doppler. Required for FPV (5+ kHz blade rate) when chip PRF can't resolve directly.">STAGGERED PRF</label>
+              <label class="fusion-toggle" style="margin:0;">
+                <input type="checkbox" id="aa-staggered-prf">
+                <span>on</span>
+              </label>
+              <span class="slider-val">—</span>
+            </div>
+          </div>
+
+          <div class="sensor-section">
+            <div class="section-label">EXTRINSIC vs EO</div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts radar projected box right on EO/thermal">AZ</label>
+              <input id="ext-radar-az" type="range" min="-10" max="10" step="0.1" value="0">
+              <span class="slider-val" id="ext-radar-az-val">— °</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="+ shifts radar projected box up on EO/thermal">EL</label>
+              <input id="ext-radar-el" type="range" min="-10" max="10" step="0.1" value="0">
+              <span class="slider-val" id="ext-radar-el-val">— °</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div><!-- /.row-ctrl-sensors -->
+
+    </div><!-- /.dev-scroll-area -->
+
+  </section><!-- /.tab-content[dev] -->
+
+</div><!-- /.stage -->
+
+<div id="replay-bar" hidden>
+  <button id="replay-pause" class="rb-btn" title="Pause / Play (server-truth)">⏸</button>
+  <input id="replay-seek" type="range" min="0" max="0" step="0.1" value="0" title="Scrub — drag to scrub through frames">
+  <span id="replay-time" class="mono">0:00 / 0:00</span>
+  <select id="replay-speed" title="Playback speed">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+  </select>
+</div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

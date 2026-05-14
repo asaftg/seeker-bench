@@ -113,7 +113,12 @@ def encode_eo(ef: Optional[EOFrame], jpeg_quality: int = 92) -> Optional[Dict[st
             "connected": False,
             "initializing": bool(getattr(ef, "initializing", False)),
         }
-    h, w = (ef.bgr.shape[:2] if ef.bgr is not None else (0, 0))
+    # 2026-05-13: prefer native_bgr (pre-downscale 2472x2064 frame) for
+    # recording fidelity. Falls back to bgr (display-downscaled) when
+    # native is not populated (webcam backend, or no downscale active).
+    # The GUI never sees native — the WS sender continues to use bgr.
+    rec_img = ef.native_bgr if getattr(ef, "native_bgr", None) is not None else ef.bgr
+    h, w = (rec_img.shape[:2] if rec_img is not None else (0, 0))
     return {
         "frame_id": int(ef.frame_id),
         "timestamp": float(ef.timestamp),
@@ -128,7 +133,7 @@ def encode_eo(ef: Optional[EOFrame], jpeg_quality: int = 92) -> Optional[Dict[st
                                    else round(float(ef.gimbal_pan_at_capture), 4)),
         "gimbal_tilt_at_capture": (None if ef.gimbal_tilt_at_capture is None
                                     else round(float(ef.gimbal_tilt_at_capture), 4)),
-        "jpeg_b64": _jpeg_b64(ef.bgr, jpeg_quality),
+        "jpeg_b64": _jpeg_b64(rec_img, jpeg_quality),
         "detections": [
             {
                 "bbox": {"x": int(d.bbox.x), "y": int(d.bbox.y),

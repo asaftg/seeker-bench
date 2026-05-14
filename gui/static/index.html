@@ -84,6 +84,10 @@
           <span class="hz mono" id="eo-hz">— Hz</span>
         </div>
         <div class="panel-subbar">
+          <button class="zoom-btn active" data-eo-zoom="1">1×</button>
+          <button class="zoom-btn" data-eo-zoom="2">2×</button>
+          <button class="zoom-btn" data-eo-zoom="4">4×</button>
+          <button class="zoom-btn" data-eo-zoom="8">8×</button>
           <span class="fov-label" id="eo-fov">11° HFOV</span>
           <!-- DISTANCE ESTIMATE: drag a bbox across a target's WIDTH,
                release, we compute distance from the assumed real-world
@@ -324,7 +328,67 @@
             </div>
           </div>
 
-          <!-- EO is ground truth for extrinsic calibration — its preview
+          <!-- ─────── EO SCHMITT TUNING ──────
+               Live-tunable per-class HI (1-frame instant pass) + LO
+               (multi-frame floor for K-of-WINDOW persistence) + globals
+               PERSIST hits-needed, WINDOW ticks, COAST after lost.
+               POSTs to /api/config/eo_schmitt or WS eo_schmitt_tune.
+            -->
+          <div class="sensor-section">
+            <div class="section-label">SCHMITT TUNING</div>
+            <div class="slider-row">
+              <label class="slider-label">VEHICLE — 1-frame pass</label>
+              <input id="eo-schmitt-hi-vehicle" type="range" min="0" max="1" step="0.01" value="0.55">
+              <span class="slider-val" id="eo-schmitt-hi-vehicle-val">0.55</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">VEHICLE — multi-frame floor</label>
+              <input id="eo-schmitt-lo-vehicle" type="range" min="0" max="1" step="0.01" value="0.25">
+              <span class="slider-val" id="eo-schmitt-lo-vehicle-val">0.25</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">HUMAN — 1-frame pass</label>
+              <input id="eo-schmitt-hi-person" type="range" min="0" max="1" step="0.01" value="0.55">
+              <span class="slider-val" id="eo-schmitt-hi-person-val">0.55</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">HUMAN — multi-frame floor</label>
+              <input id="eo-schmitt-lo-person" type="range" min="0" max="1" step="0.01" value="0.25">
+              <span class="slider-val" id="eo-schmitt-lo-person-val">0.25</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">DRONE — 1-frame pass</label>
+              <input id="eo-schmitt-hi-drone" type="range" min="0" max="1" step="0.01" value="0.40">
+              <span class="slider-val" id="eo-schmitt-hi-drone-val">0.40</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">DRONE — multi-frame floor</label>
+              <input id="eo-schmitt-lo-drone" type="range" min="0" max="1" step="0.01" value="0.20">
+              <span class="slider-val" id="eo-schmitt-lo-drone-val">0.20</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">PERSIST · hits needed</label>
+              <input id="eo-schmitt-k" type="range" min="1" max="20" step="1" value="4">
+              <span class="slider-val" id="eo-schmitt-k-val">4</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">PERSIST · window (ticks)</label>
+              <input id="eo-schmitt-window" type="range" min="5" max="50" step="1" value="20">
+              <span class="slider-val" id="eo-schmitt-window-val">20</span>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label">COAST · ticks after lost</label>
+              <input id="eo-schmitt-coast" type="range" min="1" max="20" step="1" value="3">
+              <span class="slider-val" id="eo-schmitt-coast-val">3</span>
+            </div>
+            <div class="stat-line" style="margin-top:4px;color:var(--text-3);font-size:10px;">
+              <b>1-frame pass</b>: a single YOLO frame at this conf publishes instantly.<br>
+              <b>Multi-frame floor</b>: lower conf threshold for K-of-WINDOW persistence.<br>
+              <b>COAST</b>: keep bbox alive for this many YOLO ticks after detection stops.
+            </div>
+          </div>
+
+                    <!-- EO is ground truth for extrinsic calibration — its preview
                sits here at the same size as the thermal/radar minis so
                the operator sees fused/projected bboxes shifting on the
                same canvas while dragging the bias sliders elsewhere. -->
@@ -345,12 +409,12 @@
             <div class="section-label">DETECTION TUNING</div>
             <div class="slider-row">
               <label class="slider-label">SENSITIVITY</label>
-              <input id="thr-slider" type="range" min="2" max="100" step="0.5" value="100" data-invert="1">
+              <input id="thr-slider" type="range" min="2" max="100" step="0.5" value="2" data-invert="1">
               <span class="slider-val" id="thr-val">—</span>
             </div>
             <div class="slider-row">
               <label class="slider-label">MIN BLOB</label>
-              <input id="minarea-slider" type="range" min="3" max="500" step="1" value="500" data-invert="1">
+              <input id="minarea-slider" type="range" min="3" max="500" step="1" value="3" data-invert="1">
               <span class="slider-val" id="minarea-val">—</span>
             </div>
             <div class="stat-line" style="margin-top:4px;color:var(--text-3);font-size:10px;">
@@ -447,38 +511,20 @@
             </div>
           </div>
 
-          <!-- A/G-only controls — mmHawkeye long-range raw-ADC pipeline.
-               Visible only when MODE = A/G. Drives radar_dca/long_range
-               processing once that's wired; for now the WS command is
-               recorded so the parameters round-trip on /events. -->
+          <!-- A/G-only controls — on-chip CFAR threshold.
+               The AWR2944P runs CFAR on its DSP; the threshold is
+               set in cfarCfg before sensorStart. Changing it requires
+               a chip reconfigure (~5 s). The slider stores the value;
+               APPLY pushes it to the chip. -->
           <div class="sensor-section radar-mode-extra" data-mode="ag" hidden>
-            <div class="section-label">A/G · raw-ADC · long range</div>
+            <div class="section-label">A/G · long range</div>
             <div class="slider-row">
-              <label class="slider-label" title="Coherent integration length. +10·log₁₀(N) dB SNR gain. 512 chirps = +27 dB vs stock 128. Frame rate drops accordingly.">INTEGRATE CHIRPS</label>
-              <input id="ag-chirps" type="range" min="128" max="512" step="128" value="512">
-              <span class="slider-val" id="ag-chirps-val">— chirps</span>
+              <label class="slider-label" title="On-chip CFAR detection threshold (dB above noise floor). Lower = more detections + more false alarms. Default 26 dB. Range 20–32.">CFAR THRESH</label>
+              <input id="ag-cfar-thresh" type="range" min="20" max="32" step="1" value="26">
+              <span class="slider-val" id="ag-cfar-thresh-val">26 dB</span>
             </div>
-            <div class="slider-row">
-              <label class="slider-label" title="CFAR algorithm. CA = Cell-Averaging (stock). OS = Ordered-Statistic (handles non-Gaussian foliage clutter). GO = Greatest-Of.">CFAR ALGO</label>
-              <select id="ag-cfar-algo" class="slider-select">
-                <option value="ca">CA (cell-avg)</option>
-                <option value="os" selected>OS (ordered-statistic)</option>
-                <option value="go">GO (greatest-of)</option>
-              </select>
-              <span class="slider-val">—</span>
-            </div>
-            <div class="slider-row">
-              <label class="slider-label" title="CFAR detection threshold (dB above noise floor). Lower = more detections, more false alarms.">CFAR THRESH</label>
-              <input id="ag-cfar-thresh" type="range" min="6" max="20" step="0.5" value="12">
-              <span class="slider-val" id="ag-cfar-thresh-val">— dB</span>
-            </div>
-            <div class="slider-row">
-              <label class="slider-label" title="Capon beamformer over the AWR2944P virtual array (~12 elements with DDM-MIMO). +8–10 dB spatial gain on dynamic targets.">CAPON BF</label>
-              <label class="fusion-toggle" style="margin:0;">
-                <input type="checkbox" id="ag-capon" checked>
-                <span>on</span>
-              </label>
-              <span class="slider-val">—</span>
+            <div class="slider-row" style="justify-content:flex-end;">
+              <button id="ag-cfar-apply" class="btn-small" title="Push new CFAR threshold to the AWR chip (~5 s reconfigure)">APPLY</button>
             </div>
           </div>
 

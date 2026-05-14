@@ -82,7 +82,7 @@ def _build_fused_id_index(fused: Optional[list]) -> tuple[dict, dict, dict]:
 
 
 def _fused_id_for_bbox(rawBBox: dict, fused_wire: Optional[list],
-                       sideKey: str, iouMin: float = 0.30) -> Optional[int]:
+                       sideKey: str, iouMin: float = 0.50) -> Optional[int]:  # 2026-05-14: 0.30->0.50 (kill stage-2 mismatch flicker)
     """Bbox-IoU fallback: scan fused_wire for the projected bbox that
     overlaps `rawBBox` most. Used when the per-sensor id map missed
     (typical: ByteTrack id-swap). Returns the fused track id or None.
@@ -878,6 +878,7 @@ def build_ws_message(
     gstate: Optional[GimbalState] = None,
     jpeg_quality: int = 80,
     eo_jpeg_quality: Optional[int] = None,
+    eo_schmitt_config: Optional[dict] = None,
     nir_mode: str = "auto",
     tracked_target_id: Optional[int] = None,
     tracked_heat_id: Optional[int] = None,
@@ -994,6 +995,7 @@ def build_ws_message(
                           fused_id_by_eo=eo_to_fused,
                           fused_wire=fused_wire,
                           skip_jpeg=True),
+        "eo_schmitt_config": eo_schmitt_config,
         "radar": radar_to_wire(
             BUS.get_latest(Topic.RADAR), tf=tf, ef=ef,
             radar_az_bias_deg=radar_az_bias_deg,

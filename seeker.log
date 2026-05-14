@@ -1,0 +1,746 @@
+22:44:30  INFO   __main__                      ==================================================
+22:44:30  INFO   __main__                      Seeker-01 starting (fake_thermal=False fake_eo=False no_eo=False)
+22:44:30  INFO   __main__                      ==================================================
+22:44:35  INFO   eo.eo_manager                 eo classify_interval_frames=auto -> 2 (gpu)
+22:44:35  INFO   eo.eo_classifier              EOClassifier: using seeker_eo_v3.engine (TRT FP16)
+WARNING ⚠️ Unable to automatically guess model task, assuming 'task=detect'. Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'.
+22:44:38  INFO   thermal.classifier_hv         HV classifier loaded fine-tuned model from models/seeker_eo_v3.engine
+22:44:38  INFO   eo.eo_manager                 EO classifier loaded (active=True, imgsz=832, conf=0.20, per_class_conf={'person': 0.25, 'vehicle': 0.25, 'drone': 0.2})
+22:44:38  INFO   eo.eo_manager                 EOManager capture thread starting (fake=False)
+22:44:38  INFO   eo.eo_manager                 EO AE thread starting (target p99 ∈ [300, 3500], step=1.5s)
+22:44:39  INFO   eo.imx568_capture             RawV4L2Backend probe: ok=True test=ndarray shape=(2064, 4944)
+22:44:39  INFO   eo.imx568_capture             V4L2 init: committed manual exposure_ext=1264
+22:44:39  INFO   eo.imx568_capture             IMX568Capture mode: RAW_V4L2_YUY2 on /dev/video0 (clean mono Y, no DSHOW dead-zone recovery)
+22:44:39  INFO   eo.eo_manager                 EO opened IMX568, profile_control OFF — bridge's auto-exposure remains active, AGC handles display dynamic range
+22:44:39  INFO   __main__                      EO(IMX568) opened on index 0 — excluding from thermal probe
+22:44:39  INFO   thermal.drone_classifier      No fine-tuned model at models/seeker_thermal.pt — YOLO disabled; using shape heuristic only. Train with thermal/training/ to enable YOLO.
+WARNING ⚠️ Unable to automatically guess model task, assuming 'task=detect'. Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'.
+22:44:39  INFO   thermal.classifier_hv         HV classifier loaded fine-tuned model from models/seeker_thermal_hv.engine
+22:44:39  INFO   thermal.thermal_manager       HV classifier loaded (active=True, conf>=0.55, min_bbox=2500, min_hits=2)
+22:44:39  INFO   thermal.thermal_manager       ThermalManager capture thread starting (fake=False)
+[ WARN:0@10.532] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
+[ WARN:0@10.533] global cap.cpp:478 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+22:44:39  INFO   fusion.fusion_manager         FusionManager started (rate=15.0Hz, match_gate=0.70°, track_gate=2.00°, min_hits=1, max_misses=300)
+22:44:39  INFO   gimbal.bus_servo_driver       Bus-servo adapter auto-detected on /dev/ttyACM0 (USB Single Serial USB Single Serial)
+22:44:39  INFO   gimbal.bus_servo_driver       BusServoDriver opened on /dev/ttyACM0 @ 1000000 baud
+22:44:39  INFO   gimbal.gimbal_manager         GimbalManager started (connected=True, port=/dev/ttyACM0)
+22:44:39  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=62.5, exposure=20.0ms gain=4.0, control=OFF)
+22:44:39  INFO   radar.radar_manager           RadarManager started (cli=/dev/seeker_radar_cli @115200, data=/dev/seeker_radar_data @3125000, cfg=radar/cfg/awr2944P_unified.cfg)
+22:44:39  INFO   __main__                      DCA dims from cfg: 768 chirps × 4 RX × 192 samples, PRF 30479 Hz, range res 2.64 m → 1.2 MB/frame
+22:44:39  INFO   radar_dca.dca_pipeline        DCAPipeline mode -> stock
+22:44:39  INFO   radar.composite_manager       Composite: starting TLV path (RadarManager) ...
+22:44:39  INFO   __main__                      Restored saved per-mode radar config from config/radar_modes.json
+22:44:39  INFO   radar.composite_manager       Composite: configuring DCA1000 + starting raw-ADC capture ...
+22:44:39  INFO   __main__                      Composite radar backend up (TLV + raw-ADC, mode=stock)
+22:44:39  INFO   __main__                      Loaded persisted extrinsic calibration: {'radar': {'az_bias_deg': -1.3, 'el_bias_deg': 2.0}, 'thermal': {'thermal_az_bias_deg': 2.4, 'thermal_el_bias_deg': -0.7}}
+22:44:39  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:44:39  INFO   radar_dca.data_port           DCA UDP recv buffer = 0.4 MB (requested 64 MB)
+22:44:39  INFO   __main__                      GUI -> http://0.0.0.0:8080/
+22:44:39  INFO   radar_dca.data_port           DataPortListener bound on 192.168.33.30:4098
+22:44:39  INFO   radar_dca.dca_pipeline        DCAPipeline started (768 c × 192 s × 4 rx = 1.2 MB/frame, PRF 30479 Hz, mode=stock)
+22:44:39  INFO   radar.composite_manager       Composite: raw-ADC path live (Topic.RADAR_AA)
+22:44:39  INFO   thermal.boson_capture         Boson capture opened on index 2 (raw16=True, shape=(512, 640))
+22:44:39  INFO   thermal.detection_tracker     heat-track BORN id=1 pos=(636.0,138.5) area=645
+22:44:40  INFO   thermal.detection_tracker     heat-track BORN id=2 pos=(508.5,149.0) area=850
+22:44:40  INFO   thermal.detection_tracker     heat-track BORN id=3 pos=(588.0,149.0) area=842
+22:44:40  INFO   eo.eo_manager                 EO AE step: exp 1264 -> 79 (p99=4095 mean=4095 clip=1.000, lo_floor=None, hi_brake=1264)
+22:44:40  INFO   radar.radar_manager           Radar CLI alive on first probe (resp='queryDemoStatus\n\nmmwDemo:/>BSSEV t=530702498 dev=0 msgId=0x0080 sb=0x0012 len=20')
+Loading models/seeker_eo_v3.engine for TensorRT inference...
+Loading models/seeker_thermal_hv.engine for TensorRT inference...
+[05/14/2026-22:44:41] [TRT] [I] The logger passed into createInferRuntime differs from one already provided for an existing builder, runtime, or refitter. Uses of the global logger, returned by nvinfer1::getLogger(), will return the existing value.
+
+22:44:41  WARNING  gimbal.bus_servo_driver       BusServoDriver write failed: Write timeout
+22:44:41  INFO   radar.radar_manager           Radar CLI reports sensor state=2
+[05/14/2026-22:44:41] [TRT] [I] Loaded engine size: 7 MiB
+[05/14/2026-22:44:41] [TRT] [I] Loaded engine size: 23 MiB
+[05/14/2026-22:44:42] [TRT] [W] Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+22:44:42  INFO   eo.imx568_capture             RawV4L2Backend probe: ok=True test=ndarray shape=(2064, 4944)
+22:44:42  INFO   eo.imx568_capture             V4L2 init: committed manual exposure_ext=79
+22:44:42  INFO   eo.imx568_capture             IMX568Capture mode: RAW_V4L2_YUY2 on /dev/video0 (clean mono Y, no DSHOW dead-zone recovery)
+22:44:42  INFO   eo.eo_manager                 EO opened IMX568, profile_control OFF — bridge's auto-exposure remains active, AGC handles display dynamic range
+22:44:42  INFO   eo.eo_manager                 EO AE step: exp 79 -> 39 (p99=4095 mean=4095 clip=1.000, lo_floor=None, hi_brake=79)
+22:44:43  INFO   gui.app                       WebSocket client connected
+22:44:43  INFO   eo.imx568_capture             RawV4L2Backend probe: ok=True test=ndarray shape=(2064, 4944)
+22:44:43  INFO   eo.imx568_capture             V4L2 init: committed manual exposure_ext=39
+22:44:43  INFO   eo.imx568_capture             IMX568Capture mode: RAW_V4L2_YUY2 on /dev/video0 (clean mono Y, no DSHOW dead-zone recovery)
+22:44:43  INFO   eo.eo_manager                 EO opened IMX568, profile_control OFF — bridge's auto-exposure remains active, AGC handles display dynamic range
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +315, GPU +324, now: CPU 814, GPU 5973 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +326, GPU +323, now: CPU 814, GPU 5973 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in engine deserialization: CPU +0, GPU +27, now: CPU 0, GPU 27 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in engine deserialization: CPU +0, GPU +27, now: CPU 0, GPU 27 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +0, GPU +0, now: CPU 793, GPU 5973 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +114, now: CPU 0, GPU 141 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +2, GPU +0, now: CPU 846, GPU 5979 (MiB)
+[05/14/2026-22:44:43] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +10, now: CPU 0, GPU 151 (MiB)
+22:44:44  INFO   __main__                      [producer_rate] radar=warming  eo=warming  thermal=warming
+22:44:44  INFO   eo.eo_manager                 EO AE step: exp 39 -> 19 (p99=4095 mean=4095 clip=1.000, lo_floor=None, hi_brake=39)
+22:44:44  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=20018)
+22:44:45  WARNING  radar.radar_manager           sensorStart 0 did not ack: ''
+22:44:45  INFO   eo.imx568_capture             RawV4L2Backend probe: ok=True test=ndarray shape=(2064, 4944)
+22:44:45  INFO   eo.imx568_capture             V4L2 init: committed manual exposure_ext=19
+22:44:45  INFO   eo.imx568_capture             IMX568Capture mode: RAW_V4L2_YUY2 on /dev/video0 (clean mono Y, no DSHOW dead-zone recovery)
+22:44:45  INFO   eo.eo_manager                 EO opened IMX568, profile_control OFF — bridge's auto-exposure remains active, AGC handles display dynamic range
+22:44:46  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=0.9ms/tick total=1.4ms/tick (orjson=yes, payload_bytes=20015)
+22:44:46  INFO   eo.eo_manager                 EO AE step: exp 19 -> 9 (p99=4095 mean=4095 clip=1.000, lo_floor=None, hi_brake=19)
+22:44:46  INFO   thermal.detection_tracker     heat-track DROPPED id=1 pos=(636.0,138.5) reason=max_misses (hits=1 age=7 of_streak=0)
+22:44:46  INFO   thermal.detection_tracker     heat-track CONFIRMED id=3 pos=(584.4,149.0) hits=5 age=5
+22:44:46  INFO   thermal.detection_tracker     heat-track DROPPED id=2 pos=(508.5,149.0) reason=max_misses (hits=1 age=7 of_streak=0)
+22:44:47  INFO   eo.imx568_capture             RawV4L2Backend probe: ok=True test=ndarray shape=(2064, 4944)
+22:44:47  INFO   eo.imx568_capture             V4L2 init: committed manual exposure_ext=9
+22:44:47  INFO   eo.imx568_capture             IMX568Capture mode: RAW_V4L2_YUY2 on /dev/video0 (clean mono Y, no DSHOW dead-zone recovery)
+22:44:47  INFO   eo.eo_manager                 EO opened IMX568, profile_control OFF — bridge's auto-exposure remains active, AGC handles display dynamic range
+22:44:47  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=255.0, exposure=20.0ms gain=4.0, control=OFF)
+22:44:47  INFO   eo.eo_manager                 EO AE converged (p99=786, clip=0.000, exp=9) — clearing INITIALIZING scrim
+22:44:48  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=21880)
+22:44:48  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:44:48  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:44:49  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 5.0s (packets=6381 drops=33720). Auto-kick is disabled — power-cycle the AWR to recover.
+22:44:49  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:44:49  INFO   __main__                      [producer_rate] radar=warming  eo=10.2Hz(+51f/5.0s)  thermal=10.8Hz(+54f/5.0s)
+22:44:50  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=22589)
+22:44:50  INFO   eo.eo_manager                 EO profile -> night (scene mean=53.3, exposure=80.0ms gain=16.0, control=OFF)
+22:44:52  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=3.9ms/tick total=4.6ms/tick (orjson=yes, payload_bytes=21842)
+22:44:52  INFO   eo.eo_manager                 EO Schmitt gate (tick=40): conf_fresh=0 conf_coast=0 pending=8 raw_in=0 -> out=0
+22:44:53  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:44:53  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:44:53  INFO   gui.app                       heat_detector config updated: k=100.0 min_area=500 max_det=6
+22:44:53  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:44:53  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:44:53  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 9.3s (packets=6381 drops=33720). Auto-kick is disabled — power-cycle the AWR to recover.
+22:44:53  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:44:53  INFO   thermal.detection_tracker     heat-track DROPPED id=3 pos=(585.8,149.0) reason=max_misses (hits=125 age=134 of_streak=3)
+22:44:53  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21473)
+22:44:54  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=54.8, exposure=20.0ms gain=4.0, control=OFF)
+22:44:54  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=14.8Hz(+74f/5.0s)  thermal=20.0Hz(+100f/5.0s)
+22:44:55  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_unified.cfg
+22:44:55  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5506935 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:44:55  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:44:55  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21494)
+22:44:56  INFO   radar.composite_manager       Composite: mode stock → ag — pushing chip cfg awr2944P_ag.cfg
+22:44:56  INFO   radar.radar_manager           reconfigure: awr2944P_unified.cfg → awr2944P_ag.cfg (via xds110 reset)
+22:44:56  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:44:56  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:44:56  INFO   radar.radar_manager           reconfigure: xds110 reset OK, waiting for chip boot
+22:44:57  INFO   eo.eo_manager                 EO profile -> night (scene mean=55.5, exposure=80.0ms gain=16.0, control=OFF)
+22:44:57  INFO   eo.eo_manager                 EO Schmitt gate (tick=80): conf_fresh=0 conf_coast=0 pending=6 raw_in=0 -> out=0
+22:44:59  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:44:59  INFO   __main__                      [producer_rate] radar=3.8Hz(+19f/5.0s)  eo=16.6Hz(+83f/5.0s)  thermal=22.0Hz(+110f/5.0s)
+22:45:00  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.4, exposure=20.0ms gain=4.0, control=OFF)
+22:45:00  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:45:00  INFO   radar.radar_manager           reconfigure: SUCCESS — cfg_path now awr2944P_ag.cfg (tail='sensorStart\n\nBSSEV t=3760782 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0)
+22:45:00  INFO   radar.composite_manager       Composite: max_range_m → 500 m (A/G long range)
+22:45:00  INFO   radar_dca.dca_pipeline        DCAPipeline mode -> ag
+22:45:01  INFO   radar.radar_manager           Capture loop: reconfigure just finished — skipping _push_profile, reopening data port
+22:45:01  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:45:01  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21507)
+22:45:02  INFO   eo.eo_manager                 EO Schmitt gate (tick=120): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:45:03  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.7, exposure=80.0ms gain=16.0, control=OFF)
+22:45:03  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 5.0s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:45:03  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21620)
+22:45:04  INFO   __main__                      [producer_rate] radar=13.0Hz(+65f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=22.4Hz(+112f/5.0s)
+22:45:05  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21738)
+22:45:05  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:45:05  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:45:06  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=79.1, exposure=20.0ms gain=4.0, control=OFF)
+22:45:07  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=3.0ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=21745)
+22:45:07  INFO   eo.eo_manager                 EO Schmitt gate (tick=160): conf_fresh=0 conf_coast=0 pending=5 raw_in=1 -> out=0
+22:45:08  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=22336)
+22:45:09  INFO   __main__                      [producer_rate] radar=9.6Hz(+48f/5.0s)  eo=17.0Hz(+85f/5.0s)  thermal=21.2Hz(+106f/5.0s)
+22:45:09  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:45:10  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=22367)
+22:45:10  INFO   eo.eo_manager                 EO zoom: 1x -> 2x
+22:45:10  INFO   gui.app                       EO zoom_level -> 2x
+22:45:12  INFO   eo.eo_manager                 EO Schmitt gate (tick=200): conf_fresh=0 conf_coast=0 pending=3 raw_in=0 -> out=0
+22:45:12  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.6ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=22473)
+22:45:13  INFO   eo.eo_manager                 EO zoom: 2x -> 1x
+22:45:13  INFO   gui.app                       EO zoom_level -> 1x
+22:45:13  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:45:13  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:45:13  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:45:14  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.6ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=22435)
+22:45:14  INFO   __main__                      [producer_rate] radar=0.2Hz(+1f/5.0s)  eo=15.8Hz(+79f/5.0s)  thermal=21.4Hz(+107f/5.0s)
+22:45:15  INFO   eo.eo_manager                 EO profile -> night (scene mean=60.0, exposure=80.0ms gain=16.0, control=OFF)
+22:45:16  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=24983)
+22:45:17  INFO   eo.eo_manager                 EO Schmitt gate (tick=240): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:45:17  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:45:17  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:45:17  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:45:17  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:45:17  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 19.6s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:45:18  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:45:18  INFO   eo.eo_manager                 EO optflow: bus=(-35.8,-0.0) opt=(-39.9,-1.1) used=(-35.8,0.0) n=1 fid=547
+22:45:18  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=25305)
+22:45:18  INFO   eo.eo_manager                 EO optflow: bus=(-50.1,-0.0) opt=(-107.6,-3.1) used=(-50.1,0.0) n=1 fid=548
+22:45:19  INFO   eo.eo_manager                 EO optflow: bus=(-28.6,-0.0) opt=(-10.8,-0.1) used=(-10.8,-0.0) n=1 fid=567
+22:45:19  INFO   eo.eo_manager                 EO optflow: bus=(-28.6,-0.0) opt=(-20.7,0.3) used=(-20.7,-0.0) n=1 fid=568
+22:45:19  INFO   eo.eo_manager                 EO optflow: bus=(-43.0,-0.0) opt=(-56.4,-1.6) used=(-43.0,0.0) n=1 fid=569
+22:45:19  INFO   eo.eo_manager                 EO optflow: bus=(-50.1,-0.0) opt=(-77.7,-1.3) used=(-50.1,0.0) n=1 fid=570
+22:45:19  INFO   eo.eo_manager                 EO optflow: bus=(-14.3,-0.0) opt=(-25.0,-0.4) used=(-14.3,-0.0) n=1 fid=571
+22:45:19  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=16.4Hz(+82f/5.0s)  thermal=20.4Hz(+102f/5.0s)
+22:45:19  INFO   eo.eo_manager                 EO optflow: bus=(14.3,-0.0) opt=(10.5,0.5) used=(10.5,-0.0) n=1 fid=572
+22:45:19  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:45:19  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5531647 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:45:19  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:45:19  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=3.0ms/tick total=3.7ms/tick (orjson=yes, payload_bytes=26738)
+22:45:21  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=27057)
+22:45:23  INFO   radar.radar_manager           World-frame rotation active: pan=-26.46° pts=0
+22:45:23  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=27043)
+22:45:23  INFO   eo.eo_manager                 EO zoom: 1x -> 2x
+22:45:23  INFO   gui.app                       EO zoom_level -> 2x
+22:45:23  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=52.1, exposure=20.0ms gain=4.0, control=OFF)
+22:45:24  INFO   eo.eo_manager                 EO Schmitt gate (tick=280): conf_fresh=0 conf_coast=0 pending=2 raw_in=1 -> out=0
+22:45:24  INFO   __main__                      [producer_rate] radar=19.4Hz(+97f/5.0s)  eo=8.4Hz(+42f/5.0s)  thermal=11.2Hz(+56f/5.0s)
+22:45:25  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=27076)
+22:45:25  INFO   eo.eo_manager                 EO optflow: bus=(143.2,-0.0) opt=(298.9,5.3) used=(143.2,0.0) n=1 fid=622
+22:45:25  INFO   eo.eo_manager                 EO optflow: bus=(-85.9,-0.0) opt=(-84.3,-1.0) used=(-84.3,-0.0) n=1 fid=623
+22:45:25  INFO   eo.eo_manager                 EO optflow: bus=(14.3,-0.0) opt=(17.6,-0.1) used=(14.3,-0.0) n=1 fid=624
+22:45:26  INFO   eo.eo_manager                 EO profile -> night (scene mean=49.9, exposure=80.0ms gain=16.0, control=OFF)
+22:45:26  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=22488)
+22:45:28  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=22405)
+22:45:29  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=10.2Hz(+51f/5.0s)  thermal=13.8Hz(+69f/5.0s)
+22:45:29  INFO   eo.eo_manager                 EO optflow: bus=(-171.8,-0.0) opt=(-122.3,-4.8) used=(-122.3,0.0) n=1 fid=665
+22:45:29  INFO   eo.eo_manager                 EO optflow: bus=(-143.2,-0.0) opt=(-192.7,-3.4) used=(-143.2,0.0) n=1 fid=666
+22:45:30  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=85.9, exposure=20.0ms gain=4.0, control=OFF)
+22:45:30  INFO   eo.eo_manager                 EO optflow: bus=(-128.9,-0.0) opt=(-377.2,-10.2) used=(-128.9,0.0) n=1 fid=667
+22:45:30  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.2ms/tick (orjson=yes, payload_bytes=22647)
+22:45:31  INFO   eo.eo_manager                 EO Schmitt gate (tick=320): conf_fresh=0 conf_coast=0 pending=3 raw_in=0 -> out=0
+22:45:32  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21650)
+22:45:33  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.3, exposure=80.0ms gain=16.0, control=OFF)
+22:45:33  INFO   radar.radar_manager           World-frame rotation active: pan=3.43° pts=0
+22:45:33  INFO   eo.eo_manager                 EO zoom: 2x -> 1x
+22:45:33  INFO   gui.app                       EO zoom_level -> 1x
+22:45:34  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21742)
+22:45:34  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=15.3Hz(+77f/5.0s)  thermal=20.7Hz(+104f/5.0s)
+22:45:36  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21771)
+22:45:36  INFO   eo.eo_manager                 EO Schmitt gate (tick=360): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:45:37  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21803)
+22:45:39  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=21759)
+22:45:39  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=17.6Hz(+88f/5.0s)  thermal=20.0Hz(+100f/5.0s)
+22:45:40  INFO   eo.eo_manager                 EO Schmitt gate (tick=400): conf_fresh=0 conf_coast=0 pending=4 raw_in=0 -> out=0
+22:45:41  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.6ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=21778)
+22:45:41  INFO   radar.composite_manager       apply_ag_cfar: wrote 20.0 dB to awr2944P_ag.cfg
+22:45:41  INFO   radar.composite_manager       apply_ag_cfar: in AG mode — reconfiguring chip
+22:45:41  INFO   radar.radar_manager           reconfigure: awr2944P_ag.cfg → awr2944P_ag.cfg (via xds110 reset)
+22:45:41  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:45:42  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:45:42  INFO   radar.radar_manager           reconfigure: xds110 reset OK, waiting for chip boot
+22:45:44  INFO   __main__                      [producer_rate] radar=9.0Hz(+45f/5.0s)  eo=18.2Hz(+91f/5.0s)  thermal=22.2Hz(+111f/5.0s)
+22:45:44  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:45:45  INFO   eo.eo_manager                 EO Schmitt gate (tick=440): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:45:46  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:45:46  INFO   radar.radar_manager           reconfigure: SUCCESS — cfg_path now awr2944P_ag.cfg (tail='sensorStart\n\nBSSEV t=3797381 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0)
+22:45:46  INFO   gui.app                       ag_cfar_apply: 20.0 dB → OK
+22:45:46  INFO   radar.radar_manager           Capture loop: reconfigure just finished — skipping _push_profile, reopening data port
+22:45:46  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:45:47  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=21707)
+22:45:48  INFO   radar.radar_manager           World-frame rotation active: pan=3.43° pts=0
+22:45:49  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21732)
+22:45:49  INFO   __main__                      [producer_rate] radar=10.7Hz(+54f/5.0s)  eo=17.5Hz(+88f/5.0s)  thermal=20.9Hz(+105f/5.0s)
+22:45:49  INFO   eo.eo_manager                 EO Schmitt gate (tick=480): conf_fresh=0 conf_coast=0 pending=2 raw_in=0 -> out=0
+22:45:51  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=21727)
+22:45:52  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=53.0, exposure=20.0ms gain=4.0, control=OFF)
+22:45:52  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:45:53  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21121)
+22:45:54  INFO   eo.eo_manager                 EO Schmitt gate (tick=520): conf_fresh=0 conf_coast=1 pending=0 raw_in=0 -> out=1
+22:45:54  INFO   __main__                      [producer_rate] radar=19.0Hz(+95f/5.0s)  eo=17.8Hz(+89f/5.0s)  thermal=22.0Hz(+110f/5.0s)
+22:45:54  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=23628)
+22:45:55  INFO   eo.eo_manager                 EO profile -> night (scene mean=59.9, exposure=80.0ms gain=16.0, control=OFF)
+22:45:56  INFO   eo.eo_manager                 EO optflow: bus=(-43.0,-0.0) opt=(-20.4,-0.4) used=(-20.4,-0.0) n=1 fid=1129
+22:45:56  INFO   eo.eo_manager                 EO optflow: bus=(-28.6,-0.0) opt=(-30.9,-0.3) used=(-28.6,-0.0) n=1 fid=1130
+22:45:56  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=23026)
+22:45:56  INFO   eo.eo_manager                 EO optflow: bus=(-21.5,-0.0) opt=(-47.7,-1.7) used=(-21.5,0.0) n=1 fid=1131
+22:45:56  INFO   eo.eo_manager                 EO optflow: bus=(14.3,-0.0) opt=(14.9,1.3) used=(14.3,0.0) n=1 fid=1133
+22:45:56  INFO   eo.eo_manager                 EO optflow: bus=(7.2,-0.0) opt=(15.0,0.2) used=(7.2,-0.0) n=1 fid=1135
+22:45:57  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:45:58  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=63.9, exposure=20.0ms gain=4.0, control=OFF)
+22:45:58  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=23523)
+22:45:58  INFO   eo.eo_manager                 EO Schmitt gate (tick=560): conf_fresh=1 conf_coast=0 pending=2 raw_in=1 -> out=1
+22:45:59  INFO   __main__                      [producer_rate] radar=0.2Hz(+1f/5.0s)  eo=17.0Hz(+85f/5.0s)  thermal=19.2Hz(+96f/5.0s)
+22:46:00  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=23567)
+22:46:00  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:46:00  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:46:01  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:46:02  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.3ms/tick total=3.0ms/tick (orjson=yes, payload_bytes=23579)
+22:46:03  INFO   eo.eo_manager                 EO Schmitt gate (tick=600): conf_fresh=1 conf_coast=0 pending=8 raw_in=1 -> out=1
+22:46:03  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=23568)
+22:46:04  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=15.4Hz(+77f/5.0s)  thermal=20.3Hz(+102f/5.0s)
+22:46:05  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:46:05  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:46:05  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:46:05  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:46:05  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 67.1s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:46:05  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:46:05  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=23610)
+22:46:07  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:46:07  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5556774 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:46:07  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:46:07  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=23924)
+22:46:09  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.2ms/tick (orjson=yes, payload_bytes=24346)
+22:46:09  INFO   __main__                      [producer_rate] radar=10.2Hz(+51f/5.0s)  eo=11.2Hz(+56f/5.0s)  thermal=14.7Hz(+74f/5.0s)
+22:46:10  INFO   radar.radar_manager           World-frame rotation active: pan=-6.59° pts=0
+22:46:10  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.4ms/tick total=2.0ms/tick (orjson=yes, payload_bytes=23577)
+22:46:12  INFO   eo.eo_manager                 EO Schmitt gate (tick=640): conf_fresh=1 conf_coast=0 pending=0 raw_in=1 -> out=1
+22:46:12  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.5ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=23579)
+22:46:14  INFO   eo.eo_manager                 EO optflow: bus=(-43.0,-0.0) opt=(-22.8,-0.4) used=(-22.8,-0.0) n=1 fid=1348
+22:46:14  INFO   eo.eo_manager                 EO optflow: bus=(-14.3,-0.0) opt=(-38.2,-0.8) used=(-14.3,-0.0) n=1 fid=1350
+22:46:14  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.3ms/tick total=2.0ms/tick (orjson=yes, payload_bytes=23797)
+22:46:14  INFO   eo.eo_manager                 EO optflow: bus=(-7.2,-0.0) opt=(-7.1,0.5) used=(-7.1,-0.0) n=1 fid=1352
+22:46:14  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=7.8Hz(+39f/5.0s)  thermal=10.8Hz(+54f/5.0s)
+22:46:16  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=22437)
+22:46:17  INFO   eo.eo_manager                 EO profile -> night (scene mean=59.8, exposure=80.0ms gain=16.0, control=OFF)
+22:46:17  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21874)
+22:46:18  INFO   eo.eo_manager                 EO Schmitt gate (tick=680): conf_fresh=0 conf_coast=0 pending=2 raw_in=1 -> out=0
+22:46:19  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=22812)
+22:46:19  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=15.8Hz(+79f/5.0s)  thermal=19.7Hz(+99f/5.0s)
+22:46:20  INFO   radar.radar_manager           World-frame rotation active: pan=-2.55° pts=0
+22:46:20  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=59.1, exposure=20.0ms gain=4.0, control=OFF)
+22:46:21  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.3ms/tick total=3.0ms/tick (orjson=yes, payload_bytes=22742)
+22:46:23  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=22724)
+22:46:23  INFO   eo.eo_manager                 EO Schmitt gate (tick=720): conf_fresh=1 conf_coast=0 pending=6 raw_in=1 -> out=1
+22:46:23  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.3, exposure=80.0ms gain=16.0, control=OFF)
+22:46:24  INFO   __main__                      [producer_rate] radar=19.8Hz(+99f/5.0s)  eo=16.6Hz(+83f/5.0s)  thermal=21.4Hz(+107f/5.0s)
+22:46:24  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=22697)
+22:46:26  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.44, 'drone': 0.55}}
+22:46:26  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=22721)
+22:46:26  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=58.3, exposure=20.0ms gain=4.0, control=OFF)
+22:46:27  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.59, 'drone': 0.55}}
+22:46:27  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.6, 'drone': 0.55}}
+22:46:28  INFO   eo.eo_manager                 EO Schmitt gate (tick=760): conf_fresh=1 conf_coast=0 pending=4 raw_in=1 -> out=1
+22:46:28  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=22707)
+22:46:29  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.59, 'drone': 0.55}}
+22:46:29  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.58, 'drone': 0.55}}
+22:46:29  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.57, 'drone': 0.55}}
+22:46:29  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.56, 'drone': 0.55}}
+22:46:29  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 4, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.55, 'drone': 0.55}}
+22:46:29  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=16.4Hz(+82f/5.0s)  thermal=20.3Hz(+102f/5.0s)
+22:46:29  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.3, exposure=80.0ms gain=16.0, control=OFF)
+22:46:30  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.8ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=23548)
+22:46:30  INFO   radar.radar_manager           World-frame rotation active: pan=-2.55° pts=0
+22:46:32  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=23532)
+22:46:32  INFO   eo.eo_manager                 EO Schmitt gate (tick=800): conf_fresh=2 conf_coast=0 pending=0 raw_in=2 -> out=2
+22:46:32  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=58.0, exposure=20.0ms gain=4.0, control=OFF)
+22:46:33  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=23521)
+22:46:34  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=16.7Hz(+84f/5.0s)  thermal=20.5Hz(+103f/5.0s)
+22:46:35  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=23497)
+22:46:35  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.3, exposure=80.0ms gain=16.0, control=OFF)
+22:46:36  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:46:36  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:46:36  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 11, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.55, 'drone': 0.55}}
+22:46:37  INFO   eo.eo_manager                 EO optflow: bus=(-107.4,-0.0) opt=(-124.4,-2.1) used=(-107.4,0.0) n=1 fid=1721
+22:46:37  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=22115)
+22:46:37  INFO   eo.eo_manager                 EO Schmitt gate (tick=840): conf_fresh=0 conf_coast=0 pending=3 raw_in=0 -> out=0
+22:46:38  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=60.5, exposure=20.0ms gain=4.0, control=OFF)
+22:46:39  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21927)
+22:46:39  INFO   __main__                      [producer_rate] radar=16.6Hz(+83f/5.0s)  eo=17.0Hz(+85f/5.0s)  thermal=20.9Hz(+105f/5.0s)
+22:46:41  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.8ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=21971)
+22:46:41  INFO   eo.eo_manager                 EO Schmitt cfg updated: {'conf_hi': 0.55, 'conf_lo': 0.25, 'k_persist': 10, 'window': 20, 'coast_ticks': 3, 'per_class': {'person': 0.55, 'vehicle': 0.55, 'drone': 0.55}}
+22:46:41  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:46:41  INFO   eo.eo_manager                 EO profile -> night (scene mean=57.9, exposure=80.0ms gain=16.0, control=OFF)
+22:46:42  INFO   eo.eo_manager                 EO Schmitt gate (tick=880): conf_fresh=0 conf_coast=0 pending=8 raw_in=0 -> out=0
+22:46:42  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21833)
+22:46:44  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=21866)
+22:46:44  INFO   __main__                      [producer_rate] radar=0.2Hz(+1f/5.0s)  eo=16.7Hz(+84f/5.0s)  thermal=20.7Hz(+104f/5.0s)
+22:46:45  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=58.0, exposure=20.0ms gain=4.0, control=OFF)
+22:46:45  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:46:45  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:46:45  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:46:46  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21773)
+22:46:47  INFO   eo.eo_manager                 EO Schmitt gate (tick=920): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:46:48  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=21801)
+22:46:48  INFO   eo.eo_manager                 EO profile -> night (scene mean=57.8, exposure=80.0ms gain=16.0, control=OFF)
+22:46:48  WARNING  radar.composite_manager       apply_ag_cfar: no range cfarCfg line matched
+22:46:48  INFO   gui.app                       ag_cfar_apply: 20.0 dB → FAILED
+22:46:49  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:46:49  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:46:49  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:46:49  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:46:49  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 111.5s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:46:49  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=14.8Hz(+74f/5.0s)  thermal=21.3Hz(+107f/5.0s)
+22:46:49  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21765)
+22:46:50  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:46:51  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=57.5, exposure=20.0ms gain=4.0, control=OFF)
+22:46:51  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:46:51  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5526628 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:46:51  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:46:51  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21868)
+22:46:53  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21779)
+22:46:53  INFO   radar.radar_manager           World-frame rotation active: pan=-2.55° pts=0
+22:46:53  INFO   eo.eo_manager                 EO Schmitt gate (tick=960): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:46:54  INFO   eo.eo_manager                 EO profile -> night (scene mean=57.7, exposure=80.0ms gain=16.0, control=OFF)
+22:46:54  INFO   __main__                      [producer_rate] radar=12.6Hz(+63f/5.0s)  eo=11.2Hz(+56f/5.0s)  thermal=13.0Hz(+65f/5.0s)
+22:46:55  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=21779)
+22:46:56  INFO   eo.eo_manager                 EO optflow: bus=(-7.2,-0.0) opt=(-8.5,-0.2) used=(-7.2,-0.0) n=1 fid=1991
+22:46:56  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.2ms/tick total=1.7ms/tick (orjson=yes, payload_bytes=23205)
+22:46:57  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=64.0, exposure=20.0ms gain=4.0, control=OFF)
+22:46:58  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.4ms/tick total=2.1ms/tick (orjson=yes, payload_bytes=23185)
+22:46:59  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=8.0Hz(+40f/5.0s)  thermal=11.2Hz(+56f/5.0s)
+22:47:00  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.5ms/tick total=2.1ms/tick (orjson=yes, payload_bytes=23599)
+22:47:00  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.8, exposure=80.0ms gain=16.0, control=OFF)
+22:47:01  INFO   eo.eo_manager                 EO Schmitt gate (tick=1000): conf_fresh=1 conf_coast=0 pending=1 raw_in=1 -> out=1
+22:47:02  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.7ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=24168)
+22:47:03  INFO   radar.radar_manager           World-frame rotation active: pan=-6.94° pts=0
+22:47:03  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.8ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=23365)
+22:47:03  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=63.8, exposure=20.0ms gain=4.0, control=OFF)
+22:47:04  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=16.7Hz(+84f/5.0s)  thermal=18.9Hz(+95f/5.0s)
+22:47:05  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=23200)
+22:47:06  INFO   eo.eo_manager                 EO Schmitt gate (tick=1040): conf_fresh=1 conf_coast=0 pending=0 raw_in=1 -> out=1
+22:47:07  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=23194)
+22:47:09  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=23206)
+22:47:09  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=16.2Hz(+81f/5.0s)  thermal=21.3Hz(+107f/5.0s)
+22:47:11  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=23244)
+22:47:11  INFO   eo.eo_manager                 EO Schmitt gate (tick=1080): conf_fresh=1 conf_coast=0 pending=0 raw_in=1 -> out=1
+22:47:12  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=23207)
+22:47:13  INFO   radar.radar_manager           World-frame rotation active: pan=-6.94° pts=0
+22:47:14  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=23216)
+22:47:14  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=16.4Hz(+82f/5.0s)  thermal=21.1Hz(+106f/5.0s)
+22:47:16  INFO   eo.eo_manager                 EO Schmitt gate (tick=1120): conf_fresh=1 conf_coast=0 pending=0 raw_in=1 -> out=1
+22:47:16  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=23262)
+22:47:18  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.3ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=23339)
+22:47:19  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=16.3Hz(+82f/5.0s)  thermal=21.7Hz(+109f/5.0s)
+22:47:20  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=23858)
+22:47:21  INFO   eo.eo_manager                 EO Schmitt gate (tick=1160): conf_fresh=1 conf_coast=0 pending=3 raw_in=1 -> out=1
+22:47:21  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=24267)
+22:47:21  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:47:23  INFO   radar.radar_manager           World-frame rotation active: pan=-6.94° pts=3
+22:47:23  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=23779)
+22:47:24  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=16.0Hz(+80f/5.0s)  thermal=18.2Hz(+91f/5.0s)
+22:47:25  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.8ms/tick total=3.7ms/tick (orjson=yes, payload_bytes=24734)
+22:47:26  INFO   eo.eo_manager                 EO Schmitt gate (tick=1200): conf_fresh=1 conf_coast=0 pending=0 raw_in=1 -> out=1
+22:47:27  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.9ms/tick total=3.8ms/tick (orjson=yes, payload_bytes=24591)
+22:47:29  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.2ms/tick send=2.6ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=24581)
+22:47:29  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=16.0Hz(+80f/5.0s)  thermal=14.4Hz(+72f/5.0s)
+22:47:31  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=3.2ms/tick total=4.1ms/tick (orjson=yes, payload_bytes=24802)
+22:47:31  INFO   eo.eo_manager                 EO Schmitt gate (tick=1240): conf_fresh=1 conf_coast=0 pending=0 raw_in=1 -> out=1
+22:47:32  INFO   eo.eo_manager                 EO optflow: bus=(-21.5,-0.0) opt=(-40.0,-1.0) used=(-21.5,-0.0) n=1 fid=2557
+22:47:32  INFO   eo.eo_manager                 EO optflow: bus=(14.3,-0.0) opt=(7.6,0.7) used=(7.6,-0.0) n=1 fid=2559
+22:47:33  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.2ms/tick send=2.5ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=24562)
+22:47:33  INFO   radar.radar_manager           World-frame rotation active: pan=-10.55° pts=10
+22:47:34  INFO   eo.eo_manager                 EO profile -> night (scene mean=58.9, exposure=80.0ms gain=16.0, control=OFF)
+22:47:34  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=16.2Hz(+81f/5.0s)  thermal=16.9Hz(+85f/5.0s)
+22:47:34  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.7ms/tick total=3.6ms/tick (orjson=yes, payload_bytes=23276)
+22:47:36  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.5ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=22576)
+22:47:37  INFO   eo.eo_manager                 EO Schmitt gate (tick=1280): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:47:37  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=52.1, exposure=20.0ms gain=4.0, control=OFF)
+22:47:38  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.2ms/tick send=1.9ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=24694)
+22:47:39  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=6.4Hz(+32f/5.0s)  thermal=5.2Hz(+26f/5.0s)
+22:47:40  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=1.9ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=24740)
+22:47:42  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=23097)
+22:47:42  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.5, exposure=80.0ms gain=16.0, control=OFF)
+22:47:42  INFO   eo.eo_manager                 EO optflow: bus=(-393.7,-0.0) opt=(-292.0,-5.9) used=(-292.0,0.0) n=2 fid=2633
+22:47:42  INFO   eo.eo_manager                 EO optflow: bus=(-272.0,-0.0) opt=(-260.5,-6.5) used=(-260.5,0.0) n=1 fid=2634
+22:47:42  INFO   eo.eo_manager                 EO optflow: bus=(14.3,-0.0) opt=(5.7,0.6) used=(5.7,-0.0) n=2 fid=2635
+22:47:43  INFO   radar.radar_manager           World-frame rotation active: pan=1.23° pts=0
+22:47:43  INFO   eo.eo_manager                 EO optflow: bus=(50.1,-0.0) opt=(95.1,1.6) used=(50.1,0.0) n=2 fid=2641
+22:47:44  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=3.0ms/tick total=4.0ms/tick (orjson=yes, payload_bytes=24084)
+22:47:44  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=6.8Hz(+34f/5.0s)  thermal=6.6Hz(+33f/5.0s)
+22:47:45  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.8, exposure=20.0ms gain=4.0, control=OFF)
+22:47:45  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=21666)
+22:47:46  INFO   eo.eo_manager                 EO Schmitt gate (tick=1320): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:47:47  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21670)
+22:47:48  INFO   eo.eo_manager                 EO profile -> night (scene mean=59.4, exposure=80.0ms gain=16.0, control=OFF)
+22:47:49  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=20042)
+22:47:49  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=18.0Hz(+90f/5.0s)  thermal=20.6Hz(+103f/5.0s)
+22:47:51  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=23214)
+22:47:51  INFO   eo.eo_manager                 EO Schmitt gate (tick=1360): conf_fresh=1 conf_coast=0 pending=6 raw_in=2 -> out=1
+22:47:51  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.4, exposure=20.0ms gain=4.0, control=OFF)
+22:47:53  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21764)
+22:47:53  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=0
+22:47:54  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.2, exposure=80.0ms gain=16.0, control=OFF)
+22:47:54  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21860)
+22:47:54  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=17.8Hz(+89f/5.0s)  thermal=20.6Hz(+103f/5.0s)
+22:47:55  INFO   eo.eo_manager                 EO Schmitt gate (tick=1400): conf_fresh=0 conf_coast=0 pending=13 raw_in=1 -> out=0
+22:47:56  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=21798)
+22:47:57  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.2, exposure=20.0ms gain=4.0, control=OFF)
+22:47:58  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=21757)
+22:47:59  INFO   __main__                      [producer_rate] radar=19.8Hz(+99f/5.0s)  eo=17.8Hz(+89f/5.0s)  thermal=20.6Hz(+103f/5.0s)
+22:48:00  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.6ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=21804)
+22:48:00  INFO   eo.eo_manager                 EO Schmitt gate (tick=1440): conf_fresh=0 conf_coast=0 pending=8 raw_in=1 -> out=0
+22:48:00  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.2, exposure=80.0ms gain=16.0, control=OFF)
+22:48:01  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=21820)
+22:48:03  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=0
+22:48:03  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=22700)
+22:48:03  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.2, exposure=20.0ms gain=4.0, control=OFF)
+22:48:04  INFO   eo.eo_manager                 EO Schmitt gate (tick=1480): conf_fresh=0 conf_coast=0 pending=8 raw_in=2 -> out=0
+22:48:04  INFO   __main__                      [producer_rate] radar=20.4Hz(+102f/5.0s)  eo=17.8Hz(+89f/5.0s)  thermal=21.8Hz(+109f/5.0s)
+22:48:05  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21854)
+22:48:06  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.3, exposure=80.0ms gain=16.0, control=OFF)
+22:48:07  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=21868)
+22:48:08  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21857)
+22:48:09  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:48:09  INFO   eo.eo_manager                 EO Schmitt gate (tick=1520): conf_fresh=0 conf_coast=0 pending=10 raw_in=2 -> out=0
+22:48:09  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.1, exposure=20.0ms gain=4.0, control=OFF)
+22:48:10  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=16.4Hz(+82f/5.0s)  thermal=22.1Hz(+111f/5.0s)
+22:48:10  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=20378)
+22:48:12  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=22572)
+22:48:12  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.0, exposure=80.0ms gain=16.0, control=OFF)
+22:48:14  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=21702)
+22:48:14  INFO   eo.eo_manager                 EO Schmitt gate (tick=1560): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:48:14  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:48:15  INFO   __main__                      [producer_rate] radar=6.4Hz(+32f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=21.6Hz(+108f/5.0s)
+22:48:15  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.2, exposure=20.0ms gain=4.0, control=OFF)
+22:48:15  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=21698)
+22:48:17  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21734)
+22:48:17  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:48:17  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:48:18  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:48:18  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.0, exposure=80.0ms gain=16.0, control=OFF)
+22:48:19  INFO   eo.eo_manager                 EO Schmitt gate (tick=1600): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:48:19  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21721)
+22:48:20  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=16.2Hz(+81f/5.0s)  thermal=21.5Hz(+108f/5.0s)
+22:48:21  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21794)
+22:48:21  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.0, exposure=20.0ms gain=4.0, control=OFF)
+22:48:22  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:48:22  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:48:22  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:48:22  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:48:22  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 204.2s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:48:22  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:48:23  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21765)
+22:48:24  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:48:24  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5500577 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:48:24  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:48:24  INFO   eo.eo_manager                 EO Schmitt gate (tick=1640): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:48:24  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.4ms/tick total=1.9ms/tick (orjson=yes, payload_bytes=21781)
+22:48:24  INFO   eo.eo_manager                 EO profile -> night (scene mean=55.9, exposure=80.0ms gain=16.0, control=OFF)
+22:48:25  INFO   __main__                      [producer_rate] radar=3.6Hz(+19f/5.3s)  eo=13.8Hz(+73f/5.3s)  thermal=17.4Hz(+92f/5.3s)
+22:48:26  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=0
+22:48:26  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.4ms/tick total=1.9ms/tick (orjson=yes, payload_bytes=21716)
+22:48:27  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.7, exposure=20.0ms gain=4.0, control=OFF)
+22:48:28  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.4ms/tick total=1.9ms/tick (orjson=yes, payload_bytes=21720)
+22:48:30  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.3ms/tick total=1.7ms/tick (orjson=yes, payload_bytes=21778)
+22:48:30  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=6.8Hz(+34f/5.0s)  thermal=8.6Hz(+43f/5.0s)
+22:48:31  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.1, exposure=80.0ms gain=16.0, control=OFF)
+22:48:31  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21730)
+22:48:33  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.1ms/tick (orjson=yes, payload_bytes=21735)
+22:48:34  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.9, exposure=20.0ms gain=4.0, control=OFF)
+22:48:34  INFO   eo.eo_manager                 EO Schmitt gate (tick=1680): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:48:35  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=12.0Hz(+60f/5.0s)  thermal=16.4Hz(+82f/5.0s)
+22:48:35  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.3ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=21756)
+22:48:36  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=0
+22:48:37  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.0, exposure=80.0ms gain=16.0, control=OFF)
+22:48:37  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.8ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=23762)
+22:48:39  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.9ms/tick total=3.7ms/tick (orjson=yes, payload_bytes=24337)
+22:48:39  INFO   eo.eo_manager                 EO Schmitt gate (tick=1720): conf_fresh=0 conf_coast=0 pending=2 raw_in=0 -> out=0
+22:48:40  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.1, exposure=20.0ms gain=4.0, control=OFF)
+22:48:40  INFO   __main__                      [producer_rate] radar=19.8Hz(+99f/5.0s)  eo=16.2Hz(+81f/5.0s)  thermal=17.4Hz(+87f/5.0s)
+22:48:41  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.6ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=22930)
+22:48:42  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21717)
+22:48:43  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.3, exposure=80.0ms gain=16.0, control=OFF)
+22:48:44  INFO   eo.eo_manager                 EO Schmitt gate (tick=1760): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:48:44  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.4ms/tick total=3.0ms/tick (orjson=yes, payload_bytes=21715)
+22:48:45  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=20.2Hz(+101f/5.0s)
+22:48:46  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=0
+22:48:46  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.0, exposure=20.0ms gain=4.0, control=OFF)
+22:48:46  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=21698)
+22:48:48  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=21744)
+22:48:48  INFO   eo.eo_manager                 EO Schmitt gate (tick=1800): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:48:49  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.1, exposure=80.0ms gain=16.0, control=OFF)
+22:48:49  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21748)
+22:48:50  INFO   __main__                      [producer_rate] radar=20.0Hz(+100f/5.0s)  eo=17.4Hz(+87f/5.0s)  thermal=20.4Hz(+102f/5.0s)
+22:48:51  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21681)
+22:48:52  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.1, exposure=20.0ms gain=4.0, control=OFF)
+22:48:53  INFO   eo.eo_manager                 EO Schmitt gate (tick=1840): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:48:53  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.3ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=21744)
+22:48:55  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21667)
+22:48:55  INFO   eo.eo_manager                 EO profile -> night (scene mean=55.8, exposure=80.0ms gain=16.0, control=OFF)
+22:48:55  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=17.2Hz(+86f/5.0s)  thermal=21.2Hz(+106f/5.0s)
+22:48:56  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=0
+22:48:56  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21671)
+22:48:57  INFO   eo.eo_manager                 EO Schmitt gate (tick=1880): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:48:58  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.6, exposure=20.0ms gain=4.0, control=OFF)
+22:48:58  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:48:58  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21701)
+22:49:00  INFO   __main__                      [producer_rate] radar=19.0Hz(+95f/5.0s)  eo=17.6Hz(+88f/5.0s)  thermal=19.8Hz(+99f/5.0s)
+22:49:00  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.6ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=21527)
+22:49:01  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.1, exposure=80.0ms gain=16.0, control=OFF)
+22:49:02  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21729)
+22:49:02  INFO   eo.eo_manager                 EO Schmitt gate (tick=1920): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:49:03  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:49:03  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.8ms/tick total=3.3ms/tick (orjson=yes, payload_bytes=21737)
+22:49:04  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.8, exposure=20.0ms gain=4.0, control=OFF)
+22:49:05  INFO   __main__                      [producer_rate] radar=0.2Hz(+1f/5.0s)  eo=16.6Hz(+83f/5.0s)  thermal=20.4Hz(+102f/5.0s)
+22:49:05  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.9ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=21749)
+22:49:06  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:49:06  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:49:06  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:49:07  INFO   eo.eo_manager                 EO Schmitt gate (tick=1960): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:49:07  INFO   eo.eo_manager                 EO profile -> night (scene mean=55.5, exposure=80.0ms gain=16.0, control=OFF)
+22:49:07  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21745)
+22:49:09  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21738)
+22:49:10  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=17.0Hz(+85f/5.0s)  thermal=20.4Hz(+102f/5.0s)
+22:49:10  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=55.9, exposure=20.0ms gain=4.0, control=OFF)
+22:49:10  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:49:10  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:49:10  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:49:10  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:49:10  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 252.8s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:49:11  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21740)
+22:49:11  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:49:12  INFO   eo.eo_manager                 EO Schmitt gate (tick=2000): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:49:12  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:49:12  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5517241 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:49:12  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:49:12  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=21742)
+22:49:13  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.1, exposure=80.0ms gain=16.0, control=OFF)
+22:49:14  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21701)
+22:49:15  INFO   __main__                      [producer_rate] radar=9.8Hz(+49f/5.0s)  eo=11.4Hz(+57f/5.0s)  thermal=13.8Hz(+69f/5.0s)
+22:49:16  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21681)
+22:49:16  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.3, exposure=20.0ms gain=4.0, control=OFF)
+22:49:18  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21688)
+22:49:18  INFO   radar.radar_manager           World-frame rotation active: pan=-1.93° pts=0
+22:49:19  INFO   eo.eo_manager                 EO profile -> night (scene mean=56.2, exposure=80.0ms gain=16.0, control=OFF)
+22:49:19  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.4ms/tick total=1.9ms/tick (orjson=yes, payload_bytes=21656)
+22:49:20  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=9.6Hz(+48f/5.0s)  thermal=11.0Hz(+55f/5.0s)
+22:49:20  INFO   eo.eo_manager                 EO Schmitt gate (tick=2040): conf_fresh=0 conf_coast=0 pending=2 raw_in=0 -> out=0
+22:49:21  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=3.4ms/tick total=4.1ms/tick (orjson=yes, payload_bytes=36446)
+22:49:22  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=68.0, exposure=20.0ms gain=4.0, control=OFF)
+22:49:25  INFO   __main__                      [producer_rate] radar=14.6Hz(+73f/5.0s)  eo=6.8Hz(+34f/5.0s)  thermal=4.6Hz(+23f/5.0s)
+22:49:26  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=2.7ms/tick dumps=0.4ms/tick send=23.8ms/tick total=27.0ms/tick (orjson=yes, payload_bytes=33567)
+22:49:27  INFO   eo.eo_manager                 EO profile -> night (scene mean=59.8, exposure=80.0ms gain=16.0, control=OFF)
+22:49:30  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=56.2, exposure=20.0ms gain=4.0, control=OFF)
+22:49:30  INFO   __main__                      [producer_rate] radar=14.9Hz(+75f/5.0s)  eo=7.0Hz(+35f/5.0s)  thermal=3.0Hz(+15f/5.0s)
+22:49:31  INFO   radar.radar_manager           World-frame rotation active: pan=-1.41° pts=7
+22:49:32  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=2.0ms/tick dumps=0.5ms/tick send=24.7ms/tick total=27.4ms/tick (orjson=yes, payload_bytes=22162)
+22:49:34  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=19660)
+22:49:34  INFO   eo.eo_manager                 EO Schmitt gate (tick=2080): conf_fresh=0 conf_coast=0 pending=1 raw_in=0 -> out=0
+22:49:35  INFO   __main__                      [producer_rate] radar=19.8Hz(+99f/5.0s)  eo=12.4Hz(+62f/5.0s)  thermal=13.6Hz(+68f/5.0s)
+22:49:35  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=19664)
+22:49:37  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.0ms/tick (orjson=yes, payload_bytes=19764)
+22:49:39  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.2ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=19756)
+22:49:39  INFO   eo.eo_manager                 EO Schmitt gate (tick=2120): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:49:40  INFO   __main__                      [producer_rate] radar=19.7Hz(+99f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=19.3Hz(+97f/5.0s)
+22:49:41  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.9ms/tick total=3.5ms/tick (orjson=yes, payload_bytes=20785)
+22:49:41  INFO   radar.radar_manager           World-frame rotation active: pan=-2.11° pts=2
+22:49:43  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=3.0ms/tick total=3.8ms/tick (orjson=yes, payload_bytes=20665)
+22:49:43  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:49:43  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:49:44  INFO   eo.eo_manager                 EO Schmitt gate (tick=2160): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:49:45  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.7ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=20569)
+22:49:45  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=16.0Hz(+80f/5.0s)  thermal=16.9Hz(+85f/5.0s)
+22:49:46  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=21202)
+22:49:48  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:49:48  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=20516)
+22:49:49  INFO   eo.eo_manager                 EO Schmitt gate (tick=2200): conf_fresh=0 conf_coast=0 pending=0 raw_in=0 -> out=0
+22:49:50  INFO   __main__                      [producer_rate] radar=1.2Hz(+6f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=20.0Hz(+100f/5.0s)
+22:49:50  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=19917)
+22:49:50  INFO   eo.eo_manager                 EO optflow: bus=(35.8,-0.0) opt=(32.1,-0.1) used=(32.1,-0.0) n=1 fid=4509
+22:49:50  INFO   eo.eo_manager                 EO optflow: bus=(50.1,-0.0) opt=(66.0,1.9) used=(50.1,0.0) n=1 fid=4510
+22:49:50  INFO   eo.eo_manager                 EO optflow: bus=(28.6,-0.0) opt=(23.5,0.0) used=(23.5,-0.0) n=1 fid=4511
+22:49:50  INFO   eo.eo_manager                 EO optflow: bus=(43.0,-0.0) opt=(34.0,0.4) used=(34.0,-0.0) n=1 fid=4512
+22:49:52  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:49:52  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:49:52  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=23914)
+22:49:52  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:49:54  INFO   eo.eo_manager                 EO optflow: bus=(14.3,-0.0) opt=(23.0,0.4) used=(14.3,-0.0) n=3 fid=4561
+22:49:54  INFO   eo.eo_manager                 EO optflow: bus=(28.6,-0.0) opt=(26.0,0.7) used=(26.0,-0.0) n=2 fid=4562
+22:49:54  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.2ms/tick send=3.6ms/tick total=4.5ms/tick (orjson=yes, payload_bytes=23743)
+22:49:54  INFO   eo.eo_manager                 EO Schmitt gate (tick=2240): conf_fresh=1 conf_coast=2 pending=4 raw_in=1 -> out=3
+22:49:55  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=14.6Hz(+73f/5.0s)  thermal=20.0Hz(+100f/5.0s)
+22:49:56  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=21047)
+22:49:56  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:49:56  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:49:56  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:49:56  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:49:56  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 298.3s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:49:56  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:49:57  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.8ms/tick (orjson=yes, payload_bytes=22288)
+22:49:58  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:49:58  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5537385 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:49:58  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:49:59  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=3.7ms/tick total=4.6ms/tick (orjson=yes, payload_bytes=24079)
+22:50:00  INFO   __main__                      [producer_rate] radar=7.8Hz(+39f/5.0s)  eo=11.2Hz(+56f/5.0s)  thermal=12.6Hz(+63f/5.0s)
+22:50:01  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=24193)
+22:50:02  INFO   eo.eo_manager                 EO Schmitt gate (tick=2280): conf_fresh=0 conf_coast=0 pending=5 raw_in=0 -> out=0
+22:50:04  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=3.9ms/tick total=4.7ms/tick (orjson=yes, payload_bytes=24347)
+22:50:04  INFO   radar.radar_manager           World-frame rotation active: pan=-12.57° pts=1
+22:50:04  INFO   eo.eo_manager                 EO profile -> night (scene mean=57.2, exposure=80.0ms gain=16.0, control=OFF)
+22:50:05  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=5.0Hz(+25f/5.0s)  thermal=3.6Hz(+18f/5.0s)
+22:50:05  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=2.2ms/tick total=3.2ms/tick (orjson=yes, payload_bytes=24719)
+22:50:07  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=2.6ms/tick total=3.6ms/tick (orjson=yes, payload_bytes=24592)
+22:50:07  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=86.9, exposure=20.0ms gain=4.0, control=OFF)
+22:50:09  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.7ms/tick total=3.6ms/tick (orjson=yes, payload_bytes=23606)
+22:50:10  INFO   eo.eo_manager                 EO Schmitt gate (tick=2320): conf_fresh=3 conf_coast=0 pending=2 raw_in=3 -> out=3
+22:50:10  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=13.8Hz(+69f/5.0s)  thermal=15.6Hz(+78f/5.0s)
+22:50:11  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.4ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=24644)
+22:50:13  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=23451)
+22:50:14  INFO   radar.radar_manager           World-frame rotation active: pan=-12.57° pts=0
+22:50:15  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.9ms/tick total=3.8ms/tick (orjson=yes, payload_bytes=24478)
+22:50:15  INFO   eo.eo_manager                 EO Schmitt gate (tick=2360): conf_fresh=2 conf_coast=0 pending=3 raw_in=2 -> out=2
+22:50:15  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=15.6Hz(+78f/5.0s)  thermal=16.8Hz(+84f/5.0s)
+22:50:17  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=3.1ms/tick total=4.1ms/tick (orjson=yes, payload_bytes=24892)
+22:50:19  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=3.1ms/tick total=4.1ms/tick (orjson=yes, payload_bytes=24616)
+22:50:20  INFO   eo.eo_manager                 EO Schmitt gate (tick=2400): conf_fresh=2 conf_coast=0 pending=6 raw_in=4 -> out=2
+22:50:20  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=15.9Hz(+80f/5.0s)  thermal=16.7Hz(+84f/5.0s)
+22:50:21  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=2.4ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=23952)
+22:50:23  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=3.1ms/tick total=4.1ms/tick (orjson=yes, payload_bytes=24680)
+22:50:24  INFO   radar.radar_manager           World-frame rotation active: pan=-12.57° pts=3
+22:50:25  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=2.8ms/tick total=3.8ms/tick (orjson=yes, payload_bytes=24264)
+22:50:25  INFO   __main__                      [producer_rate] radar=20.2Hz(+101f/5.0s)  eo=16.0Hz(+80f/5.0s)  thermal=17.2Hz(+86f/5.0s)
+22:50:25  INFO   eo.eo_manager                 EO Schmitt gate (tick=2440): conf_fresh=3 conf_coast=1 pending=2 raw_in=3 -> out=4
+22:50:26  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=3.3ms/tick total=4.3ms/tick (orjson=yes, payload_bytes=25507)
+22:50:28  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=2.9ms/tick total=3.9ms/tick (orjson=yes, payload_bytes=23919)
+22:50:30  INFO   __main__                      [producer_rate] radar=19.7Hz(+99f/5.0s)  eo=16.0Hz(+80f/5.0s)  thermal=15.8Hz(+79f/5.0s)
+22:50:30  INFO   eo.eo_manager                 EO Schmitt gate (tick=2480): conf_fresh=4 conf_coast=0 pending=3 raw_in=4 -> out=4
+22:50:30  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=2.7ms/tick total=3.7ms/tick (orjson=yes, payload_bytes=24671)
+22:50:32  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.7ms/tick dumps=0.2ms/tick send=3.2ms/tick total=4.2ms/tick (orjson=yes, payload_bytes=24266)
+22:50:32  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:50:32  WARNING  gimbal.bus_servo_driver       BusServoDriver read failed: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+22:50:33  INFO   eo.eo_manager                 EO optflow: bus=(-14.3,28.6) opt=(-23.7,-64.2) used=(-14.3,0.0) n=4 fid=5088
+22:50:33  INFO   eo.eo_manager                 EO optflow: bus=(57.3,-35.8) opt=(41.8,154.7) used=(41.8,0.0) n=4 fid=5090
+22:50:34  INFO   radar.radar_manager           World-frame rotation active: pan=-12.74° pts=4
+22:50:34  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.8ms/tick dumps=0.2ms/tick send=4.1ms/tick total=5.2ms/tick (orjson=yes, payload_bytes=22527)
+22:50:35  INFO   __main__                      [producer_rate] radar=16.9Hz(+85f/5.0s)  eo=15.9Hz(+80f/5.0s)  thermal=13.8Hz(+69f/5.0s)
+22:50:35  INFO   eo.eo_manager                 EO Schmitt gate (tick=2520): conf_fresh=0 conf_coast=0 pending=8 raw_in=1 -> out=0
+22:50:36  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.4ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=21215)
+22:50:37  WARNING  radar.radar_manager           No radar packets for 3.0s — reconnecting
+22:50:38  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=21836)
+22:50:40  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=21684)
+22:50:40  INFO   eo.eo_manager                 EO Schmitt gate (tick=2560): conf_fresh=0 conf_coast=0 pending=2 raw_in=1 -> out=0
+22:50:40  INFO   __main__                      [producer_rate] radar=0.2Hz(+1f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=19.8Hz(+99f/5.0s)
+22:50:41  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] CLI gave no response — assuming post-Ctrl+C wedge, attempting xds110 nRST
+22:50:41  WARNING  radar.radar_manager           [ISSUE2-RECOVERY] Pulsing nRST via tools/xds110reset_linux.py (libusb)
+22:50:41  INFO   radar.radar_manager           [ISSUE2-RECOVERY] xds110reset_linux OK — chip rebooting
+22:50:41  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=20897)
+22:50:42  INFO   eo.eo_manager                 EO profile -> night (scene mean=55.6, exposure=80.0ms gain=16.0, control=OFF)
+22:50:43  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=20867)
+22:50:45  INFO   radar.radar_manager           [ISSUE2-RECOVERY] Chip recovered (resp='queryDemoStatus\n\nmmwDemo:/>')
+22:50:45  INFO   radar.composite_manager       Composite: re-arming DCA1000 after chip wedge recovery
+22:50:45  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.4ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=20816)
+22:50:45  INFO   __main__                      [producer_rate] radar=0.0Hz(+0f/5.0s)  eo=15.0Hz(+75f/5.0s)  thermal=20.9Hz(+105f/5.0s)
+22:50:45  INFO   radar_dca.dca_control_linux   DCA setup_capture OK (lvdsMode=2, dataFormatMode=3, packetDelay=25us)
+22:50:45  INFO   radar.composite_manager       Composite: DCA1000 re-armed; LVDS will resume when chip sensorStarts (cfg push happens next in _push_profile)
+22:50:45  WARNING  radar_dca.dca_pipeline        LVDS stalled: no UDP for 347.4s (packets=13654 drops=43523). Auto-kick is disabled — power-cycle the AWR to recover.
+22:50:45  INFO   eo.eo_manager                 EO Schmitt gate (tick=2600): conf_fresh=0 conf_coast=0 pending=9 raw_in=1 -> out=0
+22:50:45  INFO   eo.eo_manager                 EO profile -> dusk (scene mean=86.4, exposure=20.0ms gain=4.0, control=OFF)
+22:50:45  INFO   radar.radar_manager           Radar CLI reports sensor state=0
+22:50:47  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=20869)
+22:50:47  INFO   radar.cfg_sender              Pushed 25 cfg lines from radar/cfg/awr2944P_ag.cfg
+22:50:47  INFO   radar.radar_manager           Chip started by cfg's own sensorStart (tail='sensorStart\n\nBSSEV t=5607983 dev=0 msgId=0x0080 sb=0x0004 len=20\r\nDebug: Init Ca', rejected=0) — skipping redundant sensorStart 0
+22:50:47  INFO   radar.radar_manager           Radar connected (data=/dev/seeker_radar_data @3125000)
+22:50:49  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.4ms/tick total=2.0ms/tick (orjson=yes, payload_bytes=20722)
+22:50:50  INFO   __main__                      [producer_rate] radar=11.8Hz(+59f/5.0s)  eo=9.6Hz(+48f/5.0s)  thermal=13.8Hz(+69f/5.0s)
+22:50:50  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=2.7ms/tick total=3.2ms/tick (orjson=yes, payload_bytes=20763)
+22:50:52  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.3ms/tick (orjson=yes, payload_bytes=21575)
+22:50:54  INFO   eo.eo_manager                 EO Schmitt gate (tick=2640): conf_fresh=0 conf_coast=1 pending=6 raw_in=0 -> out=1
+22:50:54  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=21607)
+22:50:54  INFO   eo.eo_manager                 EO zoom: 1x -> 4x
+22:50:54  INFO   gui.app                       EO zoom_level -> 4x
+22:50:55  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=9.6Hz(+48f/5.0s)  thermal=12.2Hz(+61f/5.0s)
+22:50:56  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.3ms/tick dumps=0.1ms/tick send=1.6ms/tick total=2.2ms/tick (orjson=yes, payload_bytes=21558)
+22:50:57  INFO   radar.radar_manager           World-frame rotation active: pan=-12.57° pts=0
+22:50:57  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.8ms/tick total=2.5ms/tick (orjson=yes, payload_bytes=22244)
+22:50:59  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=1.9ms/tick total=2.6ms/tick (orjson=yes, payload_bytes=21737)
+22:50:59  INFO   eo.eo_manager                 EO Schmitt gate (tick=2680): conf_fresh=0 conf_coast=0 pending=4 raw_in=1 -> out=0
+22:51:00  INFO   __main__                      [producer_rate] radar=19.7Hz(+99f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=20.7Hz(+104f/5.0s)
+22:51:01  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.4ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=22580)
+22:51:02  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=1.7ms/tick total=2.4ms/tick (orjson=yes, payload_bytes=22509)
+22:51:04  INFO   eo.eo_manager                 EO Schmitt gate (tick=2720): conf_fresh=1 conf_coast=1 pending=1 raw_in=1 -> out=2
+22:51:04  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.4ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=22594)
+22:51:05  INFO   __main__                      [producer_rate] radar=20.1Hz(+101f/5.0s)  eo=16.8Hz(+84f/5.0s)  thermal=21.5Hz(+108f/5.0s)
+22:51:06  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.3ms/tick total=3.1ms/tick (orjson=yes, payload_bytes=22591)
+22:51:07  INFO   radar.radar_manager           World-frame rotation active: pan=-12.57° pts=0
+22:51:08  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.0ms/tick total=2.7ms/tick (orjson=yes, payload_bytes=22639)
+22:51:09  INFO   eo.eo_manager                 EO Schmitt gate (tick=2760): conf_fresh=1 conf_coast=1 pending=1 raw_in=1 -> out=2
+22:51:10  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.5ms/tick dumps=0.1ms/tick send=2.1ms/tick total=2.9ms/tick (orjson=yes, payload_bytes=22586)
+22:51:10  INFO   __main__                      [producer_rate] radar=19.9Hz(+100f/5.0s)  eo=16.4Hz(+82f/5.0s)  thermal=21.1Hz(+106f/5.0s)
+22:51:12  INFO   gui.app                       [ws_sender_prof] over 60 ticks: build=0.6ms/tick dumps=0.1ms/tick send=2.5ms/tick total=3.4ms/tick (orjson=yes, payload_bytes=22626)

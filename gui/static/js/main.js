@@ -803,6 +803,95 @@ document.querySelectorAll(".zoom-btn[data-zoom]").forEach(btn => {
   });
 });
 
+// ── EO digital-zoom buttons (1× / 2× / 4× / 8×) ──
+// POSTs to /api/config/eo with zoom_level: N. Backend center-crops
+// the native frame and re-letterboxes for display.
+document.querySelectorAll(".zoom-btn[data-eo-zoom]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const level = parseInt(btn.dataset.eoZoom, 10) || 1;
+    fetch("/api/config/eo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ zoom_level: level }),
+    }).catch(() => {});
+    document.querySelectorAll(".zoom-btn[data-eo-zoom]").forEach(b => {
+      b.classList.toggle("active", parseInt(b.dataset.eoZoom, 10) === level);
+    });
+    const fovEl = document.getElementById("eo-fov");
+    if (fovEl) {
+      const apparent = (11.05 / level).toFixed(1);
+      fovEl.textContent = apparent + "° HFOV (" + level + "×)";
+    }
+  });
+});
+
+// ── EO Schmitt confidence sliders (DEV tab) ──
+(function() {
+  const ROWS = [
+    { id: "eo-schmitt-hi-vehicle", path: ["per_class","vehicle","hi"], step: 0.01 },
+    { id: "eo-schmitt-lo-vehicle", path: ["per_class","vehicle","lo"], step: 0.01 },
+    { id: "eo-schmitt-hi-person",  path: ["per_class","person","hi"],  step: 0.01 },
+    { id: "eo-schmitt-lo-person",  path: ["per_class","person","lo"],  step: 0.01 },
+    { id: "eo-schmitt-hi-drone",   path: ["per_class","drone","hi"],   step: 0.01 },
+    { id: "eo-schmitt-lo-drone",   path: ["per_class","drone","lo"],   step: 0.01 },
+    { id: "eo-schmitt-k",          path: ["k_persist"],   step: 1 },
+    { id: "eo-schmitt-window",     path: ["window"],      step: 1 },
+    { id: "eo-schmitt-coast",      path: ["coast_ticks"], step: 1 },
+  ];
+  let _q = {}, _flushTimer = null, _userDraggingUntil = 0;
+  function _flush() {
+    _flushTimer = null;
+    if (Object.keys(_q).length === 0) return;
+    const payload = Object.assign({ command: "eo_schmitt_tune" }, _q);
+    _q = {};
+    try { wsSend(payload); } catch(e) { console.warn("eo_schmitt_tune send fail", e); }
+  }
+  function _setNested(obj, path, val) {
+    let o = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+      if (!(path[i] in o)) o[path[i]] = {};
+      o = o[path[i]];
+    }
+    o[path[path.length-1]] = val;
+  }
+  ROWS.forEach(row => {
+    const el = document.getElementById(row.id);
+    const valEl = document.getElementById(row.id + "-val");
+    if (!el) return;
+    el.addEventListener("input", () => {
+      const v = row.step >= 1 ? parseInt(el.value, 10) : parseFloat(el.value);
+      if (valEl) valEl.textContent = row.step >= 1 ? v : v.toFixed(2);
+      _setNested(_q, row.path, v);
+      _userDraggingUntil = Date.now() + 250;
+      if (_flushTimer) clearTimeout(_flushTimer);
+      _flushTimer = setTimeout(_flush, 80);
+    });
+  });
+  window.__hydrateEOSchmitt = function(cfg) {
+    if (!cfg || typeof cfg !== "object") return;
+    if (Date.now() < _userDraggingUntil) return;
+    function _set(id, v, step) {
+      const el = document.getElementById(id);
+      const valEl = document.getElementById(id + "-val");
+      if (!el || v == null) return;
+      const cur = step >= 1 ? parseInt(el.value, 10) : parseFloat(el.value);
+      if (Math.abs(cur - v) <= step / 2) return;
+      el.value = v;
+      if (valEl) valEl.textContent = step >= 1 ? v : Number(v).toFixed(2);
+    }
+    const pc = cfg.per_class || {};
+    _set("eo-schmitt-hi-vehicle", (pc.vehicle||{}).hi, 0.01);
+    _set("eo-schmitt-lo-vehicle", (pc.vehicle||{}).lo, 0.01);
+    _set("eo-schmitt-hi-person",  (pc.person||{}).hi,  0.01);
+    _set("eo-schmitt-lo-person",  (pc.person||{}).lo,  0.01);
+    _set("eo-schmitt-hi-drone",   (pc.drone||{}).hi,   0.01);
+    _set("eo-schmitt-lo-drone",   (pc.drone||{}).lo,   0.01);
+    _set("eo-schmitt-k",       cfg.k_persist,   1);
+    _set("eo-schmitt-window",  cfg.window,      1);
+    _set("eo-schmitt-coast",   cfg.coast_ticks, 1);
+  };
+})();
+
 function syncZoomButtons(preset) {
   if (!preset) return;
   document.querySelectorAll(".zoom-btn[data-zoom]").forEach(b => {
@@ -968,11 +1057,10 @@ if (areaSlider) {
   // sliders. We now keep _MODE_LIVE fresh and refresh _MODE_SNAPSHOTS
   // on save, so a Stock→A/G→Stock round-trip restores Stock's
   // values instantly with no page reload.
-  // A/G mode removed 2026-05-05. Maps stay so saved configs that
-  // still carry an "ag" key load without crashing — but it's never
-  // used as a current mode and the radio is gone from the GUI.
-  let _MODE_LIVE      = { stock: null, aa: null };
-  let _MODE_SNAPSHOTS = { stock: null, aa: null };
+  // A/G mode re-enabled 2026-05-14. The radio button exists in
+  // index.html; the JS event wiring + state maps were missing.
+  let _MODE_LIVE      = { stock: null, ag: null, aa: null };
+  let _MODE_SNAPSHOTS = { stock: null, ag: null, aa: null };
   let _CURRENT_MODE   = "stock";
 
   window.__hydrateRadarModes = (saved) => {
@@ -1084,11 +1172,11 @@ if (areaSlider) {
     }
     const status = document.getElementById("radar-backend-status");
     if (status) {
-      status.textContent = newMode === "stock" ? "STOCK" : "A/A";
+      status.textContent = newMode === "stock" ? "STOCK" : newMode === "ag" ? "A/G" : "A/A";
       status.style.color = "var(--cyan)";
     }
   }
-  for (const mode of ["stock", "aa"]) {
+  for (const mode of ["stock", "ag", "aa"]) {
     const el = document.getElementById("radar-backend-" + mode);
     if (el) el.addEventListener("change", () => { if (el.checked) _applyMode(mode); });
   }
@@ -1157,9 +1245,29 @@ if (areaSlider) {
     el.addEventListener("change", pushAndPaint);
     paintLabel();  // initial label only — no WS send at page load
   }
-  // A/G DSP knobs removed 2026-05-05 — host CFAR pipeline is skipped
-  // (pmm_only=True) and chip-side CFAR can't be retuned at runtime.
-  // See HTML comment in radar-mode-extra[data-mode="ag"].
+  // A/G CFAR threshold — on-chip parameter, requires chip reconfigure
+  // (~5 s) to take effect. Slider updates the label; APPLY pushes
+  // the value and triggers a reconfigure via xds110 reset.
+  (function wireAgCfar() {
+    const sl = document.getElementById("ag-cfar-thresh");
+    const lbl = document.getElementById("ag-cfar-thresh-val");
+    const btn = document.getElementById("ag-cfar-apply");
+    if (!sl) return;
+    sl.addEventListener("input", () => {
+      if (lbl) lbl.textContent = sl.value + " dB";
+    });
+    if (lbl) lbl.textContent = sl.value + " dB";
+    if (btn) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        const v = Number(sl.value);
+        wsSend({ command: "ag_cfar_apply", cfar_threshold_db: v });
+        btn.textContent = "APPLYING…";
+        btn.disabled = true;
+        setTimeout(() => { btn.textContent = "APPLY"; btn.disabled = false; }, 7000);
+      });
+    }
+  })();
 
   // ── Dual-thumb PMM-band slider ────────────────────────────────────
   // The two `aa-pmm-low` / `aa-pmm-high` inputs share one track. We
@@ -1677,6 +1785,7 @@ function connect() {
       window.__hydrateRadarModes(msg.radar_modes_saved);
     }
     if (msg.radar_tuning && typeof window.__hydrateRadarTuning === "function") {
+    if (window.__hydrateEOSchmitt) window.__hydrateEOSchmitt(msg.eo_schmitt_config);
       window.__hydrateRadarTuning(msg.radar_tuning);
     }
     if (msg.extrinsic && typeof window.__hydrateExtrinsic === "function") {
