@@ -550,32 +550,30 @@ class RadarClusterer:
     def _merge_close_tracks(self, active_tids: set) -> None:
         """Merge confirmed tracks that are too close to be separate objects.
 
-        After the per-frame association loop, two DBSCAN-split siblings
-        can each match their own existing track — the overlap check
-        never fires. This pass catches that case: for each pair of
-        active (hit-this-frame) confirmed tracks, if their centroids
-        are within a range-adaptive gate (base + per_m * range),
-        absorb the weaker one. At 200m the gate is ~13m,
-        matching the angular resolution spread.
+        DBSCAN alternates which cluster it forms each frame, so split
+        siblings are never both active simultaneously — one is always
+        coasting. Check each active track against ALL confirmed tracks
+        (including coasting). Range-adaptive gate: base + per_m * range.
+        At 200m the gate is ~13m, matching angular resolution spread.
         """
         base_gate = self.params.track_merge_base_m
         per_m = self.params.track_merge_per_meter
-        tids = [t for t in active_tids
-                if t in self._tracks and self._tracks[t].confirmed]
         absorbed: set = set()
-        for i_idx in range(len(tids)):
-            a_tid = tids[i_idx]
+        # Check each active confirmed track against every other
+        # confirmed track (active OR coasting).
+        active_confirmed = [t for t in active_tids
+                            if t in self._tracks
+                            and self._tracks[t].confirmed]
+        for a_tid in active_confirmed:
             if a_tid in absorbed:
                 continue
             trk_a = self._tracks.get(a_tid)
             if trk_a is None:
                 continue
-            for j_idx in range(i_idx + 1, len(tids)):
-                b_tid = tids[j_idx]
-                if b_tid in absorbed:
+            for b_tid, trk_b in list(self._tracks.items()):
+                if b_tid == a_tid or b_tid in absorbed:
                     continue
-                trk_b = self._tracks.get(b_tid)
-                if trk_b is None:
+                if not trk_b.confirmed:
                     continue
                 d = trk_a.centroid - trk_b.centroid
                 d2 = float(d @ d)
@@ -583,15 +581,13 @@ class RadarClusterer:
                                    + float(np.linalg.norm(trk_b.centroid)))
                 gate = base_gate + per_m * avg_range
                 if d2 < gate * gate:
-                    # Merge: keep the track with more hits
+                    # Keep the track with more hits
                     if trk_a.hits >= trk_b.hits:
                         winner, loser_tid = trk_a, b_tid
                     else:
                         winner, loser_tid = trk_b, a_tid
                     loser = self._tracks[loser_tid]
-                    # Transfer peak SNR
                     winner.peak_snr = max(winner.peak_snr, loser.peak_snr)
-                    # Bury the loser for ID resurrection later
                     now_t = self._last_step_t or time.time()
                     self._graveyard[loser_tid] = _GraveyardEntry(
                         centroid=loser.centroid.copy(),
@@ -603,7 +599,7 @@ class RadarClusterer:
                     )
                     del self._tracks[loser_tid]
                     absorbed.add(loser_tid)
-                    break  # trk_a state may have changed
+                    break
 
     def _overlaps_matched(
         self, centroid: np.ndarray, matched: set[int]
