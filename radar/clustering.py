@@ -98,7 +98,7 @@ class ClusterParams:
     # sibling, not a separate object.
     merge_overlap_m: float = 5.0
     # Tracker persistence
-    coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
+    coast_max_frames: int = 15          # ~1.15 s at 13 Hz (was 30 — zombie tracks) — bridges long dropouts
     confirm_min_hits: int = 2
     confirm_window: int = 3
     # Velocity half-life during coast (seconds). The Kalman's velocity
@@ -120,8 +120,8 @@ class ClusterParams:
     # sharply out of the gate, KF prediction overshoots, reacquires
     # nearby" — classic sources of ID churn that coast budget alone
     # can't fix.
-    graveyard_ttl_s: float = 4.0
-    resurrect_radius_m: float = 12.0
+    graveyard_ttl_s: float = 2.0  # was 4.0
+    resurrect_radius_m: float = 8.0  # was 12.0
     # 2026-05-12 fixes for "targets fading + new IDs born":
     #
     # bury_unconfirmed: also save UNCONFIRMED-but-coasting tracks

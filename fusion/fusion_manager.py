@@ -604,11 +604,21 @@ class FusionManager:
             if slant < 0.1:
                 continue
             # Cartesian → angular (radar convention: x=right, y=forward, z=up).
-            az = math.degrees(math.atan2(t.pos_x_m, t.pos_y_m)) + az_bias
+            # 2026-05-14: Radar targets are in world frame (rotated in
+            # radar_manager before Kalman). EO/thermal observations are
+            # boresight-relative. Subtract gimbal pose so the fusion
+            # system can match radar against camera detections.
+            gp = float(pose_pan) if pose_pan is not None else 0.0
+            gt = float(pose_tilt) if pose_tilt is not None else 0.0
+            # AWR2944P z (elevation) is unreliable — poor vertical
+            # resolution makes el estimates wildly wrong (e.g. -35 deg
+            # for a ground target at 21 m). Zero it.
+            tz = 0.0
+            az = math.degrees(math.atan2(t.pos_x_m, t.pos_y_m)) - gp + az_bias
             el = math.degrees(math.atan2(
-                t.pos_z_m,
+                tz,
                 math.sqrt(t.pos_x_m * t.pos_x_m + t.pos_y_m * t.pos_y_m)
-            )) + el_bias
+            )) - gt + el_bias
             # Bbox angular extent from physical half-size at slant range.
             # Floor at 0.4° so a tiny cluster still gates against EO/thermal.
             ang_w = max(0.4, math.degrees(2.0 * math.atan2(t.size_x_m, slant)))
