@@ -908,7 +908,13 @@ class RadarManager:
         # drift during pan. Now we interpolate the gimbal angle
         # at the UART receive time from a ring buffer sampled in
         # the capture loop.
-        gimbal_pan_at_capture, gimbal_tilt_at_capture = self._interp_gimbal(rx_time)
+        # Subtract estimated hardware pipeline delay (radar CFAR + UART
+        # transfer) so we use the angle when the chirp was actually
+        # captured, not when the bytes arrived at the host.
+        _RADAR_HW_DELAY_S = 0.045  # ~45 ms — tunable
+        gimbal_pan_at_capture, gimbal_tilt_at_capture = self._interp_gimbal(
+            rx_time - _RADAR_HW_DELAY_S
+        )
 
         if gimbal_pan_at_capture is not None:
             pan_rad = _m.radians(gimbal_pan_at_capture)
