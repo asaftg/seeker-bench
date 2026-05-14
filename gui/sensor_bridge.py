@@ -867,17 +867,8 @@ def track_score(t: Dict[str, Any]) -> float:
 
     Sensor count dominates (a 2-sensor fused track is *much* more
     trustworthy than any single-sensor one), confidence breaks ties.
-
-    Radar-only tracks (target_class == "radar_target") get a -1.0
-    penalty so they rank below any classified EO/thermal detection.
-    Without this, a radar-only coasting track with default conf=1.0
-    scores 2.0 and pushes classified vehicle/human detections out of
-    the top-5.
     """
-    score = float(len(t.get("sensors", []))) + float(t.get("confidence", 0.0))
-    if t.get("target_class") == "radar_target":
-        score -= 1.0
-    return score
+    return float(len(t.get("sensors", []))) + float(t.get("confidence", 0.0))
 
 
 def build_ws_message(
