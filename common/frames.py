@@ -184,7 +184,13 @@ class EOFrame:
     timestamp: float
     frame_id: int
     connected: bool
-    bgr: Optional[np.ndarray] = None   # uint8, shape (H, W, 3)
+    bgr: Optional[np.ndarray] = None   # uint8, shape (H, W, 3) — downscaled DISPLAY frame
+    # Native-resolution uint8 BGR frame BEFORE the display downscale.
+    # 2026-05-13: needed so tiled YOLO and the JSONL recorder can run
+    # on native 2472x2064 while the GUI keeps publishing the cheap
+    # 900-wide display frame. None when not in use (webcam backend or
+    # when display_max_width >= source width).
+    native_bgr: Optional[np.ndarray] = None
     detections: List[EODetection] = field(default_factory=list)
 
     # Software-AE / source-restart sentinel. Distinct from `connected`:
@@ -345,6 +351,7 @@ class RadarTarget:
     coasting: bool = False
     hits: int = 0
     misses: int = 0
+    snr_db: float = 0.0
 
 
 @dataclass
