@@ -981,6 +981,27 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                     except Exception:
                         log.exception("ag_cfar_apply")
 
+
+                elif command == "ag_aoa_apply":
+                    # Push a new on-chip AoA FoV to the AWR2944P.
+                    # Modifies aoaFovCfg in AG cfg and reconfigures (~5 s).
+                    try:
+                        az = float(cmd.get("az_half_deg", 90))
+                        az = max(10.0, min(90.0, az))
+                        state.setdefault("ag_tuning", {})["aoa_az_half_deg"] = az
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "apply_ag_aoa"):
+                            try:
+                                ok = rm.apply_ag_aoa(az)
+                                log.info("ag_aoa_apply: +/-%.0f deg -> %s",
+                                         az, "OK" if ok else "FAILED")
+                            except Exception:
+                                log.exception("ag_aoa_apply failed")
+                        emit_event("ag_aoa_apply",
+                                   {"az_half_deg": az})
+                    except Exception:
+                        log.exception("ag_aoa_apply")
+
                 elif command == "aa_tune":
                     # A/A (PMM drone) DSP knobs: pmm_band_low_hz, pmm_band_high_hz,
                     # pmm_threshold_db, pmm_slow_time_win, staggered_prf.

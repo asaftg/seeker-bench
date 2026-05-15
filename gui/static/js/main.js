@@ -1269,6 +1269,29 @@ if (areaSlider) {
     }
   })();
 
+  // A/G on-chip AoA FoV — modifies aoaFovCfg in the chip config.
+  // Same pattern as CFAR: slider updates label, APPLY pushes + reconfigures.
+  (function wireAgAoa() {
+    const sl = document.getElementById("ag-aoa-az");
+    const lbl = document.getElementById("ag-aoa-az-val");
+    const btn = document.getElementById("ag-aoa-apply");
+    if (!sl) return;
+    sl.addEventListener("input", () => {
+      if (lbl) lbl.textContent = "±" + sl.value + "°";
+    });
+    if (lbl) lbl.textContent = "±" + sl.value + "°";
+    if (btn) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        const v = Number(sl.value);
+        wsSend({ command: "ag_aoa_apply", az_half_deg: v });
+        btn.textContent = "APPLYING…";
+        btn.disabled = true;
+        setTimeout(() => { btn.textContent = "APPLY FOV"; btn.disabled = false; }, 7000);
+      });
+    }
+  })();
+
   // ── Dual-thumb PMM-band slider ────────────────────────────────────
   // The two `aa-pmm-low` / `aa-pmm-high` inputs share one track. We
   // (a) clamp so low ≤ high − step, (b) update a single combined

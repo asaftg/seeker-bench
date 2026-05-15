@@ -373,12 +373,12 @@
             </div>
             <div class="slider-row">
               <label class="slider-label">PERSIST · window (ticks)</label>
-              <input id="eo-schmitt-window" type="range" min="5" max="50" step="1" value="20">
+              <input id="eo-schmitt-window" type="range" min="5" max="50" step="1" value="17">
               <span class="slider-val" id="eo-schmitt-window-val">20</span>
             </div>
             <div class="slider-row">
               <label class="slider-label">COAST · ticks after lost</label>
-              <input id="eo-schmitt-coast" type="range" min="1" max="20" step="1" value="3">
+              <input id="eo-schmitt-coast" type="range" min="1" max="20" step="1" value="17">
               <span class="slider-val" id="eo-schmitt-coast-val">3</span>
             </div>
             <div class="stat-line" style="margin-top:4px;color:var(--text-3);font-size:10px;">
@@ -506,7 +506,7 @@
             </div>
             <div class="slider-row">
               <label class="slider-label" title="DBSCAN minimum cluster size.">MIN PTS</label>
-              <input id="radar-minpts" type="range" min="2" max="8" step="1" value="3">
+              <input id="radar-minpts" type="range" min="2" max="8" step="1" value="17">
               <span class="slider-val" id="radar-minpts-val">—</span>
             </div>
           </div>
@@ -520,11 +520,19 @@
             <div class="section-label">A/G · long range</div>
             <div class="slider-row">
               <label class="slider-label" title="On-chip CFAR detection threshold (dB above noise floor). Lower = more detections + more false alarms. Default 26 dB. Range 20–32.">CFAR THRESH</label>
-              <input id="ag-cfar-thresh" type="range" min="3" max="32" step="1" value="3">
-              <span class="slider-val" id="ag-cfar-thresh-val">3 dB</span>
+              <input id="ag-cfar-thresh" type="range" min="3" max="32" step="1" value="17">
+              <span class="slider-val" id="ag-cfar-thresh-val">17 dB</span>
             </div>
             <div class="slider-row" style="justify-content:flex-end;">
-              <button id="ag-cfar-apply" class="btn-small" title="Push new CFAR threshold to the AWR chip (~5 s reconfigure)">APPLY</button>
+              <button id="ag-cfar-apply" class="btn-small" title="Push new CFAR threshold to the AWR chip (~5 s reconfigure)">APPLY CFAR</button>
+            </div>
+            <div class="slider-row">
+              <label class="slider-label" title="On-chip AoA azimuth FoV (half-angle). Narrower = less noise from sidelobes. Requires chip reconfigure (~5 s).">CHIP FOV ±</label>
+              <input id="ag-aoa-az" type="range" min="10" max="90" step="5" value="90">
+              <span class="slider-val" id="ag-aoa-az-val">90°</span>
+            </div>
+            <div class="slider-row" style="justify-content:flex-end;">
+              <button id="ag-aoa-apply" class="btn-small" title="Push new AoA FoV to the AWR chip (~5 s reconfigure)">APPLY FOV</button>
             </div>
           </div>
 

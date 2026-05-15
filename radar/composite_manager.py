@@ -464,6 +464,52 @@ class CompositeRadarBackend:
         # Not in AG — threshold stored for next AG entry
         return True
 
+
+    def apply_ag_aoa(self, az_half_deg: float) -> bool:
+        """Modify the AG cfg's aoaFovCfg azimuth limits and reconfigure
+        the chip if currently in A/G mode.
+
+        aoaFovCfg format: aoaFovCfg <subFrameIdx> <minAz> <maxAz> <minEl> <maxEl>
+        We set minAz = -az_half_deg, maxAz = +az_half_deg, leave elevation at +/-90.
+        """
+        import re as _re
+        from pathlib import Path as _Path
+
+        cfg_dir = _Path(self._radar.cfg_path).parent
+        ag_cfg = cfg_dir / "awr2944P_ag.cfg"
+
+        if not ag_cfg.exists():
+            log.error("apply_ag_aoa: %s not found", ag_cfg)
+            return False
+
+        text = ag_cfg.read_text()
+
+        az_int = int(az_half_deg)
+
+        def replace_aoa(m):
+            return "aoaFovCfg -1 -%d %d -90 90" % (az_int, az_int)
+
+        new_text = _re.sub(
+            r"^aoaFovCfg\s+-1\s+.*$",
+            replace_aoa,
+            text,
+            flags=_re.MULTILINE,
+        )
+
+        if new_text == text:
+            log.warning("apply_ag_aoa: no aoaFovCfg line matched")
+            return False
+
+        ag_cfg.write_text(new_text)
+        log.info("apply_ag_aoa: wrote +/-%d deg to %s", az_int, ag_cfg.name)
+
+        if self._mode == "ag":
+            log.info("apply_ag_aoa: in AG mode - reconfiguring chip")
+            ok = self._radar.reconfigure(str(ag_cfg))
+            return ok
+
+        return True
+
     # ─────────────────────── diagnostics ────────────────────────────────
     def diagnostics(self) -> Dict[str, Any]:
         """Return one dict covering both data planes so the GUI debug
