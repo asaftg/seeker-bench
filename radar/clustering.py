@@ -35,7 +35,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from common.frames import RadarDetection, RadarTarget
 
@@ -97,29 +96,8 @@ class ClusterParams:
     # first cluster claims the real track, the orphan is its split
     # sibling, not a separate object.
     merge_overlap_m: float = 5.0
-    # Track-level merge: after per-frame association, merge
-    # confirmed tracks whose centroids are within this gate.
-    # Catches split-siblings that already established separate
-    # tracks (DBSCAN splits that self-perpetuate because each
-    # cluster matches its own track every frame).
-    track_merge_base_m: float = 5.0
-    track_merge_per_meter: float = 0.04  # +4cm/m of range
     # Tracker persistence
     coast_max_frames: int = 30          # ~2.3 s at 13 Hz — bridges long dropouts
-    # Proportional coast: a track must accumulate this many hits to
-    # earn the full coast budget.  Immature tracks (hits < this)
-    # get a proportionally shorter budget:
-    #   effective = max(3, coast_max_frames * hits / coast_maturity_hits)
-    # This kills false-confirmation ghosts: a clutter cluster that
-    # scored 2/3 hits coasts ~5 frames instead of 30.
-    coast_maturity_hits: int = 10
-    # Moving-target coast floor: if the track's 2D ground speed
-    # exceeds this threshold, it gets at least this many frames of
-    # coast even with few hits. Distinguishes walking humans
-    # (~1 m/s) from static clutter (~0 m/s) which both have low
-    # hit counts early in life.
-    coast_moving_speed_mps: float = 0.5
-    coast_moving_floor_frames: int = 15  # ~1.2s at 13 Hz
     confirm_min_hits: int = 2
     confirm_window: int = 3
     # Velocity half-life during coast (seconds). The Kalman's velocity
@@ -131,7 +109,7 @@ class ClusterParams:
     # position near where the target actually is when it reappears.
     coast_vel_halflife_s: float = 1.0
     # Kalman
-    q_accel_mps2: float = 6.0           # higher = tracks pivots faster (was 3.0, bumped for pan-drift)
+    q_accel_mps2: float = 3.0           # higher = tracks pivots faster
     r_pos_m: float = 0.4
     # Track graveyard — reaped tracks are stashed for this many seconds
     # before being fully forgotten. When a would-be new track's centroid
@@ -143,54 +121,6 @@ class ClusterParams:
     # can't fix.
     graveyard_ttl_s: float = 4.0
     resurrect_radius_m: float = 12.0
-    # 2026-05-12 fixes for "targets fading + new IDs born":
-    #
-    # bury_unconfirmed: also save UNCONFIRMED-but-coasting tracks
-    #   to graveyard with a shorter TTL. The original "only confirmed"
-    #   policy was an over-correction against noise — in practice it
-    #   means a cluster that fragmented (FedEx truck case) and never
-    #   reached confirm_min_hits before re-fragmenting just dies
-    #   without ID preservation. The shorter TTL keeps the graveyard
-    #   from clogging with true noise.
-    bury_unconfirmed: bool = True
-    graveyard_unconfirmed_ttl_s: float = 1.5
-    # resurrect_radius_per_meter: scale the resurrect radius with the
-    # buried track's last slant range. At long range a small angular
-    # error projects to a large physical distance, so a tight 12m
-    # gate misses re-acquires. 0.05 -> +5cm per meter of range -> at
-    # 200m the radius becomes 12 + 10 = 22m. Set 0 to keep flat
-    # `resurrect_radius_m` only.
-    resurrect_radius_per_meter: float = 0.05
-
-    # 2026-05-12 — post-DBSCAN merge pass for "multiple bboxes per
-    # physical target" (FedEx truck case). DBSCAN can split one big
-    # target into 2-4 clusters when surfaces have different micro-
-    # doppler (truck body translates at v, wheels spin at v ± wheel_v).
-    # Each fragment becomes its own track in the GUI. This pass merges
-    # clusters whose centroids are close AND whose mean doppler agrees,
-    # after DBSCAN runs.
-    #
-    # Merge gate = base + per_meter * range_a. Default 4m base +
-    # 0.04 m/m at 50m -> 6m gate -> handles a typical big truck.
-    # max_doppler_diff_mps protects against merging traffic moving
-    # in opposite directions.
-    post_dbscan_merge_enabled: bool = True
-    cluster_merge_dist_m: float = 4.0
-    cluster_merge_dist_per_meter: float = 0.04
-    cluster_merge_max_doppler_diff_mps: float = 3.0
-
-    # 2026-05-16 — velocity-free mode. When False, DBSCAN clusters on
-    # (x, y, z) only, post-DBSCAN merge ignores doppler difference, and
-    # new tracks are initialised with zero velocity (position-only
-    # tracker, converges via Kalman from position deltas in 2-3 frames).
-    #
-    # WHY: the DDMA waveform Vmax is ~5 m/s (18 km/h). Any target
-    # moving faster wraps — the reported velocity is wrong. Using a
-    # wrong velocity in clustering splits one target into two, and in
-    # the Kalman init it causes track prediction to overshoot → breaks.
-    # Position-only mode trades away 2-3 frames of velocity lag for
-    # stable, unsplit bounding boxes at any target speed.
-    use_doppler: bool = True
 
 
 class _Tracklet:
@@ -204,7 +134,7 @@ class _Tracklet:
 
     __slots__ = (
         "tid", "x", "P", "size_half", "hits", "misses",
-        "hit_history", "confirmed", "last_hit_t", "peak_snr",
+        "hit_history", "confirmed", "last_hit_t",
     )
 
     def __init__(
@@ -230,7 +160,6 @@ class _Tracklet:
         self.misses = 0
         self.hit_history: List[bool] = [True]
         self.confirmed = False
-        self.peak_snr = 0.0
         self.last_hit_t = now_t
 
     def predict(
@@ -315,23 +244,6 @@ class _Tracklet:
         self.misses += 1
 
 
-@dataclass
-class _GraveyardEntry:
-    """Buried tracklet awaiting potential resurrection.
-
-    2026-05-12: replaced the legacy 3-tuple (centroid, vel, t) with
-    this dataclass so the graveyard can carry confirmation state
-    + range (needed for separate TTLs and range-aware resurrect
-    radius).
-    """
-    centroid: np.ndarray
-    velocity: np.ndarray
-    buried_t: float
-    was_confirmed: bool
-    hits_at_burial: int
-    last_range_m: float
-
-
 class RadarClusterer:
     """Stateful DBSCAN + Kalman tracker for a point-cloud stream.
 
@@ -343,11 +255,10 @@ class RadarClusterer:
         self._tracks: Dict[int, _Tracklet] = {}
         self._next_tid: int = 0
         self._last_step_t: Optional[float] = None
-        # Graveyard: tid → _GraveyardEntry. Entries live for
-        # graveyard_ttl_s (confirmed) or graveyard_unconfirmed_ttl_s
-        # (unconfirmed) then are forgotten. Used to resurrect IDs
-        # when a cluster spawns near a recently-dead track.
-        self._graveyard: Dict[int, "_GraveyardEntry"] = {}
+        # Graveyard: tid → (last_centroid, last_velocity, reap_t). Entries
+        # live for params.graveyard_ttl_s then are forgotten. Used to
+        # resurrect IDs when a cluster spawns near a recently-dead track.
+        self._graveyard: Dict[int, Tuple[np.ndarray, np.ndarray, float]] = {}
 
     # ──────────────────────── public API ────────────────────────
     def step(
@@ -379,20 +290,6 @@ class RadarClusterer:
             return detections, self._publish_coasting_only()
 
         # ── DBSCAN ──
-        # Decimate pathological frames (garbage injection, dust, jitter)
-        # to a sane cap. Real targets emit ~20-50 points; >300 is noise.
-        # Keep top-by-SNR so real targets survive.
-        if len(detections) > 300:
-            dets_sorted = sorted(
-                detections,
-                key=lambda d: (
-                    float(d.snr_db) if d.snr_db is not None
-                    and not (d.snr_db != d.snr_db) else -1000.0
-                ),
-                reverse=True,
-            )
-            detections = dets_sorted[:300]
-
         pts = np.array(
             [[d.x_m, d.y_m, d.z_m, d.doppler_mps] for d in detections],
             dtype=np.float32,
@@ -400,8 +297,7 @@ class RadarClusterer:
         labels = _dbscan(
             pts,
             eps_pos=self.params.eps_pos_m,
-            eps_dop=(self.params.eps_dop_mps if self.params.use_doppler
-                     else 1e9),
+            eps_dop=self.params.eps_dop_mps,
             min_samples=self.params.min_samples,
         )
 
@@ -410,12 +306,6 @@ class RadarClusterer:
             if lbl < 0:
                 continue
             clusters.setdefault(int(lbl), []).append(i)
-
-        # 2026-05-12 post-DBSCAN merge — collapses same-target
-        # fragments before they each spawn their own track. See
-        # `_merge_adjacent_clusters` for the merge condition.
-        if self.params.post_dbscan_merge_enabled and len(clusters) > 1:
-            clusters = self._merge_adjacent_clusters(clusters, pts)
 
         # ── Per-cluster stats in sensor coords ──
         frame_clusters: List[Tuple[int, np.ndarray, np.ndarray, np.ndarray, int]] = []
@@ -433,20 +323,10 @@ class RadarClusterer:
             np.clip(half, self.params.min_size_m, self.params.max_size_m, out=half)
 
             # Radial-doppler → 3D velocity hint along the sensor ray.
-            # When use_doppler is off, init with zero — the Kalman will
-            # converge from position deltas in 2-3 frames (~100-150 ms).
-            if self.params.use_doppler:
-                r = max(float(np.linalg.norm(centroid)), 1e-3)
-                dir_hat = centroid / r
-                vel = dir_hat * float(ds.mean())
-            else:
-                vel = np.zeros(3, dtype=np.float64)
-            # Max SNR of constituent detections for coast budget.
-            _snrs = [float(detections[ii].snr_db) for ii in idxs
-                     if detections[ii].snr_db is not None
-                     and detections[ii].snr_db == detections[ii].snr_db]  # skip NaN
-            max_snr = max(_snrs) if _snrs else 0.0
-            frame_clusters.append((cid, centroid, half, vel, len(idxs), max_snr))
+            r = max(float(np.linalg.norm(centroid)), 1e-3)
+            dir_hat = centroid / r
+            vel = dir_hat * float(ds.mean())
+            frame_clusters.append((cid, centroid, half, vel, len(idxs)))
 
         # Associate largest clusters first (greedy).
         frame_clusters.sort(key=lambda t: -t[4])
@@ -454,7 +334,7 @@ class RadarClusterer:
         matched_tracks: set[int] = set()
         cid_to_tid: Dict[int, int] = {}
 
-        for cid, centroid, half, vel, n_pts, max_snr in frame_clusters:
+        for cid, centroid, half, vel, n_pts in frame_clusters:
             tid = self._find_best_track(centroid, exclude=matched_tracks)
             if tid is None:
                 # Before creating a new track, check if this cluster is
@@ -491,7 +371,6 @@ class RadarClusterer:
                 # visible again would show a brief "gap" in the trail.
                 if resurrected_tid is not None:
                     new_trk.confirmed = True
-                new_trk.peak_snr = max_snr
                 self._tracks[tid] = new_trk
             else:
                 trk = self._tracks[tid]
@@ -505,14 +384,9 @@ class RadarClusterer:
                     self.params.confirm_min_hits,
                 )
                 trk.last_hit_t = now_t
-                trk.peak_snr = max(0.3 * trk.peak_snr + 0.7 * max_snr, trk.peak_snr)
                 matched_tracks.add(tid)
 
             cid_to_tid[cid] = tid
-
-        # Merge confirmed tracks that are too close to be separate
-        # objects. Catches self-perpetuating DBSCAN split-siblings.
-        self._merge_close_tracks(matched_tracks)
 
         # Age un-matched tracklets.
         for tid, trk in list(self._tracks.items()):
@@ -566,60 +440,6 @@ class RadarClusterer:
                 best_tid = tid
         return best_tid
 
-    def _merge_close_tracks(self, active_tids: set) -> None:
-        """Merge confirmed tracks that are too close to be separate objects.
-
-        DBSCAN alternates which cluster it forms each frame, so split
-        siblings are never both active simultaneously — one is always
-        coasting. Check each active track against ALL confirmed tracks
-        (including coasting). Range-adaptive gate: base + per_m * range.
-        At 200m the gate is ~13m, matching angular resolution spread.
-        """
-        base_gate = self.params.track_merge_base_m
-        per_m = self.params.track_merge_per_meter
-        absorbed: set = set()
-        # Check each active confirmed track against every other
-        # confirmed track (active OR coasting).
-        active_confirmed = [t for t in active_tids
-                            if t in self._tracks
-                            and self._tracks[t].confirmed]
-        for a_tid in active_confirmed:
-            if a_tid in absorbed:
-                continue
-            trk_a = self._tracks.get(a_tid)
-            if trk_a is None:
-                continue
-            for b_tid, trk_b in list(self._tracks.items()):
-                if b_tid == a_tid or b_tid in absorbed:
-                    continue
-                if not trk_b.confirmed:
-                    continue
-                d = trk_a.centroid - trk_b.centroid
-                d2 = float(d @ d)
-                avg_range = 0.5 * (float(np.linalg.norm(trk_a.centroid))
-                                   + float(np.linalg.norm(trk_b.centroid)))
-                gate = base_gate + per_m * avg_range
-                if d2 < gate * gate:
-                    # Keep the track with more hits
-                    if trk_a.hits >= trk_b.hits:
-                        winner, loser_tid = trk_a, b_tid
-                    else:
-                        winner, loser_tid = trk_b, a_tid
-                    loser = self._tracks[loser_tid]
-                    winner.peak_snr = max(winner.peak_snr, loser.peak_snr)
-                    now_t = self._last_step_t or time.time()
-                    self._graveyard[loser_tid] = _GraveyardEntry(
-                        centroid=loser.centroid.copy(),
-                        velocity=loser.velocity.copy(),
-                        buried_t=now_t,
-                        was_confirmed=bool(loser.confirmed),
-                        hits_at_burial=int(loser.hits),
-                        last_range_m=float(np.linalg.norm(loser.centroid)),
-                    )
-                    del self._tracks[loser_tid]
-                    absorbed.add(loser_tid)
-                    break
-
     def _overlaps_matched(
         self, centroid: np.ndarray, matched: set[int]
     ) -> bool:
@@ -641,228 +461,45 @@ class RadarClusterer:
             trk.miss_tick(self.params.confirm_window)
         self._reap()
 
-    def _merge_adjacent_clusters(
-        self,
-        clusters: Dict[int, List[int]],
-        pts: np.ndarray,
-    ) -> Dict[int, List[int]]:
-        """Iterative pairwise merge of DBSCAN clusters that look like
-        fragments of the same physical target.
-
-        For each pair (a, b) of remaining clusters, merge b into a if:
-          * |centroid_a - centroid_b| < (base + per_m * range_a), OR
-          * Bounding boxes overlap on all 3 axes (full 3D bbox overlap)
-        AND
-          * |mean_doppler_a - mean_doppler_b| < max_doppler_diff_mps
-            (protects against merging traffic moving in opposite
-             directions through the same angular bin)
-
-        Iterates until no merges happen, with a hard cap of 32 passes
-        to bound worst-case compute on pathological scenes. Each merge
-        emits a `radar_cluster_merged` event for post-hoc forensics.
-
-        Range-aware gate: closer clusters get a tighter gate than
-        farther ones because the same angular error projects to more
-        meters at range. Default base=4m, per_m=0.04 -> at 50m gate=6m.
-
-        Returns the merged cluster dict. Cluster IDs preserved: the
-        winner (lower id) keeps its id, the loser's points are
-        absorbed and the loser id is removed from the dict.
-        """
-        if len(clusters) < 2:
-            return clusters
-
-        def _cluster_stats(idxs):
-            cp = pts[np.asarray(idxs)]
-            centroid = cp[:, :3].mean(axis=0)
-            if len(idxs) > 1:
-                half = 1.5 * cp[:, :3].std(axis=0)
-            else:
-                half = np.array([self.params.min_size_m] * 3,
-                                 dtype=np.float64)
-            half = np.clip(half, self.params.min_size_m,
-                           self.params.max_size_m)
-            mean_dop = float(cp[:, 3].mean())
-            return centroid, half, mean_dop
-
-        base = float(self.params.cluster_merge_dist_m)
-        per_m = float(self.params.cluster_merge_dist_per_meter)
-        max_dop = (float(self.params.cluster_merge_max_doppler_diff_mps)
-                   if self.params.use_doppler else 1e9)
-
-        try:
-            from common.events import emit as _emit
-        except Exception:
-            _emit = None  # type: ignore
-
-        for _pass in range(32):
-            cids = sorted(clusters.keys())
-            stats = {c: _cluster_stats(clusters[c]) for c in cids}
-            merged_any = False
-            for i, cid_a in enumerate(cids):
-                if cid_a not in clusters:
-                    continue
-                ca, ha, da = stats[cid_a]
-                for cid_b in cids[i + 1:]:
-                    if cid_b not in clusters:
-                        continue
-                    cb, hb, db = stats[cid_b]
-                    if abs(da - db) > max_dop:
-                        continue
-                    bbox_overlap = bool(np.all(
-                        np.abs(ca - cb) < (ha + hb)))
-                    range_a = float(np.linalg.norm(ca))
-                    gate = base + per_m * range_a
-                    dist = float(np.linalg.norm(ca - cb))
-                    if bbox_overlap or dist < gate:
-                        clusters[cid_a] = (clusters[cid_a]
-                                            + clusters[cid_b])
-                        del clusters[cid_b]
-                        if _emit is not None:
-                            try:
-                                _emit("radar_cluster_merged", {
-                                    "winner": int(cid_a),
-                                    "loser": int(cid_b),
-                                    "n_points_after": len(clusters[cid_a]),
-                                    "distance_m": round(dist, 2),
-                                    "gate_m": round(gate, 2),
-                                    "bbox_overlap": bbox_overlap,
-                                    "doppler_diff_mps": round(
-                                        abs(da - db), 2),
-                                    "range_m": round(range_a, 2),
-                                })
-                            except Exception:
-                                pass
-                        merged_any = True
-                        break  # ca/ha/da stale — restart pass
-            if not merged_any:
-                break
-        return clusters
-
     def _reap(self) -> None:
         now_t = self._last_step_t or time.time()
-        def _effective_coast(trk) -> int:
-            """Proportional coast + velocity floor."""
-            mh = self.params.coast_maturity_hits
-            if trk.hits >= mh:
-                return self.params.coast_max_frames
-            base = max(3, self.params.coast_max_frames * trk.hits // mh)
-            speed = float(np.linalg.norm(trk.velocity[:2]))
-            if speed > self.params.coast_moving_speed_mps:
-                base = max(base, self.params.coast_moving_floor_frames)
-            # High-SNR targets are strong returns (vehicles) — give extra coast
-            if trk.peak_snr > 15.0:  # strong return
-                base = max(base, 20)
-            return base
         dead = [tid for tid, trk in self._tracks.items()
-                if trk.misses > _effective_coast(trk)]
+                if trk.misses > self.params.coast_max_frames]
         for tid in dead:
             trk = self._tracks[tid]
-            # 2026-05-12: bury BOTH confirmed and unconfirmed tracks.
-            # Original policy was "confirmed only" but in practice that
-            # meant a cluster that fragmented (FedEx truck case) and
-            # never reached confirm_min_hits before re-fragmenting just
-            # died without ID preservation. Operator-reported as
-            # "targets fading + new IDs". Unconfirmed entries get a
-            # shorter TTL (graveyard_unconfirmed_ttl_s) so true noise
-            # doesn't clog the dictionary.
-            should_bury = trk.confirmed or self.params.bury_unconfirmed
-            if should_bury:
-                last_range_m = float(np.linalg.norm(trk.centroid))
-                self._graveyard[tid] = _GraveyardEntry(
-                    centroid=trk.centroid.copy(),
-                    velocity=trk.velocity.copy(),
-                    buried_t=now_t,
-                    was_confirmed=bool(trk.confirmed),
-                    hits_at_burial=int(trk.hits),
-                    last_range_m=last_range_m,
+            # Only confirmed tracks deserve resurrection — unconfirmed
+            # ones were transient anyway, no point keeping their ID.
+            if trk.confirmed:
+                self._graveyard[tid] = (
+                    trk.centroid.copy(),
+                    trk.velocity.copy(),
+                    now_t,
                 )
-                # Diagnostic — visible in the JSONL events stream so
-                # post-hoc forensics can correlate burial -> resurrect
-                # cycles with operator-perceived ID churn.
-                try:
-                    from common.events import emit as _emit
-                    _emit("radar_track_buried", {
-                        "tid": int(tid),
-                        "confirmed": bool(trk.confirmed),
-                        "hits": int(trk.hits),
-                        "misses": int(trk.misses),
-                        "last_range_m": round(last_range_m, 2),
-                        "last_x": round(float(trk.centroid[0]), 2),
-                        "last_y": round(float(trk.centroid[1]), 2),
-                        "last_z": round(float(trk.centroid[2]), 2),
-                    })
-                except Exception:
-                    pass
             del self._tracks[tid]
-        # Age out stale graveyard entries — separate TTL for confirmed
-        # vs unconfirmed so noise doesn't clog the table.
-        ttl_c = self.params.graveyard_ttl_s
-        ttl_u = self.params.graveyard_unconfirmed_ttl_s
-        stale = []
-        for tid, entry in self._graveyard.items():
-            ttl = ttl_c if entry.was_confirmed else ttl_u
-            if (now_t - entry.buried_t) > ttl:
-                stale.append(tid)
+        # Age out stale graveyard entries.
+        ttl = self.params.graveyard_ttl_s
+        stale = [tid for tid, (_, _, t_reap) in self._graveyard.items()
+                 if (now_t - t_reap) > ttl]
         for tid in stale:
-            try:
-                from common.events import emit as _emit
-                _emit("radar_track_graveyard_expired", {
-                    "tid": int(tid),
-                    "was_confirmed": bool(self._graveyard[tid].was_confirmed),
-                    "age_s": round(now_t - self._graveyard[tid].buried_t, 2),
-                })
-            except Exception:
-                pass
             del self._graveyard[tid]
 
     def _try_resurrect(self, centroid: np.ndarray) -> Optional[int]:
         """Return a graveyard tid whose last position is closest to
-        ``centroid`` and within the (range-aware) resurrect radius —
-        or None.
-
-        Range-aware radius: each entry's effective gate is
-            resurrect_radius_m + resurrect_radius_per_meter * last_range_m
-        So a long-range track (where small angular shifts project to
-        large physical distances) gets a wider catchment than a
-        close-range one. Set resurrect_radius_per_meter=0 in YAML
-        to keep the flat radius.
-
-        The entry is removed on success so two fresh clusters can't
-        both claim the same dead ID in the same frame.
-        """
+        ``centroid`` and within resurrect_radius_m — or None. The entry
+        is removed on success so two fresh clusters can't both claim
+        the same dead ID in the same frame."""
         if not self._graveyard:
             return None
-        base_r = float(self.params.resurrect_radius_m)
-        per_m = float(self.params.resurrect_radius_per_meter)
+        gate2 = self.params.resurrect_radius_m ** 2
         best_tid: Optional[int] = None
         best_d2 = float("inf")
-        best_gate = 0.0
-        for tid, entry in self._graveyard.items():
-            gate = base_r + per_m * entry.last_range_m
-            gate2 = gate * gate
-            d = entry.centroid - centroid
+        for tid, (last_xyz, _, _) in self._graveyard.items():
+            d = last_xyz - centroid
             d2 = float(d @ d)
             if d2 < gate2 and d2 < best_d2:
                 best_d2 = d2
                 best_tid = tid
-                best_gate = gate
         if best_tid is not None:
-            entry = self._graveyard[best_tid]
-            try:
-                from common.events import emit as _emit
-                _emit("radar_track_resurrected", {
-                    "tid": int(best_tid),
-                    "was_confirmed": bool(entry.was_confirmed),
-                    "distance_m": round(float(best_d2 ** 0.5), 2),
-                    "gate_m": round(best_gate, 2),
-                    "age_s": round(
-                        (self._last_step_t or time.time()) - entry.buried_t,
-                        2),
-                    "last_range_m": round(entry.last_range_m, 2),
-                })
-            except Exception:
-                pass
             del self._graveyard[best_tid]
         return best_tid
 
@@ -909,7 +546,6 @@ class RadarClusterer:
             coasting=bool(coasting),
             hits=int(trk.hits),
             misses=int(trk.misses),
-            snr_db=float(trk.peak_snr),
         )
 
 
@@ -932,32 +568,23 @@ def _dbscan(
     """
     n = pts.shape[0]
     labels = np.full(n, -1, dtype=np.int32)
-    if n == 0:
-        return labels
     visited = np.zeros(n, dtype=bool)
+    eps_pos2 = float(eps_pos) * float(eps_pos)
 
     xyz = pts[:, :3]
     dop = pts[:, 3]
 
-    # cKDTree neighbor lists: O(N log N) instead of O(N^2). For N=500
-    # this is ~5 ms on Xavier vs ~50-100 ms for the dense matrix.
-    # Critical fix for thermal FPS drop when radar emits many points
-    # (garbage injection, busy scene, dust returns).
-    tree = cKDTree(xyz)
-    spatial_nbrs = tree.query_ball_tree(tree, r=float(eps_pos))
-
-    # Doppler gate is applied as a filter on the spatial neighbor list,
-    # not as a full N x N matrix.
-    def _dop_filter(i, neighbors):
-        d_i = dop[i]
-        return [j for j in neighbors if abs(dop[j] - d_i) <= eps_dop]
+    diff = xyz[:, None, :] - xyz[None, :, :]
+    d2 = (diff * diff).sum(axis=-1)
+    dop_ok = np.abs(dop[:, None] - dop[None, :]) <= eps_dop
+    nbrs = (d2 <= eps_pos2) & dop_ok
 
     next_label = 0
     for i in range(n):
         if visited[i]:
             continue
         visited[i] = True
-        neighbour_idxs = _dop_filter(i, spatial_nbrs[i])
+        neighbour_idxs = np.flatnonzero(nbrs[i])
         if len(neighbour_idxs) < min_samples:
             continue
         labels[i] = next_label
@@ -971,12 +598,12 @@ def _dbscan(
             if visited[j]:
                 continue
             visited[j] = True
-            j_nbrs = _dop_filter(j, spatial_nbrs[j])
+            j_nbrs = np.flatnonzero(nbrs[j])
             if len(j_nbrs) >= min_samples:
+                queue.extend(int(k) for k in j_nbrs if labels[k] == -1)
                 for k in j_nbrs:
                     if labels[k] == -1:
                         labels[k] = next_label
-                        queue.append(int(k))
             elif labels[j] == -1:
                 labels[j] = next_label
         next_label += 1

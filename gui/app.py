@@ -908,37 +908,23 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         log.warning("set_radar_mode: unknown mode %r", mode)
 
                 elif command == "ag_tune":
-                    # Legacy A/G DSP knobs — kept for event recording
-                    # compatibility. No host-side A/G DSP pipeline exists
-                    # yet; values are stored but not consumed.
+                    # A/G (mmHawkeye long-range) DSP knobs: integrate_chirps,
+                    # cfar_algo, cfar_threshold_db, capon_bf. Pushes into
+                    # the composite if available; the AG host-side processor
+                    # consumes them at frame time.
                     try:
                         params = {k: v for k, v in cmd.items()
                                   if k != "command" and v is not None}
                         state.setdefault("ag_tuning", {}).update(params)
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "update_ag_params"):
+                            try:
+                                rm.update_ag_params(**params)
+                            except Exception:
+                                log.exception("composite.update_ag_params failed")
                         emit_event("ag_tune", params)
                     except Exception:
                         log.exception("ag_tune")
-
-                elif command == "ag_cfar_apply":
-                    # Push a new on-chip CFAR threshold to the AWR2944P.
-                    # This modifies the AG cfg's cfarCfg line and triggers
-                    # a full chip reconfigure (~5 s via xds110 reset).
-                    try:
-                        thresh = float(cmd.get("cfar_threshold_db", 26.0))
-                        thresh = max(10.0, min(40.0, thresh))  # safety clamp
-                        state.setdefault("ag_tuning", {})["cfar_threshold_db"] = thresh
-                        rm = app.state.radar_manager
-                        if rm is not None and hasattr(rm, "apply_ag_cfar"):
-                            try:
-                                ok = rm.apply_ag_cfar(thresh)
-                                log.info("ag_cfar_apply: %.1f dB → %s",
-                                         thresh, "OK" if ok else "FAILED")
-                            except Exception:
-                                log.exception("ag_cfar_apply failed")
-                        emit_event("ag_cfar_apply",
-                                   {"cfar_threshold_db": thresh})
-                    except Exception:
-                        log.exception("ag_cfar_apply")
 
                 elif command == "aa_tune":
                     # A/A (PMM drone) DSP knobs: pmm_band_low_hz, pmm_band_high_hz,
@@ -1008,7 +994,6 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 cluster_eps_pos_m=cmd.get("cluster_eps_pos_m"),
                                 cluster_eps_dop_mps=cmd.get("cluster_eps_dop_mps"),
                                 cluster_min_samples=cmd.get("cluster_min_samples"),
-                                use_doppler=cmd.get("use_doppler"),
                             )
                             # Emit one event per tune. Sliders fire on
                             # every input event so this can be busy;
