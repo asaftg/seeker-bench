@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from common.logging_setup import get_logger
@@ -48,28 +49,39 @@ from radar_dca.dca_pipeline import DCAPipeline, dims_from_cfg
 log = get_logger(__name__)
 
 
+# Config groups — modes in the same group share a chip config.
+# Switching within a group is instant (host-side only).
+# Switching between groups requires chip reset + new cfg push (~3 s).
+_MODE_CFG_GROUP: Dict[str, str] = {
+    "stock": "unified",
+    "ag":    "unified",
+    "aa":    "single_tx",
+}
+
 # Per-mode RadarManager filter settings. These map directly onto
 # RadarManager.set_tuning(...) — no cfg push, no chip change, just
 # host-side filters on the TLV detection list.
-_MODE_FILTERS: Dict[str, Dict[str, float]] = {
+_MODE_FILTERS: Dict[str, Dict] = {
     "stock": {
         # Full FoV, no speed cull — same behaviour as pre-Phase-3 Seeker.
         "az_half_deg": 60.0,
         "speed_min_mps": 0.0,
+        "use_doppler": True,
     },
     "ag": {
         # Air-to-ground: narrow FoV (matches AWR2944P antenna main lobe)
-        # and dynamic-only filter (drops parked vehicles / standing
-        # humans that we'll catch with EO+thermal anyway).
+        # and dynamic-only filter. use_doppler=False → position-only
+        # clustering (avoids DDMA velocity aliasing artifacts >18 km/h).
         "az_half_deg": 25.0,
         "speed_min_mps": 0.5,
+        "use_doppler": False,
     },
     "aa": {
-        # Air-to-air: same TLV filter as stock (we still want full
-        # coverage of the sky on TLV); the new behaviour comes from
-        # also surfacing the Topic.RADAR_AA PMM stream.
+        # Air-to-air: single-TX config — TLV is dead (DSP skipped),
+        # only the DCA raw-ADC pipeline produces output.
         "az_half_deg": 60.0,
         "speed_min_mps": 0.0,
+        "use_doppler": True,
     },
 }
 
@@ -113,6 +125,15 @@ class CompositeRadarBackend:
         if self._mode not in _MODE_FILTERS:
             self._mode = "stock"
         self._lock = threading.RLock()
+
+        # Config paths for chip reconfiguration. Stock/AG share
+        # "unified" (DDMA 4-TX), AA uses "single_tx" (TX0 only).
+        # Derive single-TX path from the unified cfg's directory.
+        cfg_dir = Path(radar.cfg_path).parent
+        self._cfg_paths: Dict[str, str] = {
+            "unified":   str(radar.cfg_path),
+            "single_tx": str(cfg_dir / "awr2944P_pmm_fpv.cfg"),
+        }
         # Hand the pipeline back-refs so its LVDS stall watchdog can
         # do the FULL recovery dance: reset DCA FPGA + kick chip cfg.
         # The chip on this firmware emits LVDS in bursts then halts;
@@ -296,12 +317,11 @@ class CompositeRadarBackend:
 
     # ─────────────────────── mode dispatch ──────────────────────────────
     def set_mode(self, mode: str) -> str:
-        """Change the host-side mode filter. Returns the mode that was
-        actually applied (echoes the input on success, returns the
-        previous mode if the input was invalid).
+        """Change the radar mode. Returns the applied mode string.
 
-        No chip interaction. No power-cycle. Idempotent — calling with
-        the current mode is a no-op and returns the current mode."""
+        Within a config group (e.g. stock↔ag) switching is instant —
+        only host-side filters change. Across groups (stock/ag↔aa)
+        the chip is reset and a new .cfg is pushed (~3 s)."""
         target = (mode or "").lower()
         if target not in ("stock", "ag", "aa"):
             log.warning("set_mode: unknown mode %r — keeping %s", mode, self._mode)
@@ -309,19 +329,95 @@ class CompositeRadarBackend:
         with self._lock:
             if target == self._mode:
                 return self._mode
-            log.info("Composite: mode %s → %s (host-side, no chip change, sliders untouched)",
-                     self._mode, target)
+
+            old_group = _MODE_CFG_GROUP.get(self._mode, "unified")
+            new_group = _MODE_CFG_GROUP.get(target, "unified")
+
+            if old_group != new_group:
+                # Cross-group switch — reset chip and push new config.
+                log.info("Composite: mode %s → %s (config %s → %s, "
+                         "resetting chip …)",
+                         self._mode, target, old_group, new_group)
+                self._switch_chip_config(new_group)
+            else:
+                log.info("Composite: mode %s → %s (host-side only, "
+                         "no chip change)",
+                         self._mode, target)
+
             self._mode = target
+
+            # Apply per-mode host-side filters (az gate, speed gate,
+            # use_doppler). These persist until the next mode switch.
+            filters = _MODE_FILTERS.get(target, {})
+            if filters:
+                try:
+                    self._radar.set_tuning(
+                        az_half_deg=filters.get("az_half_deg"),
+                        speed_min_mps=filters.get("speed_min_mps"),
+                        use_doppler=filters.get("use_doppler"),
+                    )
+                    log.info("Composite: applied host filters for mode "
+                             "%s: %s", target,
+                             {k: v for k, v in filters.items()})
+                except Exception:
+                    log.exception("Composite: set_tuning for mode %s "
+                                  "failed", target)
+
             # Forward mode to the DCA pipeline so its _publish gate works.
-            # Was previously writing _publish_enabled which the pipeline
-            # never reads — dead code, the gate didn't fire and PMM hits
-            # flooded the GUI in stock mode.
             if self._dca_pipeline is not None:
                 try:
                     self._dca_pipeline.set_mode(target)
                 except Exception:
                     log.exception("dca_pipeline.set_mode(%s) failed", target)
         return self._mode
+
+    def _switch_chip_config(self, cfg_group: str) -> bool:
+        """Reset chip and push a new config for cross-group mode switch.
+
+        Sequence: stop RadarManager → update cfg_path → xds110 reset →
+        wait for chip boot → re-arm DCA1000 → restart RadarManager
+        (whose capture loop will push the new cfg on first iteration).
+
+        Takes ~3 s. Called with self._lock held.
+        """
+        new_cfg = self._cfg_paths.get(cfg_group)
+        if not new_cfg:
+            log.error("Composite: no cfg path for group %r", cfg_group)
+            return False
+
+        log.info("Composite: switching chip config → %s (%s)",
+                 cfg_group, new_cfg)
+
+        # 1. Stop radar threads (closes data port, joins threads).
+        try:
+            self._radar.stop()
+        except Exception:
+            log.exception("Composite: radar stop failed during "
+                          "config switch")
+
+        # 2. Point RadarManager at the new config file.
+        self._radar.cfg_path = new_cfg
+
+        # 3. Reset chip via xds110 so it boots to INIT state.
+        #    (This firmware can't reconfigure from STOPPED — only INIT.)
+        ok = self._radar._run_xds110_reset()
+        if not ok:
+            log.error("Composite: xds110 reset failed during "
+                      "config switch — restarting with old cfg")
+            self._radar.start()
+            return False
+
+        # 4. Wait for chip + USB CDC to re-enumerate.
+        time.sleep(2.0)
+
+        # 5. Re-arm DCA1000 FPGA (LVDS source vanished during reset).
+        self._rearm_dca_after_chip_reset()
+
+        # 6. Restart RadarManager — capture loop pushes new cfg.
+        self._radar.start()
+
+        log.info("Composite: config switch to %s complete", cfg_group)
+        return True
 
     # ─────────────────────── live-tune knobs ────────────────────────────
     def update_aa_params(self, **kwargs: Any) -> None:

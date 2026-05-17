@@ -994,6 +994,7 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                                 cluster_eps_pos_m=cmd.get("cluster_eps_pos_m"),
                                 cluster_eps_dop_mps=cmd.get("cluster_eps_dop_mps"),
                                 cluster_min_samples=cmd.get("cluster_min_samples"),
+                                use_doppler=cmd.get("use_doppler"),
                             )
                             # Emit one event per tune. Sliders fire on
                             # every input event so this can be busy;

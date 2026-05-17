@@ -155,6 +155,7 @@ class RadarManager:
         cluster_eps_pos_m: Optional[float] = None,
         cluster_eps_dop_mps: Optional[float] = None,
         cluster_min_samples: Optional[int] = None,
+        use_doppler: Optional[bool] = None,
     ) -> None:
         """Hot-update filter + cluster knobs without a manager restart.
 
@@ -180,6 +181,8 @@ class RadarManager:
                 cp.eps_dop_mps = float(cluster_eps_dop_mps)
             if cluster_min_samples is not None:
                 cp.min_samples = int(cluster_min_samples)
+            if use_doppler is not None:
+                cp.use_doppler = bool(use_doppler)
 
     def set_extrinsic(
         self,
@@ -235,6 +238,7 @@ class RadarManager:
             "cluster_min_samples": cp.min_samples,
             "az_bias_deg": self.az_bias_deg,
             "el_bias_deg": self.el_bias_deg,
+            "use_doppler": cp.use_doppler,
         }
 
     # ─────────────────────── lifecycle ───────────────────────

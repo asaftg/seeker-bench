@@ -121,6 +121,20 @@ class ClusterParams:
     # can't fix.
     graveyard_ttl_s: float = 4.0
     resurrect_radius_m: float = 12.0
+    # 2026-05-12 graveyard upgrades
+    bury_unconfirmed: bool = True
+    graveyard_unconfirmed_ttl_s: float = 2.0
+    resurrect_radius_per_meter: float = 0.08
+    # Post-DBSCAN merge
+    post_dbscan_merge_enabled: bool = True
+    cluster_merge_dist_m: float = 5.0
+    cluster_merge_dist_per_meter: float = 0.05
+    cluster_merge_max_doppler_diff_mps: float = 2.0
+    # Position-only clustering — when False, DBSCAN ignores Doppler
+    # entirely and the Kalman tracker initialises with zero velocity
+    # (velocity is inferred from position deltas at 20 Hz instead).
+    # Fixes velocity aliasing artifacts at >18 km/h (DDMA Vmax).
+    use_doppler: bool = True
 
 
 class _Tracklet:
@@ -297,7 +311,8 @@ class RadarClusterer:
         labels = _dbscan(
             pts,
             eps_pos=self.params.eps_pos_m,
-            eps_dop=self.params.eps_dop_mps,
+            eps_dop=(self.params.eps_dop_mps if self.params.use_doppler
+                     else 1e9),
             min_samples=self.params.min_samples,
         )
 
@@ -323,9 +338,15 @@ class RadarClusterer:
             np.clip(half, self.params.min_size_m, self.params.max_size_m, out=half)
 
             # Radial-doppler → 3D velocity hint along the sensor ray.
-            r = max(float(np.linalg.norm(centroid)), 1e-3)
-            dir_hat = centroid / r
-            vel = dir_hat * float(ds.mean())
+            # When use_doppler is off, init with zero — the Kalman will
+            # converge velocity from position deltas in 2-3 frames at
+            # 20 Hz (tracks up to ~216 km/h with a 3m assoc gate).
+            if self.params.use_doppler:
+                r = max(float(np.linalg.norm(centroid)), 1e-3)
+                dir_hat = centroid / r
+                vel = dir_hat * float(ds.mean())
+            else:
+                vel = np.zeros(3, dtype=np.float64)
             frame_clusters.append((cid, centroid, half, vel, len(idxs)))
 
         # Associate largest clusters first (greedy).
