@@ -125,7 +125,7 @@ class DCAControl:
                 "dataCaptureMode": "ethernetStream",
                 "lvdsMode": 1,
                 "dataFormatMode": 3,
-                "packetDelay_us": 200,  # 25 → 75 → 200 escalation
+                "packetDelay_us": 25,  # was 200 — caused 5 Hz throttle (810 pkts/frame × 200us = 162ms = ~6Hz max). Original working value.
                 "ethernetConfig": {
                     "DCA1000IPAddress": self.dca_ip,
                     "DCA1000ConfigPort": self.config_port,

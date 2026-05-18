@@ -427,15 +427,17 @@ class CompositeRadarBackend:
         if self._dca_pipeline is None:
             return
         if "pmm_band_low_hz" in kwargs:
-            self._dca_pipeline._pmm_band_low = float(kwargs["pmm_band_low_hz"])
+            self._dca_pipeline.params.pmm_band_low_hz = float(kwargs["pmm_band_low_hz"])
         if "pmm_band_high_hz" in kwargs:
-            self._dca_pipeline._pmm_band_high = float(kwargs["pmm_band_high_hz"])
+            self._dca_pipeline.params.pmm_band_high_hz = float(kwargs["pmm_band_high_hz"])
         if "pmm_threshold_db" in kwargs:
-            self._dca_pipeline._pmm_threshold = float(kwargs["pmm_threshold_db"])
+            self._dca_pipeline.params.pmm_threshold_db = float(kwargs["pmm_threshold_db"])
         if "pmm_slow_time_win" in kwargs:
-            self._dca_pipeline._pmm_slow_time_win = int(kwargs["pmm_slow_time_win"])
+            self._dca_pipeline.params.pmm_slow_time_win = int(kwargs["pmm_slow_time_win"])
         if "staggered_prf" in kwargs:
             self._dca_pipeline._staggered_prf = bool(kwargs["staggered_prf"])
+        if "pmm_n_frames_buf" in kwargs:
+            self._dca_pipeline.set_params(pmm_n_frames_buf=int(kwargs["pmm_n_frames_buf"]))
 
     def update_ag_params(self, **kwargs: Any) -> None:
         """Update A/G long-range processor knobs (host-side raw-ADC
@@ -446,6 +448,101 @@ class CompositeRadarBackend:
         for k in ("integrate_chirps", "cfar_algo", "cfar_threshold_db", "capon_bf"):
             if k in kwargs:
                 setattr(self._dca_pipeline, "_ag_" + k, kwargs[k])
+
+    # ─────────────────────── on-chip tuning (CFAR / AoA FoV) ────────────
+
+    def apply_ag_cfar(self, threshold_db: float) -> bool:
+        """Modify the unified cfg's range-CFAR threshold and reconfigure
+        the chip.
+
+        The cfarCfg line for range direction (procDirection=1) has the
+        threshold at field index 8 (0-indexed from 'cfarCfg'). We rewrite
+        that field in the cfg file on disk, then trigger a chip reset +
+        re-push so the change takes effect immediately.
+
+        Returns True if the reconfigure succeeded.
+        """
+        import re as _re
+
+        cfg_path = self._cfg_paths.get("unified")
+        if not cfg_path:
+            log.error("apply_ag_cfar: no unified cfg path")
+            return False
+
+        from pathlib import Path as _Path
+        cfg_file = _Path(cfg_path)
+        if not cfg_file.exists():
+            log.error("apply_ag_cfar: %s not found", cfg_file)
+            return False
+
+        text = cfg_file.read_text()
+
+        # Match range-direction cfarCfg (procDirection=1, second field)
+        def replace_range_cfar(m):
+            fields = m.group(0).split()
+            # fields[8] is thresholdScale for range CFAR
+            fields[8] = f"{threshold_db:.1f}"
+            return " ".join(fields)
+
+        new_text = _re.sub(
+            r"^cfarCfg\s+-1\s+1\s+.*$",
+            replace_range_cfar,
+            text,
+            flags=_re.MULTILINE,
+        )
+
+        if new_text == text:
+            log.warning("apply_ag_cfar: no range cfarCfg line matched")
+            return False
+
+        cfg_file.write_text(new_text)
+        log.info("apply_ag_cfar: wrote %.1f dB to %s", threshold_db, cfg_file.name)
+
+        # Reconfigure: reset chip and push modified cfg
+        return self._switch_chip_config("unified")
+
+    def apply_ag_aoa(self, az_half_deg: float) -> bool:
+        """Modify the unified cfg's aoaFovCfg azimuth limits and
+        reconfigure the chip.
+
+        aoaFovCfg format: aoaFovCfg <subFrameIdx> <minAz> <maxAz> <minEl> <maxEl>
+        We set minAz = -az_half_deg, maxAz = +az_half_deg, leave el at ±90.
+        """
+        import re as _re
+
+        cfg_path = self._cfg_paths.get("unified")
+        if not cfg_path:
+            log.error("apply_ag_aoa: no unified cfg path")
+            return False
+
+        from pathlib import Path as _Path
+        cfg_file = _Path(cfg_path)
+        if not cfg_file.exists():
+            log.error("apply_ag_aoa: %s not found", cfg_file)
+            return False
+
+        text = cfg_file.read_text()
+        az_int = int(az_half_deg)
+
+        def replace_aoa(m):
+            return "aoaFovCfg -1 -%d %d -90 90" % (az_int, az_int)
+
+        new_text = _re.sub(
+            r"^aoaFovCfg\s+-1\s+.*$",
+            replace_aoa,
+            text,
+            flags=_re.MULTILINE,
+        )
+
+        if new_text == text:
+            log.warning("apply_ag_aoa: no aoaFovCfg line matched")
+            return False
+
+        cfg_file.write_text(new_text)
+        log.info("apply_ag_aoa: wrote +/-%d deg to %s", az_int, cfg_file.name)
+
+        # Reconfigure: reset chip and push modified cfg
+        return self._switch_chip_config("unified")
 
     # ─────────────────────── diagnostics ────────────────────────────────
     def diagnostics(self) -> Dict[str, Any]:
@@ -531,10 +628,12 @@ class CompositeRadarBackend:
                     "last_drone_blade_freq_hz": stats.last_drone_blade_freq_hz,
                     # Echo the live PMM tuning so we can see what
                     # threshold the detector is actually using.
-                    "pmm_band_low_hz": getattr(self._dca_pipeline, "_pmm_band_low", None),
-                    "pmm_band_high_hz": getattr(self._dca_pipeline, "_pmm_band_high", None),
-                    "pmm_threshold_db": getattr(self._dca_pipeline, "_pmm_threshold", None),
-                    "pmm_slow_time_win": getattr(self._dca_pipeline, "_pmm_slow_time_win", None),
+                    "pmm_band_low_hz": getattr(self._dca_pipeline.params, "pmm_band_low_hz", None),
+                    "pmm_band_high_hz": getattr(self._dca_pipeline.params, "pmm_band_high_hz", None),
+                    "pmm_threshold_db": getattr(self._dca_pipeline.params, "pmm_threshold_db", None),
+                    "pmm_slow_time_win": getattr(self._dca_pipeline.params, "pmm_slow_time_win", None),
+                    "pmm_n_frames_buf": getattr(self._dca_pipeline.params, "pmm_n_frames_buf", None),
+                    "n_tx_slots": getattr(self._dca_pipeline._dims, "n_tx_slots", None) if self._dca_pipeline._dims else None,
                 }
             except Exception as e:
                 d["aa"] = {"error": str(e)}

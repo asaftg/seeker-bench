@@ -314,6 +314,14 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                 emit_event("device_changed", {"sensor": "eo", "idx": idx})
             except Exception:
                 pass
+        # ── Digital zoom (1/2/4/8) ──
+        if "zoom_level" in body:
+            try:
+                zl = int(body["zoom_level"])
+                em.set_zoom_level(zl)
+                log.info("EO zoom_level -> %dx", zl)
+            except Exception as exc:
+                log.warning("EO set_zoom_level failed: %s", exc)
         return {"device_index": em.device_index}
 
     @app.post("/api/config/eo_exposure")
@@ -897,7 +905,9 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         rm = app.state.radar_manager
                         if rm is not None and hasattr(rm, "set_mode"):
                             try:
-                                rm.set_mode(mode)
+                                import asyncio
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, rm.set_mode, mode)
                             except Exception:
                                 log.exception("composite.set_mode failed")
                         try:
@@ -943,6 +953,46 @@ def create_app(thermal_manager=None, eo_manager=None, gimbal_manager=None,
                         emit_event("aa_tune", params)
                     except Exception:
                         log.exception("aa_tune")
+
+                elif command == "ag_cfar_apply":
+                    # Push a new on-chip CFAR threshold to the AWR2944P.
+                    # Modifies cfarCfg in unified cfg and reconfigures (~5 s).
+                    try:
+                        threshold = float(cmd.get("cfar_threshold_db", 20))
+                        threshold = max(3.0, min(40.0, threshold))
+                        state.setdefault("ag_tuning", {})["cfar_threshold_db"] = threshold
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "apply_ag_cfar"):
+                            try:
+                                ok = rm.apply_ag_cfar(threshold)
+                                log.info("ag_cfar_apply: %.1f dB → %s",
+                                         threshold, "OK" if ok else "FAILED")
+                            except Exception:
+                                log.exception("ag_cfar_apply failed")
+                        emit_event("ag_cfar_apply",
+                                   {"cfar_threshold_db": threshold})
+                    except Exception:
+                        log.exception("ag_cfar_apply")
+
+                elif command == "ag_aoa_apply":
+                    # Push a new on-chip AoA FoV to the AWR2944P.
+                    # Modifies aoaFovCfg in unified cfg and reconfigures (~5 s).
+                    try:
+                        az = float(cmd.get("az_half_deg", 90))
+                        az = max(10.0, min(90.0, az))
+                        state.setdefault("ag_tuning", {})["aoa_az_half_deg"] = az
+                        rm = app.state.radar_manager
+                        if rm is not None and hasattr(rm, "apply_ag_aoa"):
+                            try:
+                                ok = rm.apply_ag_aoa(az)
+                                log.info("ag_aoa_apply: +/-%.0f deg → %s",
+                                         az, "OK" if ok else "FAILED")
+                            except Exception:
+                                log.exception("ag_aoa_apply failed")
+                        emit_event("ag_aoa_apply",
+                                   {"az_half_deg": az})
+                    except Exception:
+                        log.exception("ag_aoa_apply")
 
                 elif command == "save_radar_mode_config":
                     # Persist the current per-mode slider values to disk

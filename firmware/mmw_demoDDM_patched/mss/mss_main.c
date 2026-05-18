@@ -2891,6 +2891,14 @@ int32_t MmwDemo_getNumEmptySubBands(uint32_t numTxAntennas){
         case 4:
             numBandsEmpty = 2;
             break;
+        case 1:
+            /* SEEKER PATCH 2026-05-16: single-TX (non-DDMA) raw-capture cfg.
+             * One occupied band, zero empty bands. Without this case a 1-TX
+             * cfg falls through to default and returns -1, which poisons
+             * numBandsTotal (-> 0) and numTxTotalDivisor (-> 0, a
+             * divide-by-zero in configPhaseShifterChirps). */
+            numBandsEmpty = 0;
+            break;
         default:
             numBandsEmpty = -1;
             goto exit;
@@ -2914,10 +2922,25 @@ exit:
 int32_t MmwDemo_configSensor(void)
 {
     int32_t     errCode = 0;
+    uint8_t     numTxEnabled =
+        mathUtils_countSetBits(gMmwMssMCB.cfg.openCfg.chCfg.txChannelEn);
 
-    errCode = MmwDemo_configPhaseShifterChirps();
-    if(errCode != 0){
-        goto exit;
+    /* SEEKER PATCH 2026-05-16: phase-shifter chirps implement the DDMA
+     * Doppler-division and are only meaningful for a multi-TX config. For a
+     * single-TX raw-capture cfg there is nothing to phase-shift, and running
+     * configPhaseShifterChirps() would compute numTxTotalDivisor = 0 and
+     * divide by zero. Skip it for <=1 TX; set numEmptySubBands directly so the
+     * downstream numBandsTotal / TLV numDopFFTSubBins computations stay sane. */
+    if (numTxEnabled > 1)
+    {
+        errCode = MmwDemo_configPhaseShifterChirps();
+        if(errCode != 0){
+            goto exit;
+        }
+    }
+    else
+    {
+        gMmwMssMCB.numEmptySubBands = MmwDemo_getNumEmptySubBands(numTxEnabled);
     }
 
     /* Configure the mmWave module: */

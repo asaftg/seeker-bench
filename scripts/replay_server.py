@@ -6,21 +6,21 @@ it were live. The browser opens ``http://localhost:8081/`` and sees
 the same dashboard layout, sensors, gimbal motion, and fused tracks
 that were captured — at the original timestamps.
 
-No Foxglove, no new viewer, just FastAPI + WebSocket re-emitting
-captured frames into the existing static SPA.
+The GUI exposes a bottom control bar in replay mode: pause/play, a
+seek slider, and a speed dropdown. Commands flow client→server over
+the same /ws/sensors WebSocket as JSON `{cmd: ...}` messages.
 
 URL params on /ws/sensors:
     speed=<float>   playback rate; 1.0 = real-time, 2.0 = double-speed.
-                    Defaults to 1.0.
-    from=<float>    seconds offset from session start to begin from.
-                    Defaults to 0.
+                    Defaults to 1.0. Live speed changes are sent over
+                    the WS as `{cmd:"speed", v:<float>}`.
 
 Limitations vs. live:
     - The fused-track projections onto thermal/EO panels (bbox_thermal,
       bbox_eo) are NOT rebuilt; the GUI just won't draw them. Raw
       sensor detections + radar boxes still render.
     - Live gimbal commands from the browser are ignored — this is a
-      replay, not a sandbox. (Easy follow-up if the use case appears.)
+      replay, not a sandbox.
 
 Usage:
     python scripts/replay_server.py --latest
@@ -31,11 +31,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
 # Add project root so the static dir resolves the same way as in
 # gui/app.py.
@@ -161,7 +162,8 @@ def _fused_wire(msg: Dict[str, Any]) -> list:
 # Replay engine — single in-memory ordered timeline
 # ──────────────────────────────────────────────────────────────
 class _Timeline:
-    """All records in (ts_ns, channel, msg) order, plus latest-by-channel."""
+    """All records in (ts_ns, channel, msg) order, plus precomputed
+    seek lookup arrays."""
 
     def __init__(self, path: str) -> None:
         self.records: list[tuple[int, str, dict]] = []
@@ -178,17 +180,20 @@ class _Timeline:
             if self.first_ts_ns is None:
                 self.first_ts_ns = ts
             self.last_ts_ns = ts
+        # rel_ns[i] = offset of record i from session start, in ns.
+        # Used by index_at() for O(log N) seek.
+        first = self.first_ts_ns or 0
+        self.rel_ns: list[int] = [t - first for t, _, _ in self.records]
+        last = self.last_ts_ns or first
+        self.duration_s: float = max(0.0, (last - first) / 1e9)
+
+    def index_at(self, t_s: float) -> int:
+        target_ns = int(max(0.0, t_s) * 1e9)
+        return bisect.bisect_left(self.rel_ns, target_ns)
 
 
-async def _stream(ws: WebSocket, tl: _Timeline,
-                  speed: float, from_offset_s: float) -> None:
-    if not tl.records or tl.first_ts_ns is None:
-        await ws.send_json({"error": "empty recording"})
-        return
-
-    base_ts_ns = tl.first_ts_ns + int(from_offset_s * 1e9)
-    # Latest-by-channel snapshots feed the next outgoing envelope.
-    latest = {
+def _empty_latest() -> Dict[str, Any]:
+    return {
         "thermal/frame": _empty_thermal(),
         "eo/frame": _empty_eo(),
         "radar/frame": _empty_radar(),
@@ -196,75 +201,305 @@ async def _stream(ws: WebSocket, tl: _Timeline,
         "fusion/tracks": {"tracks": []},
     }
 
-    # Pacing: emit a wire envelope at the rate the underlying record
-    # stream produces frames, but advance simulated wall-clock at
-    # speed×real. We tick once per record; on every "frame" record
-    # we batch up the envelope and send it. Events get folded as a
-    # synthetic "event" message in the envelope.
-    sim_t0 = asyncio.get_event_loop().time()
-    rec_t0_ns = base_ts_ns
-    pending_events: list[dict] = []
-    for ts, ch, msg in tl.records:
-        if ts < base_ts_ns:
-            continue
-        # Sleep until this record's wall-clock target.
-        target_dt = (ts - rec_t0_ns) / 1e9 / max(0.01, speed)
-        now_dt = asyncio.get_event_loop().time() - sim_t0
-        sleep_s = target_dt - now_dt
-        if sleep_s > 0:
+
+# Browser refresh-rate ceiling. Source records arrive at ~55 Hz at 1x,
+# scaling linearly with speed (≈220 Hz at 4x) — far past what the JS
+# thread can JSON-parse + base64-decode + render. Cap natural-playback
+# emissions here so 2x/4x actually feel faster: each emitted envelope
+# carries the latest state across all dropped sub-frames, trading
+# per-record fidelity for smooth wall-clock pacing.
+_EMIT_INTERVAL_S = 1.0 / 60.0
+
+
+# ──────────────────────────────────────────────────────────────
+# Player session — one per WebSocket connection. Owns playback
+# state machine: pause/play/seek/speed driven by inbound WS commands.
+# ──────────────────────────────────────────────────────────────
+class _PlayerSession:
+    def __init__(self, tl: _Timeline, speed: float = 1.0) -> None:
+        self.tl = tl
+        self.speed: float = max(0.01, float(speed))
+        self.current_index: int = 0
+        self.playhead_t_s: float = 0.0
+        self.is_paused: bool = False
+        self.latest: Dict[str, Any] = _empty_latest()
+        self.pending_events: list = []
+        # wake fires on any command arrival, breaking out of the
+        # interruptible asyncio.wait_for(wake) sleep so the loop can
+        # pick the command up before emitting the next envelope.
+        self.wake = asyncio.Event()
+        self.cmd_queue: asyncio.Queue = asyncio.Queue()
+        # Wall-clock anchor: at this loop.time(), the playhead is 0 s.
+        # Re-anchored by play/seek/speed.
+        self.wall_origin: float = 0.0
+        self._done_sent = False
+        # Last envelope emit timestamp (loop.time()) — used to rate-cap
+        # the run loop at _EMIT_INTERVAL_S so 4x doesn't drown the
+        # browser. Updated inside _send_envelope so command-driven
+        # snapshots also push back the next natural emit.
+        self._last_emit_t: float = 0.0
+
+    # ── inbound commands ─────────────────────────────────────
+    def submit(self, cmd: dict) -> None:
+        try:
+            self.cmd_queue.put_nowait(cmd)
+        except asyncio.QueueFull:
+            return
+        self.wake.set()
+
+    async def _apply_cmd(self, cmd: dict, ws: WebSocket) -> None:
+        loop = asyncio.get_event_loop()
+        name = cmd.get("cmd")
+        if name == "pause":
+            self.is_paused = True
+        elif name == "play":
+            self.is_paused = False
+            self.wall_origin = loop.time() - self.playhead_t_s / self.speed
+        elif name == "seek":
             try:
-                await asyncio.sleep(sleep_s)
-            except asyncio.CancelledError:
+                t = float(cmd.get("t_s", 0.0))
+            except (TypeError, ValueError):
                 return
+            self._do_seek(t)
+        elif name == "speed":
+            try:
+                v = float(cmd.get("v", 1.0))
+            except (TypeError, ValueError):
+                return
+            v = max(0.01, v)
+            self.wall_origin = loop.time() - self.playhead_t_s / v
+            self.speed = v
+        else:
+            return  # unknown command — don't broadcast
 
-        if ch in latest:
-            latest[ch] = msg
+        # Broadcast new state. Critical for pause/speed-while-paused
+        # because the run loop parks without emitting in those states,
+        # so the GUI would otherwise never see the flag flip.
+        try:
+            await self._send_envelope(ws, seeked=(name == "seek"))
+        except (WebSocketDisconnect, RuntimeError):
+            pass
 
-        if ch == "events":
-            pending_events.append(
-                {"ts_ns": ts, "type": msg.get("type"),
-                 "payload": msg.get("payload")})
-            # Don't emit a full envelope on event-only ticks; flush
-            # events with the next sensor frame to keep the client
-            # rate sane.
-            continue
+    def _do_seek(self, t_s: float) -> None:
+        loop = asyncio.get_event_loop()
+        duration = self.tl.duration_s
+        # Clamp to [0, duration); stay just before end so we don't
+        # immediately re-trigger replay_done.
+        t = max(0.0, min(t_s, max(0.0, duration - 1e-6)))
+        target_idx = self.tl.index_at(t)
+        target_idx = min(target_idx, len(self.tl.records))
+        # Rebuild `latest` by replaying records [0, target_idx) — the
+        # only correct way to compute state-at-time-t after a backward
+        # seek, since the running `latest` accumulates forward only.
+        self.latest = _empty_latest()
+        for i in range(target_idx):
+            _ts, ch, msg = self.tl.records[i]
+            if ch in self.latest:
+                self.latest[ch] = msg
+        self.current_index = target_idx
+        self.playhead_t_s = t
+        # Past events are not replayed — clear the buffer rather than
+        # flush stale entries the GUI's append-only event log would
+        # treat as fresh.
+        self.pending_events = []
+        self.wall_origin = loop.time() - t / self.speed
+        self._done_sent = False
 
-        # On every frame-shaped record, build + send the envelope.
+    # ── outbound envelope ────────────────────────────────────
+    async def _send_envelope(self, ws: WebSocket, *, seeked: bool = False) -> None:
+        if self.current_index < len(self.tl.records):
+            ts = self.tl.records[self.current_index][0]
+        elif self.tl.last_ts_ns is not None:
+            ts = self.tl.last_ts_ns
+        else:
+            ts = 0
         envelope = {
             "ts": ts / 1e9,
-            "thermal": latest["thermal/frame"],
-            "eo": _eo_wire(latest["eo/frame"]),
-            "radar": _radar_wire(latest["radar/frame"]),
-            "fused": _fused_wire(latest["fusion/tracks"]),
+            "thermal": self.latest["thermal/frame"],
+            "eo": _eo_wire(self.latest["eo/frame"]),
+            "radar": _radar_wire(self.latest["radar/frame"]),
+            "fused": _fused_wire(self.latest["fusion/tracks"]),
             "tracks": [],
-            "top_targets": _fused_wire(latest["fusion/tracks"])[:5],
-            "main_target_id": latest["gimbal/state"].get("tracked_target_id"),
-            "gimbal": _gimbal_wire(latest["gimbal/state"]),
+            "top_targets": _fused_wire(self.latest["fusion/tracks"])[:5],
+            "main_target_id": self.latest["gimbal/state"].get("tracked_target_id"),
+            "gimbal": _gimbal_wire(self.latest["gimbal/state"]),
             "recording": False,
             "replay": True,
-            "replay_t_s": (ts - tl.first_ts_ns) / 1e9,
-            "events": pending_events,
+            # replay_t_s kept as alias of playhead_t_s for the existing
+            # _setReplayBadge clock in main.js.
+            "replay_t_s": self.playhead_t_s,
+            "playhead_t_s": self.playhead_t_s,
+            "duration_s": self.tl.duration_s,
+            "is_paused": self.is_paused,
+            "speed": self.speed,
+            "events": self.pending_events,
         }
-        pending_events = []
-        try:
-            await ws.send_text(json.dumps(envelope, default=str))
-        except WebSocketDisconnect:
-            return
-        except RuntimeError:
-            return
+        if seeked:
+            envelope["seeked"] = True
+        self.pending_events = []
+        await ws.send_text(json.dumps(envelope, default=str))
+        # Track last emit so the run loop's rate cap knows when to skip.
+        # Cmd-driven snapshots count too — they push back the next
+        # natural emit by one interval, avoiding back-to-back floods.
+        self._last_emit_t = asyncio.get_event_loop().time()
 
-    # Recording exhausted — send a sentinel and drop.
+    # ── main loop ────────────────────────────────────────────
+    async def run(self, ws: WebSocket) -> None:
+        if not self.tl.records or self.tl.first_ts_ns is None:
+            try:
+                await ws.send_json({"error": "empty recording"})
+            except Exception:
+                pass
+            return
+        loop = asyncio.get_event_loop()
+        self.wall_origin = loop.time()  # playhead 0 ↔ now
+
+        while True:
+            # Drain any pending commands (pause/play/seek/speed).
+            while not self.cmd_queue.empty():
+                try:
+                    cmd = self.cmd_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await self._apply_cmd(cmd, ws)
+
+            # End-of-timeline park: emit replay_done once, then wait
+            # for a command (typically a backward seek).
+            if self.current_index >= len(self.tl.records):
+                if not self._done_sent:
+                    self.is_paused = True
+                    try:
+                        await ws.send_json({"replay_done": True})
+                    except (WebSocketDisconnect, RuntimeError):
+                        return
+                    self._done_sent = True
+                self.wake.clear()
+                try:
+                    await self.wake.wait()
+                except asyncio.CancelledError:
+                    return
+                continue
+
+            # Pause park.
+            if self.is_paused:
+                self.wake.clear()
+                try:
+                    await self.wake.wait()
+                except asyncio.CancelledError:
+                    return
+                continue
+
+            ts, ch, msg = self.tl.records[self.current_index]
+            # Refresh playhead at the top of every tick — keeps a
+            # subsequent pause re-anchor from reading a stale value.
+            self.playhead_t_s = (ts - self.tl.first_ts_ns) / 1e9
+
+            # Sleep until target wall time, interruptible via wake.
+            target_dt = self.playhead_t_s / self.speed
+            now_dt = loop.time() - self.wall_origin
+            sleep_s = target_dt - now_dt
+            if sleep_s > 0:
+                self.wake.clear()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), timeout=sleep_s)
+                    # Woken by a command — re-loop without advancing
+                    # so the command applies before the next emit.
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    return
+
+            if ch in self.latest:
+                self.latest[ch] = msg
+
+            if ch == "events":
+                self.pending_events.append({
+                    "ts_ns": ts,
+                    "type": msg.get("type"),
+                    "payload": msg.get("payload"),
+                })
+                # Don't emit on event-only ticks; flush with the next
+                # frame to keep client rate sane.
+                self.current_index += 1
+                continue
+
+            # Rate cap: drop natural emits that would arrive faster than
+            # 60 Hz. The dropped record's data is already folded into
+            # `latest` above, so the next non-dropped emit carries it.
+            # This is what makes 2x/4x actually feel faster instead of
+            # "stuck" — the browser stops choking on the JPEG flood.
+            if (loop.time() - self._last_emit_t) < _EMIT_INTERVAL_S:
+                self.current_index += 1
+                continue
+
+            try:
+                await self._send_envelope(ws)
+            except (WebSocketDisconnect, RuntimeError):
+                return
+            except Exception:
+                return
+            self.current_index += 1
+
+
+# ──────────────────────────────────────────────────────────────
+# Auto-shutdown — when every browser tab closes, exit the server so
+# the user doesn't have to manually kill the cmd window between runs.
+# ──────────────────────────────────────────────────────────────
+_active_conns: int = 0
+_shutdown_task: Optional[asyncio.Task] = None
+_AUTO_SHUTDOWN_GRACE_S = 2.0
+
+
+async def _auto_shutdown_after_grace() -> None:
     try:
-        await ws.send_json({"replay_done": True})
-    except Exception:
-        pass
+        await asyncio.sleep(_AUTO_SHUTDOWN_GRACE_S)
+    except asyncio.CancelledError:
+        return
+    if _active_conns == 0:
+        # Hard exit beats a graceful uvicorn shutdown here — the server
+        # has no persistent state to flush and the user just wants the
+        # cmd window to close.
+        print("[replay] no clients — shutting down")
+        os._exit(0)
+
+
+def _on_connect() -> None:
+    global _active_conns, _shutdown_task
+    _active_conns += 1
+    if _shutdown_task and not _shutdown_task.done():
+        _shutdown_task.cancel()
+        _shutdown_task = None
+
+
+def _on_disconnect() -> None:
+    global _active_conns, _shutdown_task
+    _active_conns = max(0, _active_conns - 1)
+    if _active_conns == 0:
+        if _shutdown_task and not _shutdown_task.done():
+            _shutdown_task.cancel()
+        _shutdown_task = asyncio.create_task(_auto_shutdown_after_grace())
+
+
+async def _inbound_loop(ws: WebSocket, session: _PlayerSession) -> None:
+    while True:
+        try:
+            txt = await ws.receive_text()
+        except (WebSocketDisconnect, RuntimeError):
+            return
+        try:
+            cmd = json.loads(txt)
+        except Exception:
+            continue
+        if isinstance(cmd, dict) and cmd.get("cmd"):
+            session.submit(cmd)
 
 
 # ──────────────────────────────────────────────────────────────
 # FastAPI app
 # ──────────────────────────────────────────────────────────────
 def build_app(jsonl_path: str) -> FastAPI:
-    app = FastAPI(title="Seeker-01 Replay", version="0.1.0")
+    app = FastAPI(title="Seeker-01 Replay", version="0.2.0")
     static = _static_dir()
     if static.exists():
         app.mount("/static", StaticFiles(directory=str(static)), name="static")
@@ -281,19 +516,33 @@ def build_app(jsonl_path: str) -> FastAPI:
     @app.websocket("/ws/sensors")
     async def _ws(ws: WebSocket) -> None:
         await ws.accept()
+        _on_connect()
         speed = 1.0
-        from_offset = 0.0
         try:
-            qp = ws.query_params
-            speed = float(qp.get("speed", 1.0))
-            from_offset = float(qp.get("from", 0.0))
+            speed = float(ws.query_params.get("speed", 1.0))
         except Exception:
             pass
         tl = _Timeline(jsonl_path)
+        session = _PlayerSession(tl, speed=speed)
+
+        run_task = asyncio.create_task(session.run(ws))
+        inbound_task = asyncio.create_task(_inbound_loop(ws, session))
         try:
-            await _stream(ws, tl, speed=speed, from_offset_s=from_offset)
+            _done, pending = await asyncio.wait(
+                {run_task, inbound_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
         except WebSocketDisconnect:
-            return
+            pass
+        finally:
+            _on_disconnect()
 
     return app
 
@@ -323,8 +572,8 @@ def main() -> int:
         return 2
 
     app = build_app(path)
-    print(f"Replay → http://{args.host}:{args.port}/  (file={path})")
-    print(f"  use ?speed=2.0 on the WS to fast-forward; ?from=<s> to skip ahead")
+    print(f"Replay -> http://{args.host}:{args.port}/  (file={path})")
+    print(f"  pause/seek controls in the bottom bar; ?speed=N still works")
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0

@@ -63,6 +63,7 @@ class EOClassifier:
         fallback_model_path: str = "models/yolov8n.pt",
         conf_threshold: float = 0.40,
         imgsz: int = 640,
+        per_class_conf: dict | None = None,
     ) -> None:
         # Priority: v3 (close-targets fine-tune) > v2 (long-range only)
         # > COCO. We resolve the chain HERE so callers don't have to
@@ -86,6 +87,7 @@ class EOClassifier:
             fallback_model_path=fallback_model_path,
             conf_threshold=conf_threshold,
             imgsz=imgsz,
+            per_class_conf=per_class_conf,
         )
 
     @property

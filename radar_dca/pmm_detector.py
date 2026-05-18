@@ -73,8 +73,8 @@ class PMMResult:
 def detect_pmm(
     slow_time: np.ndarray,
     prf_hz: float,
-    band_low_hz: float = 50.0,
-    band_high_hz: float = 500.0,
+    band_low_hz: float = 100.0,
+    band_high_hz: float = 2500.0,
     threshold_db: float = 18.0,
 ) -> PMMResult:
     """Run PMM detection on a 1-D slow-time slice at one range bin.
@@ -165,31 +165,29 @@ def detect_pmm(
         return PMMResult(detected=False, band_snr_db=float("-inf"),
                          blade_freq_hz=float("nan"), confidence=0.0)
 
-    # Compute noise floor BEFORE masking the body bin: median power
-    # in bins outside the prop band around the body. This is the
-    # spectrum's "elsewhere", roughly the AWGN level.
-    half_band_max = delta_max
+    # Vectorized noise floor + sideband search (no Python loops).
+    deltas = np.arange(delta_min, delta_max + 1)
+    plus_idx = (body_bin + deltas) % n_fft
+    minus_idx = (body_bin - deltas) % n_fft
+
+    # Noise floor: median power outside the search band.
     inband_mask = np.zeros(n_fft, dtype=bool)
-    for d in range(delta_min, delta_max + 1):
-        inband_mask[(body_bin + d) % n_fft] = True
-        inband_mask[(body_bin - d) % n_fft] = True
-    inband_mask[body_bin] = True  # exclude body itself from noise estimate
+    inband_mask[plus_idx] = True
+    inband_mask[minus_idx] = True
+    inband_mask[body_bin] = True
     noise_floor = float(np.median(mag[~inband_mask] ** 2))
     if noise_floor <= 0:
         noise_floor = float(np.finfo(np.float64).tiny)
 
     # Score each candidate Δ: min of the two sideband powers, in dB
-    # vs. noise floor. Best Δ wins.
-    best_score_db = float("-inf")
-    best_delta = 0
-    for d in range(delta_min, delta_max + 1):
-        plus_idx = (body_bin + d) % n_fft
-        minus_idx = (body_bin - d) % n_fft
-        sb_pwr = min(mag[plus_idx] ** 2, mag[minus_idx] ** 2)
-        score_db = 10.0 * np.log10(max(sb_pwr, 1e-30) / noise_floor)
-        if score_db > best_score_db:
-            best_score_db = score_db
-            best_delta = d
+    # vs. noise floor. Best Δ wins. Fully vectorized.
+    plus_pwr = mag[plus_idx] ** 2
+    minus_pwr = mag[minus_idx] ** 2
+    sb_pwr = np.minimum(plus_pwr, minus_pwr)
+    scores_db = 10.0 * np.log10(np.maximum(sb_pwr, 1e-30) / noise_floor)
+    best_idx = int(np.argmax(scores_db))
+    best_score_db = float(scores_db[best_idx])
+    best_delta = int(deltas[best_idx])
 
     band_snr_db = float(best_score_db)
     detected = band_snr_db >= threshold_db
@@ -210,12 +208,117 @@ def detect_pmm(
     )
 
 
+def detect_pmm_from_mag(
+    mag: np.ndarray,
+    bin_hz: float,
+    band_low_hz: float = 100.0,
+    band_high_hz: float = 2500.0,
+    threshold_db: float = 18.0,
+) -> PMMResult:
+    """PMM detection on a pre-computed magnitude spectrum (vectorized).
+
+    Same symmetric-sideband search as ``detect_pmm``, but skips the
+    DC-subtract / Hann / FFT steps — the caller provides the magnitude
+    spectrum directly. Used by the spectral-whitening path in
+    ``_stage5_pmm`` where the background has already been normalized
+    before this function sees it.
+
+    Fully vectorized with numpy — no Python loops over candidate
+    offsets. Critical for multi-frame integration where n_fft=32768
+    and 2500+ candidate deltas per range bin.
+
+    Parameters
+    ----------
+    mag : array (n_fft,)
+        Magnitude spectrum (non-negative). May be a whitened spectrum
+        (normalized by background EMA).
+    bin_hz : float
+        Frequency resolution per FFT bin = PRF / n_fft.
+    """
+    n_fft = mag.shape[0]
+    if n_fft < 32:
+        return PMMResult(detected=False, band_snr_db=float("-inf"),
+                         blade_freq_hz=float("nan"), confidence=0.0)
+
+    body_bin = int(np.argmax(mag))
+
+    HANN_GUARD_BINS = 8
+    delta_min = max(HANN_GUARD_BINS, int(round(band_low_hz / bin_hz)))
+    delta_max = min(n_fft // 2 - 1, int(round(band_high_hz / bin_hz)))
+    if delta_min >= delta_max:
+        return PMMResult(detected=False, band_snr_db=float("-inf"),
+                         blade_freq_hz=float("nan"), confidence=0.0)
+
+    # Vectorized inband mask + noise floor.
+    deltas = np.arange(delta_min, delta_max + 1)
+    plus_idx = (body_bin + deltas) % n_fft
+    minus_idx = (body_bin - deltas) % n_fft
+    inband_mask = np.zeros(n_fft, dtype=bool)
+    inband_mask[plus_idx] = True
+    inband_mask[minus_idx] = True
+    inband_mask[body_bin] = True
+    noise_floor = float(np.median(mag[~inband_mask] ** 2))
+    if noise_floor <= 0:
+        noise_floor = float(np.finfo(np.float64).tiny)
+
+    # Vectorized symmetric sideband search.
+    plus_pwr = mag[plus_idx] ** 2
+    minus_pwr = mag[minus_idx] ** 2
+    sb_pwr = np.minimum(plus_pwr, minus_pwr)
+    scores_db = 10.0 * np.log10(np.maximum(sb_pwr, 1e-30) / noise_floor)
+    best_idx = int(np.argmax(scores_db))
+
+    band_snr_db = float(scores_db[best_idx])
+    best_delta = int(deltas[best_idx])
+    detected = band_snr_db >= threshold_db
+    blade_freq = float(best_delta * bin_hz) if best_delta > 0 else float("nan")
+
+    if band_snr_db >= threshold_db:
+        confidence = 0.5 + min(0.49, (band_snr_db - threshold_db) / 24.0)
+    else:
+        confidence = max(0.0, 0.5 * band_snr_db / threshold_db)
+
+    return PMMResult(
+        detected=detected,
+        band_snr_db=float(band_snr_db),
+        blade_freq_hz=float(blade_freq),
+        confidence=float(confidence),
+    )
+
+
+def scan_range_bins_from_mag(
+    mag_grid: np.ndarray,
+    bin_hz: float,
+    *,
+    band_low_hz: float = 100.0,
+    band_high_hz: float = 2500.0,
+    threshold_db: float = 18.0,
+) -> List[Tuple[int, PMMResult]]:
+    """Run ``detect_pmm_from_mag`` on every range bin of a pre-computed
+    magnitude grid (n_range, n_fft). Used by the temporal-subtraction
+    path where the background has already been removed.
+    """
+    if mag_grid.ndim != 2:
+        raise ValueError("expected 2-D (n_range, n_fft), got "
+                         f"shape {mag_grid.shape}")
+    n_range = mag_grid.shape[0]
+    out: List[Tuple[int, PMMResult]] = []
+    for i in range(n_range):
+        r = detect_pmm_from_mag(mag_grid[i], bin_hz,
+                                band_low_hz=band_low_hz,
+                                band_high_hz=band_high_hz,
+                                threshold_db=threshold_db)
+        if r.detected:
+            out.append((i, r))
+    return out
+
+
 def scan_range_bins(
     slow_time_2d: np.ndarray,
     prf_hz: float,
     *,
-    band_low_hz: float = 50.0,
-    band_high_hz: float = 500.0,
+    band_low_hz: float = 100.0,
+    band_high_hz: float = 2500.0,
     threshold_db: float = 18.0,
 ) -> List[Tuple[int, PMMResult]]:
     """Run ``detect_pmm`` on every range bin of a (n_range, n_chirps)

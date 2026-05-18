@@ -84,6 +84,10 @@
           <span class="hz mono" id="eo-hz">— Hz</span>
         </div>
         <div class="panel-subbar">
+          <button class="zoom-btn active" data-eo-zoom="1">1×</button>
+          <button class="zoom-btn" data-eo-zoom="2">2×</button>
+          <button class="zoom-btn" data-eo-zoom="4">4×</button>
+          <button class="zoom-btn" data-eo-zoom="8">8×</button>
           <span class="fov-label" id="eo-fov">11° HFOV</span>
           <!-- DISTANCE ESTIMATE: drag a bbox across a target's WIDTH,
                release, we compute distance from the assumed real-world
@@ -409,8 +413,14 @@
             </div>
             <div class="stat-line" style="margin-top:6px;color:var(--text-3);font-size:10px;">
               STOCK = TLV + DBSCAN (today's chain).
-              A/G = mmHawkeye-style raw-ADC long-integration (+27 dB) + OS-CFAR + Capon BF for dynamic vehicles/humans.
+              A/G = position-only clustering (no radar velocity).
               A/A = raw-ADC slow-time + propeller-sideband (PMM) drone classifier.
+            </div>
+            <div class="fusion-sub" style="margin-top:4px;">
+              <label class="fusion-toggle" title="When OFF: DBSCAN ignores Doppler velocity and Kalman tracks from position deltas only. Fixes velocity aliasing artifacts above 18 km/h. Default: OFF in A/G, ON in Stock.">
+                <input type="checkbox" id="radar-use-doppler" checked>
+                <span>Use Doppler</span>
+              </label>
             </div>
           </div>
           <div class="sensor-section">
@@ -447,38 +457,28 @@
             </div>
           </div>
 
-          <!-- A/G-only controls — mmHawkeye long-range raw-ADC pipeline.
-               Visible only when MODE = A/G. Drives radar_dca/long_range
-               processing once that's wired; for now the WS command is
-               recorded so the parameters round-trip on /events. -->
+          <!-- A/G-only controls — on-chip CFAR threshold.
+               The AWR2944P runs CFAR on its DSP; the threshold is
+               set in cfarCfg before sensorStart. Changing it requires
+               a chip reconfigure (~5 s). The slider stores the value;
+               APPLY pushes it to the chip. -->
           <div class="sensor-section radar-mode-extra" data-mode="ag" hidden>
-            <div class="section-label">A/G · raw-ADC · long range</div>
+            <div class="section-label">A/G · long range</div>
             <div class="slider-row">
-              <label class="slider-label" title="Coherent integration length. +10·log₁₀(N) dB SNR gain. 512 chirps = +27 dB vs stock 128. Frame rate drops accordingly.">INTEGRATE CHIRPS</label>
-              <input id="ag-chirps" type="range" min="128" max="512" step="128" value="512">
-              <span class="slider-val" id="ag-chirps-val">— chirps</span>
+              <label class="slider-label" title="On-chip CFAR detection threshold (dB above noise floor). Lower = more detections + more false alarms. Default 20 dB. With N=192 (96 range bins), floor is ~10-12 dB. Use slider to find empirical floor.">CFAR THRESH</label>
+              <input id="ag-cfar-thresh" type="range" min="3" max="32" step="1" value="20">
+              <span class="slider-val" id="ag-cfar-thresh-val">20 dB</span>
+            </div>
+            <div class="slider-row" style="justify-content:flex-end;">
+              <button id="ag-cfar-apply" class="btn-small" title="Push new CFAR threshold to the AWR chip (~5 s reconfigure)">APPLY</button>
             </div>
             <div class="slider-row">
-              <label class="slider-label" title="CFAR algorithm. CA = Cell-Averaging (stock). OS = Ordered-Statistic (handles non-Gaussian foliage clutter). GO = Greatest-Of.">CFAR ALGO</label>
-              <select id="ag-cfar-algo" class="slider-select">
-                <option value="ca">CA (cell-avg)</option>
-                <option value="os" selected>OS (ordered-statistic)</option>
-                <option value="go">GO (greatest-of)</option>
-              </select>
-              <span class="slider-val">—</span>
+              <label class="slider-label" title="On-chip AoA FoV half-angle. Chip only reports targets within ±this azimuth. Narrows the beam to reject sidelobes. Default ±90° (full).">CHIP FOV ±</label>
+              <input id="ag-aoa-fov" type="range" min="10" max="90" step="5" value="90">
+              <span class="slider-val" id="ag-aoa-fov-val">90°</span>
             </div>
-            <div class="slider-row">
-              <label class="slider-label" title="CFAR detection threshold (dB above noise floor). Lower = more detections, more false alarms.">CFAR THRESH</label>
-              <input id="ag-cfar-thresh" type="range" min="6" max="20" step="0.5" value="12">
-              <span class="slider-val" id="ag-cfar-thresh-val">— dB</span>
-            </div>
-            <div class="slider-row">
-              <label class="slider-label" title="Capon beamformer over the AWR2944P virtual array (~12 elements with DDM-MIMO). +8–10 dB spatial gain on dynamic targets.">CAPON BF</label>
-              <label class="fusion-toggle" style="margin:0;">
-                <input type="checkbox" id="ag-capon" checked>
-                <span>on</span>
-              </label>
-              <span class="slider-val">—</span>
+            <div class="slider-row" style="justify-content:flex-end;">
+              <button id="ag-aoa-apply" class="btn-small" title="Push new AoA FoV to the AWR chip (~5 s reconfigure)">APPLY</button>
             </div>
           </div>
 
@@ -551,6 +551,19 @@
   </section><!-- /.tab-content[dev] -->
 
 </div><!-- /.stage -->
+
+<div id="replay-bar" hidden>
+  <button id="replay-pause" class="rb-btn" title="Pause / Play (server-truth)">⏸</button>
+  <input id="replay-seek" type="range" min="0" max="0" step="0.1" value="0" title="Scrub — drag to scrub through frames">
+  <span id="replay-time" class="mono">0:00 / 0:00</span>
+  <select id="replay-speed" title="Playback speed">
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+  </select>
+</div>
 
 <script type="module" src="/static/js/main.js"></script>
 </body>

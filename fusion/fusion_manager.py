@@ -1148,14 +1148,18 @@ class FusionManager:
         trk["az"] = a_pos * trk["az"] + (1 - a_pos) * c["az"]
         trk["el"] = a_pos * trk["el"] + (1 - a_pos) * c["el"]
 
-        # ── Size EMA (faster a=0.7 by default — adapts to aspect
-        # changes during motion onset). Skip on blackout per
-        # size_freeze_during_blackout — but at this point we're
-        # MATCHED, so blackout doesn't apply here. The freeze is
-        # in the no-match decay branch (which doesn't touch size).
+        # ── Size EMA (size_alpha = CANDIDATE WEIGHT; default 0.7
+        # means 70% candidate, 30% prior — faster than the position
+        # EMA's 60% candidate weight). Adapts to aspect changes
+        # during motion onset (parked head-on → rolling side-profile)
+        # in 1-2 ticks instead of 3-4.
+        # Note convention: size_alpha here is candidate weight (0..1),
+        # the OPPOSITE of position's a_pos = old weight. This matches
+        # the Phase 4 audit's "α=0.7 faster than α=0.4" recommendation
+        # which was using the candidate-weight convention.
         a_size = self._size_alpha
-        trk["ang_w"] = a_size * trk["ang_w"] + (1 - a_size) * c["ang_w"]
-        trk["ang_h"] = a_size * trk["ang_h"] + (1 - a_size) * c["ang_h"]
+        trk["ang_w"] = (1 - a_size) * trk["ang_w"] + a_size * c["ang_w"]
+        trk["ang_h"] = (1 - a_size) * trk["ang_h"] + a_size * c["ang_h"]
 
         # ── Stamped pose (used by _publish for cam-frame output) ──
         if c.get("_pose_pan") is not None:

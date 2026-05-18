@@ -80,8 +80,20 @@ class HumanVehicleClassifier:
         conf_threshold: float = 0.40,
         classes: Optional[list] = None,
         imgsz: int = 640,
+        per_class_conf: Optional[Dict[str, float]] = None,
     ) -> None:
         self.conf_threshold = conf_threshold
+        # Optional per-class conf override applied AFTER predict.
+        # YOLO doesn't natively support per-class thresholds, so we
+        # request inference at min(conf_threshold) and then filter.
+        # Example: {"person": 0.40, "vehicle": 0.40, "drone": 0.20}.
+        self.per_class_conf: Dict[str, float] = dict(per_class_conf or {})
+        # Lower the inference floor to the minimum of any class
+        # threshold so the post-filter has something to filter.
+        if self.per_class_conf:
+            self.conf_threshold = min(
+                self.conf_threshold, min(self.per_class_conf.values())
+            )
         # Inference image size. Training was imgsz=640; running predict at 960
         # upscales the input so small/distant targets get more pixels.
         # Typical on A4000: 8ms @ 640 vs 14ms @ 960 — still ~70 Hz.
@@ -184,6 +196,10 @@ class HumanVehicleClassifier:
                 class_name = self._coco_map.get(int(cls_id))
                 if class_name is None:
                     continue
+            # Per-class conf gate (post-filter — YOLO can't do this natively)
+            cls_floor = self.per_class_conf.get(class_name)
+            if cls_floor is not None and float(conf) < cls_floor:
+                continue
             x = int(max(0, x1))
             y = int(max(0, y1))
             w = int(max(1, x2 - x1))
@@ -261,6 +277,15 @@ class HumanVehicleClassifier:
                 class_name = self._coco_map.get(int(cls_id))
                 if class_name is None:
                     continue
+            # Per-class conf gate. We allow ByteTrack to use ALL detections
+            # for association (it does its own low-conf-association via
+            # high/low track thresholds), but only emit a det to the
+            # caller if it clears the per-class floor. This means a
+            # blurred-into-noise car gets associated to its track for
+            # ID continuity, but we don't render a low-conf box for it.
+            cls_floor = self.per_class_conf.get(class_name)
+            if cls_floor is not None and float(conf) < cls_floor:
+                continue
             x = int(max(0, x1))
             y = int(max(0, y1))
             w = int(max(1, x2 - x1))

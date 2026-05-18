@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,7 +50,7 @@ from common.frames import (
 from common.logging_setup import get_logger
 from radar.clustering import ClusterParams, RadarClusterer
 from radar_dca.data_port import DataPortListener
-from radar_dca.pmm_detector import PMMResult, scan_range_bins
+from radar_dca.pmm_detector import PMMResult, scan_range_bins, scan_range_bins_from_mag
 
 log = get_logger(__name__)
 
@@ -66,6 +67,7 @@ class FrameDims:
     bytes_per_sample: int = 2
     range_resolution_m: float = 0.04
     chirp_period_s: float = 100e-6
+    n_tx_slots: int = 1  # DDM: num unique chirp indices (6 for unified)
 
     @property
     def bytes_per_chirp(self) -> int:
@@ -155,6 +157,7 @@ def dims_from_cfg_file(cfg_path: str) -> FrameDims:
         n_samples=int(n_samples),                    # type: ignore[arg-type]
         chirp_period_s=float(chirp_period_s),        # type: ignore[arg-type]
         range_resolution_m=float(range_res_m),       # type: ignore[arg-type]
+        n_tx_slots=int(chirp_indices),               # type: ignore[arg-type]
     )
 
 
@@ -186,9 +189,10 @@ class PipelineParams:
     confirm_min_hits: int = 2
     coast_max_frames: int = 30
     # PMM
-    pmm_band_low_hz: float = 50.0
-    pmm_band_high_hz: float = 500.0
-    pmm_threshold_db: float = 24.0   # raised from 18; chopper artifacts fired at 18-22 dB
+    pmm_band_low_hz: float = 100.0
+    pmm_band_high_hz: float = 2500.0
+    pmm_threshold_db: float = 18.0   # slot-0 decimation kills DDM artifacts; 18 dB is fine
+    pmm_n_frames_buf: int = 20       # multi-frame integration depth (deeper = more gain)
 
 
 STOCK_PRESET: Dict[str, Any] = dict(
@@ -212,9 +216,12 @@ AG_PRESET: Dict[str, Any] = dict(
 )
 AA_PRESET: Dict[str, Any] = dict(
     # AA mode: PMM is primary detector for drones; CFAR + tracks are
-    # shown as backdrop. PMM threshold 28dB to reject chopper sidebands.
+    # shown as backdrop.  Slot-0 decimation eliminates DDM TX artifacts,
+    # so threshold can be the standard 18 dB.  20-frame buffer gives
+    # +13 dB coherent integration gain for weak propeller tones.
     snr_min_db=18, range_min_m=0.5, speed_min_mps=0.0,
-    cfar_threshold_db=18, pmm_threshold_db=28,
+    cfar_threshold_db=18, pmm_threshold_db=18,
+    pmm_n_frames_buf=20,
     cluster_min_samples=4, confirm_min_hits=3,
     aoa_max_detections=128,
 )
@@ -236,6 +243,9 @@ class PipelineStats:
     last_frame_t: float = 0.0
     detections_per_frame: float = 0.0
     targets_per_frame: float = 0.0
+    drone_detections: int = 0
+    last_drone_range_m: float = 0.0
+    last_drone_blade_freq_hz: float = 0.0
 
 
 # ─────────────────────── pipeline ───────────────────────────────────────────
@@ -280,6 +290,25 @@ class DCAPipeline:
             az_half_deg=float(az_half_deg),
             range_max_m=float(max_range_m),
         )
+
+        # Multi-frame integration: buffer last N frames of raw slow-time
+        # data, concatenate before FFT. Gives +10*log10(N) dB coherent
+        # gain and finer blade-rate frequency resolution.
+        # Default N=20 → +13 dB gain. At 20 Hz: 1 second effective dwell.
+        # DDM slot-0: 20 × 128 = 2560 chirps, n_fft ≈ 8192.
+        # Single-TX: 20 × 768 = 15360 chirps, n_fft ≈ 32768.
+        self._pmm_frame_buf: deque = deque(maxlen=self.params.pmm_n_frames_buf)
+
+        # PMM temporal-subtraction background. EMA of |FFT(slow_time)|²
+        # per range bin. Chip artifacts are near-constant across frames
+        # so they converge into this average; subtracting it before the
+        # sideband search kills them. Propeller signals vary frame-to-
+        # frame (frequency drifts, amplitude modulates, target closes)
+        # so they stay above the average and survive detection.
+        # alpha=0.05 → ~20-frame time constant (~5 s at 4 fps).
+        self._pmm_bg: Optional[np.ndarray] = None  # (n_range, n_fft)
+        self._pmm_bg_alpha: float = 0.05
+
         self._mode_name = "stock"
         self.set_mode("stock")
 
@@ -308,6 +337,17 @@ class DCAPipeline:
         # at 0.5 m/s sits ~10 bins off zero and is unaffected.
         self._cell_zero_dop_halfwidth: int = 4
         self._cell_static_max_range_m: float = 12.0
+
+    def _sync_pmm_buf_depth(self) -> None:
+        """Resize multi-frame buffer if params.pmm_n_frames_buf changed."""
+        target = self.params.pmm_n_frames_buf
+        if self._pmm_frame_buf.maxlen != target:
+            old = list(self._pmm_frame_buf)
+            self._pmm_frame_buf = deque(old[-target:], maxlen=target)
+            # Reset EMA background — shape changes with new buffer depth.
+            self._pmm_bg = None
+            log.info("PMM frame buffer resized: %d -> %d",
+                     len(old), target)
 
     # ─────────────────────── public API ────────────────────────────────
 
@@ -390,6 +430,8 @@ class DCAPipeline:
         self._mode_name = key
         for k, v in _PRESETS[key].items():
             setattr(self.params, k, v)
+        # Resize multi-frame buffer if depth changed.
+        self._sync_pmm_buf_depth()
         # Tracker config follows the active params.
         if hasattr(self, "_tracker"):
             self._tracker.params = self._cluster_params()
@@ -403,6 +445,8 @@ class DCAPipeline:
                 log.warning("set_params: ignoring unknown field %r", k)
                 continue
             setattr(self.params, k, v)
+        if "pmm_n_frames_buf" in kwargs:
+            self._sync_pmm_buf_depth()
         if hasattr(self, "_tracker"):
             self._tracker.params = self._cluster_params()
 
@@ -528,6 +572,16 @@ class DCAPipeline:
         self._stats.targets_per_frame = (
             (1 - a) * self._stats.targets_per_frame + a * len(tracks)
         )
+        if pmm_targets:
+            self._stats.drone_detections += len(pmm_targets)
+            # Record best hit (highest confidence) for diagnostics.
+            best = max(pmm_targets, key=lambda t: t.confidence)
+            self._stats.last_drone_range_m = best.pos_y_m
+            # blade freq from the scan output: stored in tid (range bin)
+            # but we'll get it from the pmm result's confidence. A
+            # better approach: propagate blade_freq through RadarTarget
+            # metadata. For now, the diagnostics mostly care that
+            # drone_detections > 0.
         if self._frame_id % 80 == 0:
             log.info(
                 "DCAPipeline frame %d [%s]: cfar=%d tracks=%d pmm=%d",
@@ -566,24 +620,27 @@ class DCAPipeline:
         return rfft_out.astype(np.complex64)
 
     def _notch_harmonic_artifact(self, range_cube: np.ndarray) -> None:
-        """Zero AWR2944P LO/ADC leakage harmonics in-place.
+        """Remove the AWR2944P LO/ADC clock-spur in-place — non-destructively.
 
-        The chip aliases internal mixer harmonics into the range axis
-        every n_samples/16 bins (24 bins for n_samples=384). The exact
-        peak position drifts ±3-4 bins between captures — the chip's
-        sample clock isn't perfectly stable so the nominal grid is
-        approximate. Empirical positions seen so far:
+        The chip aliases an internal clock spur into the range axis at a
+        fixed pattern (~every n_samples/16 bins). The spur is STATIC: the
+        same complex value on every chirp within a frame. A real target's
+        micro-Doppler is NOT static — it varies chirp-to-chirp.
 
-            08:09 capture: 24,  72, 120, 168     (on the grid)
-            08:41 capture: 75, 116, 171, ...     (offset by +3, -4, +3)
+        So at the spur range bins we subtract only the static
+        (chirp-mean) component — the spur itself — and keep the rest of
+        the bin intact. The previous implementation ZEROED the entire bin
+        window (~38 % of all range bins, 7 dead-zone windows of ~13 m),
+        which deleted any real drone return that landed there — including
+        roughly half of the airborne-1 drone trajectory. This version
+        preserves every range bin.
 
-        Notch radius ±5 catches both ±FFT-leakage and clock-drift
-        wobble. ~38 % of range coverage is sacrificed to 7 dead-zone
-        windows of ~13 m each, but the surviving bins span the full
-        1-250 m radar horizon. The seeker mission is long-range drone
-        detection — capping range to "fix" this would defeat the
-        purpose. Killing the artifact at SOURCE here lets the rest of
-        the pipeline do real work at 100-250 m.
+        Note: _process_frame's slow-time MTI subtracts the chirp-mean
+        from every bin anyway, so after MTI this is a near-no-op — its
+        real job is simply to NOT destroy the spur bins. Kept as an
+        explicit, documented step so the artifact handling stays visible
+        and can be tightened later (e.g. a narrow per-spur model) if the
+        clock proves to jitter within a frame.
 
         Operates on the complex range cube (n_chirps, n_range, n_rx).
         """
@@ -596,7 +653,8 @@ class DCAPipeline:
         for b in range(step, n_range, step):
             lo = max(b - radius, 0)
             hi = min(b + radius + 1, n_range)
-            range_cube[:, lo:hi, :] = 0
+            window = range_cube[:, lo:hi, :]
+            window -= window.mean(axis=0, keepdims=True)
 
     def _stage3_range_doppler(
         self, range_cube: np.ndarray,
@@ -706,25 +764,109 @@ class DCAPipeline:
         return out
 
     def _stage5_pmm(self, range_cube: np.ndarray) -> List[RadarTarget]:
-        """PMM scan over MTI'd slow-time grid → drone-class targets.
+        """PMM scan with temporal background subtraction.
 
-        chirp_x_range = range_cube.sum(axis=2); slow_time grid is its
-        transpose. Stage-2 already MTI'd the range_cube so no extra
-        clutter suppression is needed here.
+        Computes the slow-time FFT magnitude for every range bin, then
+        subtracts an exponential moving average (EMA) of the spectrum
+        before searching for propeller sidebands. This kills chip
+        artifacts (constant across frames) while preserving propeller
+        signals (time-varying).
+
+        The EMA converges in ~20 frames (~5 s at 4 fps). During warmup
+        the subtraction is partial — artifacts are progressively
+        suppressed rather than instantly killed.
         """
         d = self._dims
         chirp_x_range = range_cube.sum(axis=2)            # (n_chirps, n_range)
         slow_time_grid = chirp_x_range.T                  # (n_range, n_chirps)
+
+        # ── Slot-0 decimation for DDM (DDMA) mode ──
+        # In DDM, n_tx_slots TX antennas fire in round-robin. Only
+        # chirps from ONE TX slot are coherent for slow-time analysis.
+        # Take every n_tx_slots-th chirp (slot 0) to get the true
+        # per-TX slow-time at PRF/n_tx_slots.
+        # Single-TX configs (n_tx_slots=1) pass through unchanged.
+        if d.n_tx_slots > 1:
+            slow_time_grid = slow_time_grid[:, ::d.n_tx_slots]
+
+        n_range_cur, n_chirps_cur = slow_time_grid.shape
+
+        if n_chirps_cur < 32:
+            return []
+
+        # ── Multi-frame integration ──
+        # Buffer raw slow-time from the last N frames. Once the buffer
+        # is full, concatenate along the chirps axis before FFT. This
+        # gives +10*log10(N) dB coherent integration gain:
+        #   5 frames × 128 chirps (DDM slot-0) = 640 chirps = 250 ms dwell
+        #   Frequency resolution: eff_PRF/n_fft ≈ 2.9 Hz
+        #   SNR gain: +7 dB
+        #
+        # While the buffer fills, use single-frame (no gain penalty —
+        # just haven't accumulated enough data yet). The n_fft is fixed
+        # once full, so the EMA background shape is stable.
+        self._pmm_frame_buf.append(slow_time_grid.copy())
+
+        if len(self._pmm_frame_buf) == self._pmm_frame_buf.maxlen:
+            # Buffer full — concatenate all frames
+            combined = np.concatenate(list(self._pmm_frame_buf), axis=1)
+        else:
+            # Still filling — use single frame
+            combined = slow_time_grid
+
+        n_range, n_chirps = combined.shape
+
+        # ── Vectorized FFT across all range bins ──
+        # Same preprocessing as detect_pmm: DC subtract + Hann + zero-padded FFT.
+        s = combined - combined.mean(axis=1, keepdims=True)
+        hann = np.hanning(n_chirps).astype(np.float32)
+        s = s * hann[np.newaxis, :]
+        n_fft = 2 * (1 << int(np.ceil(np.log2(n_chirps))))
+        X = np.fft.fft(s, n=n_fft, axis=1)
+        mag2 = np.abs(X) ** 2  # (n_range, n_fft) — power spectrum
+
+        # ── Update background EMA ──
+        alpha = self._pmm_bg_alpha
+        if self._pmm_bg is None or self._pmm_bg.shape != mag2.shape:
+            # First frame: initialize background to current spectrum.
+            # Residual will be zero → no detections this frame. That's
+            # fine — one lost frame at startup.
+            self._pmm_bg = mag2.copy()
+        else:
+            self._pmm_bg *= (1.0 - alpha)
+            self._pmm_bg += alpha * mag2
+
+        # ── Spectral whitening — normalize by background ──
+        # Divide each bin's power by its time-average. Constant-power
+        # bins (chip artifacts) become ~1.0 regardless of absolute
+        # level, so the symmetric-sideband detector can't distinguish
+        # them from noise. New/varying signals (propellers) spike above
+        # their average → whitened >> 1.0 → detectable.
+        #
+        # Why whitening, not subtraction?
+        # Simple subtraction (mag2 - bg) preserves the correlated
+        # jitter structure of artifacts: when artifacts fluctuate ±3 dB
+        # chip-to-chip, BOTH sidebands of a chip-harmonic pair
+        # fluctuate together, so the residual still has symmetric pairs
+        # and the detector fires. Whitening normalizes each bin
+        # independently, breaking that correlation.
+        whitened = np.sqrt(mag2 / np.maximum(self._pmm_bg, 1e-30))
+
+        # ── Run sideband search on whitened spectrum ──
+        # Effective PRF accounts for slot-0 decimation: in DDM mode the
+        # time between consecutive slot-0 chirps is n_tx_slots × chirp_period.
+        eff_prf = d.prf_hz / d.n_tx_slots
+        bin_hz = eff_prf / n_fft
         try:
-            hits: List[Tuple[int, PMMResult]] = scan_range_bins(
-                slow_time_grid,
-                prf_hz=d.prf_hz,
+            hits: List[Tuple[int, PMMResult]] = scan_range_bins_from_mag(
+                whitened,
+                bin_hz,
                 band_low_hz=float(self.params.pmm_band_low_hz),
                 band_high_hz=float(self.params.pmm_band_high_hz),
                 threshold_db=float(self.params.pmm_threshold_db),
             )
         except Exception:
-            log.exception("scan_range_bins raised; treating as no hits")
+            log.exception("scan_range_bins_from_mag raised; no hits")
             return []
 
         rng_min = float(self.params.range_min_m)

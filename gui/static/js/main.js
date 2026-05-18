@@ -159,6 +159,115 @@ function _setReplayBadge(on, tSec) {
   }
 }
 
+// Replay control bar — pause/play + seek slider + speed dropdown,
+// only visible when an envelope arrives with `replay:true`. State
+// mirror keeps the controls coherent with server-truth so the pause
+// glyph and slider position don't fight envelope updates while the
+// user is mid-scrub.
+const _replayState = {
+  duration_s: 0,
+  is_paused: false,
+  speed: 1,
+  playhead_t_s: 0,
+};
+let _userScrubbing = false;
+
+function _fmtMMSS(t) {
+  const tt = Math.max(0, Number(t) || 0);
+  const m = Math.floor(tt / 60);
+  const s = Math.floor(tt - m * 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function _updateReplayTimeReadout(cur, total) {
+  const el = document.getElementById("replay-time");
+  if (el) el.textContent = `${_fmtMMSS(cur)} / ${_fmtMMSS(total)}`;
+}
+
+function _setReplayBarVisible(on) {
+  const bar = document.getElementById("replay-bar");
+  if (!bar) return;
+  bar.hidden = !on;
+}
+
+// Throttled mid-drag seek so the user "sees video flow" while
+// scrubbing — server walks the timeline and emits a snapshot envelope
+// per seek, so panels repaint as the slider moves. 80 ms = ~12 Hz.
+let _lastSeekSentAt = 0;
+let _seekTrailingTimer = null;
+const SCRUB_THROTTLE_MS = 80;
+
+function _maybeSendScrubSeek(slider) {
+  const now = performance.now();
+  const since = now - _lastSeekSentAt;
+  if (since >= SCRUB_THROTTLE_MS) {
+    const t = Math.max(0, Number(slider.value) || 0);
+    wsSend({ cmd: "seek", t_s: t });
+    _lastSeekSentAt = now;
+    if (_seekTrailingTimer) {
+      clearTimeout(_seekTrailingTimer);
+      _seekTrailingTimer = null;
+    }
+  } else {
+    // Trailing-edge: ensure the latest position lands within one window.
+    if (_seekTrailingTimer) clearTimeout(_seekTrailingTimer);
+    _seekTrailingTimer = setTimeout(() => {
+      const tNow = Math.max(0, Number(slider.value) || 0);
+      wsSend({ cmd: "seek", t_s: tNow });
+      _lastSeekSentAt = performance.now();
+      _seekTrailingTimer = null;
+    }, SCRUB_THROTTLE_MS - since);
+  }
+}
+
+(() => {
+  const pauseBtn = document.getElementById("replay-pause");
+  const slider   = document.getElementById("replay-seek");
+  const speedSel = document.getElementById("replay-speed");
+  if (!pauseBtn || !slider) return;
+
+  pauseBtn.addEventListener("click", () => {
+    // Optimistic UI is intentionally avoided — the server's next
+    // envelope is the source of truth for the glyph.
+    wsSend({ cmd: _replayState.is_paused ? "play" : "pause" });
+  });
+
+  const beginScrub = () => { _userScrubbing = true; };
+  const onInput = () => {
+    _updateReplayTimeReadout(Number(slider.value) || 0, _replayState.duration_s);
+    if (_userScrubbing) _maybeSendScrubSeek(slider);
+  };
+  const commitScrub = () => {
+    if (!_userScrubbing) return;
+    if (_seekTrailingTimer) {
+      clearTimeout(_seekTrailingTimer);
+      _seekTrailingTimer = null;
+    }
+    const t = Math.max(0, Number(slider.value) || 0);
+    wsSend({ cmd: "seek", t_s: t });
+    _lastSeekSentAt = performance.now();
+    _userScrubbing = false;
+  };
+  slider.addEventListener("pointerdown", beginScrub);
+  slider.addEventListener("touchstart",  beginScrub, { passive: true });
+  slider.addEventListener("input",       onInput);
+  slider.addEventListener("pointerup",   commitScrub);
+  slider.addEventListener("touchend",    commitScrub);
+  // Keyboard arrow keys: `change` fires per press, no pointer events.
+  slider.addEventListener("change", () => {
+    if (_userScrubbing) return;  // commitScrub already handled this
+    const t = Math.max(0, Number(slider.value) || 0);
+    wsSend({ cmd: "seek", t_s: t });
+  });
+
+  if (speedSel) {
+    speedSel.addEventListener("change", () => {
+      const v = Number(speedSel.value) || 1;
+      wsSend({ cmd: "speed", v });
+    });
+  }
+})();
+
 // Cross-sensor overlay gating — source-centric. Each flag controls
 // whether that sensor's tracks project onto the OTHER panels:
 //   radar:   draw radar bboxes (cyan dashed) on thermal + EO.
@@ -704,6 +813,28 @@ function syncZoomButtons(preset) {
   if (fovEl && fovMap[preset]) fovEl.textContent = fovMap[preset] + " HFOV";
 }
 
+// ── EO digital-zoom buttons (1× / 2× / 4× / 8×) ──
+// POSTs to /api/config/eo with zoom_level: N. Backend center-crops
+// the native frame and re-letterboxes for display.
+document.querySelectorAll(".zoom-btn[data-eo-zoom]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const level = parseInt(btn.dataset.eoZoom, 10) || 1;
+    fetch("/api/config/eo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ zoom_level: level }),
+    }).catch(() => {});
+    document.querySelectorAll(".zoom-btn[data-eo-zoom]").forEach(b => {
+      b.classList.toggle("active", parseInt(b.dataset.eoZoom, 10) === level);
+    });
+    const fovEl = document.getElementById("eo-fov");
+    if (fovEl) {
+      const apparent = (11.05 / level).toFixed(1);
+      fovEl.textContent = apparent + "° HFOV (" + level + "×)";
+    }
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 // Thermal tuning sliders
 // ─────────────────────────────────────────────────────────────────────────
@@ -859,11 +990,10 @@ if (areaSlider) {
   // sliders. We now keep _MODE_LIVE fresh and refresh _MODE_SNAPSHOTS
   // on save, so a Stock→A/G→Stock round-trip restores Stock's
   // values instantly with no page reload.
-  // A/G mode removed 2026-05-05. Maps stay so saved configs that
-  // still carry an "ag" key load without crashing — but it's never
-  // used as a current mode and the radio is gone from the GUI.
-  let _MODE_LIVE      = { stock: null, aa: null };
-  let _MODE_SNAPSHOTS = { stock: null, aa: null };
+  // A/G mode re-enabled 2026-05-14. The radio button exists in
+  // index.html; the JS event wiring + state maps were missing.
+  let _MODE_LIVE      = { stock: null, ag: null, aa: null };
+  let _MODE_SNAPSHOTS = { stock: null, ag: null, aa: null };
   let _CURRENT_MODE   = "stock";
 
   window.__hydrateRadarModes = (saved) => {
@@ -949,6 +1079,15 @@ if (areaSlider) {
     }
     _CURRENT_MODE = newMode;
     _showModeExtras(newMode);
+    // Use-Doppler toggle: visible in stock/ag, hidden in aa.
+    // Default: ON in stock, OFF in ag.
+    const _dopRow = document.getElementById("radar-use-doppler");
+    if (_dopRow) {
+      const dopWrap = _dopRow.closest(".fusion-sub");
+      if (dopWrap) dopWrap.style.display = (newMode === "aa") ? "none" : "";
+      if (newMode === "stock")  { _dopRow.checked = true;  wsSend({ command: "radar_tune", use_doppler: true }); }
+      if (newMode === "ag")     { _dopRow.checked = false; wsSend({ command: "radar_tune", use_doppler: false }); }
+    }
     // 2. Tell backend which mode is active.
     wsSend({ command: "set_radar_mode", mode: newMode });
     // 3. Load incoming mode's slider values: prefer in-memory live
@@ -975,17 +1114,37 @@ if (areaSlider) {
     }
     const status = document.getElementById("radar-backend-status");
     if (status) {
-      status.textContent = newMode === "stock" ? "STOCK" : "A/A";
+      status.textContent = newMode === "stock" ? "STOCK" : newMode === "ag" ? "A/G" : "A/A";
       status.style.color = "var(--cyan)";
     }
   }
-  for (const mode of ["stock", "aa"]) {
+  for (const mode of ["stock", "ag", "aa"]) {
     const el = document.getElementById("radar-backend-" + mode);
     if (el) el.addEventListener("change", () => { if (el.checked) _applyMode(mode); });
   }
   // Initial state: Stock is checked in HTML, so make sure the extras
   // are hidden at page load.
   _showModeExtras("stock");
+
+  // Use-Doppler toggle — sends radar_tune with use_doppler flag.
+  // A/G defaults to OFF (set by backend on mode switch), but user can
+  // override from here. Synced with mode switches below.
+  const _dopToggle = document.getElementById("radar-use-doppler");
+  if (_dopToggle) {
+    _dopToggle.addEventListener("change", () => {
+      wsSend({ command: "radar_tune", use_doppler: _dopToggle.checked });
+    });
+  }
+
+  // Sync the doppler checkbox when mode changes — A/G defaults OFF,
+  // Stock/A/A default ON.
+  const _origApplyMode = _applyMode;
+  _applyMode = function(newMode) {
+    _origApplyMode(newMode);
+    if (_dopToggle) {
+      _dopToggle.checked = (newMode !== "ag");
+    }
+  };
 
   // Keep _MODE_LIVE for the active mode in sync as the user drags
   // sliders. Without this, switching A/G→Stock→A/G would lose all
@@ -1048,9 +1207,29 @@ if (areaSlider) {
     el.addEventListener("change", pushAndPaint);
     paintLabel();  // initial label only — no WS send at page load
   }
-  // A/G DSP knobs removed 2026-05-05 — host CFAR pipeline is skipped
-  // (pmm_only=True) and chip-side CFAR can't be retuned at runtime.
-  // See HTML comment in radar-mode-extra[data-mode="ag"].
+  // A/G CFAR threshold — on-chip parameter, requires chip reconfigure
+  // (~5 s) to take effect. Slider updates the label; APPLY pushes
+  // the value and triggers a reconfigure via xds110 reset.
+  (function wireAgCfar() {
+    const sl = document.getElementById("ag-cfar-thresh");
+    const lbl = document.getElementById("ag-cfar-thresh-val");
+    const btn = document.getElementById("ag-cfar-apply");
+    if (!sl) return;
+    sl.addEventListener("input", () => {
+      if (lbl) lbl.textContent = sl.value + " dB";
+    });
+    if (lbl) lbl.textContent = sl.value + " dB";
+    if (btn) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        const v = Number(sl.value);
+        wsSend({ command: "ag_cfar_apply", cfar_threshold_db: v });
+        btn.textContent = "APPLYING…";
+        btn.disabled = true;
+        setTimeout(() => { btn.textContent = "APPLY"; btn.disabled = false; }, 7000);
+      });
+    }
+  })();
 
   // ── Dual-thumb PMM-band slider ────────────────────────────────────
   // The two `aa-pmm-low` / `aa-pmm-high` inputs share one track. We
@@ -1393,8 +1572,50 @@ function connect() {
     // point an LLM agent at ("at ~0:12 the gimbal jumped right").
     if (msg && msg.replay === true) {
       _setReplayBadge(true, Number(msg.replay_t_s || 0));
+
+      // Drive the replay control bar from server-truth fields. Each
+      // envelope carries playhead_t_s / duration_s / is_paused / speed
+      // (replay_server.py:_PlayerSession._send_envelope).
+      const playhead = Number(msg.playhead_t_s);
+      const duration = Number(msg.duration_s);
+      const paused   = !!msg.is_paused;
+      const speed    = Number(msg.speed);
+      if (Number.isFinite(playhead)) _replayState.playhead_t_s = playhead;
+      if (Number.isFinite(duration)) _replayState.duration_s   = duration;
+      if (Number.isFinite(speed))    _replayState.speed        = speed;
+      _replayState.is_paused = paused;
+
+      _setReplayBarVisible(true);
+
+      const slider = document.getElementById("replay-seek");
+      if (slider) {
+        const newMax = Number.isFinite(duration) ? duration : 0;
+        if (Number(slider.max) !== newMax) slider.max = String(newMax);
+        // Don't fight the user mid-drag.
+        if (!_userScrubbing && Number.isFinite(playhead)) {
+          slider.value = String(playhead);
+        }
+      }
+      if (!_userScrubbing) {
+        _updateReplayTimeReadout(_replayState.playhead_t_s, _replayState.duration_s);
+      }
+      const pauseBtn = document.getElementById("replay-pause");
+      if (pauseBtn) pauseBtn.textContent = paused ? "▶" : "⏸";
+
+      // Sync the speed dropdown to server-reported speed (keeps the
+      // selection truthful when speed was set via URL ?speed= or on
+      // another tab). Only adjust when an exact preset matches.
+      const speedSel = document.getElementById("replay-speed");
+      if (speedSel && Number.isFinite(speed)) {
+        const match = Array.from(speedSel.options)
+          .find(o => Math.abs(Number(o.value) - speed) < 0.001);
+        if (match && speedSel.value !== match.value) {
+          speedSel.value = match.value;
+        }
+      }
     } else if (_replayActive) {
       _setReplayBadge(false, 0);
+      _setReplayBarVisible(false);
     }
 
     // Out-of-band events (not periodic frames). Backend uses {event: "..."}

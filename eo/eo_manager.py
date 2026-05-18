@@ -396,14 +396,38 @@ class EOManager:
                 _imgsz = 640
             else:
                 _imgsz = int(_raw_imgsz)
+            # Per-class conf overrides — see app_config.yaml `classes_conf`.
+            # When set, conf_threshold becomes the FLOOR (model receives
+            # min(thresholds) at predict time) and per-class filtering
+            # happens after. Lets us keep drone permissive (small hard
+            # targets) while keeping person/vehicle strict (FP-prone on
+            # streetlights/poles).
+            _classes_conf = ccfg.get("classes_conf") or {}
+            # Tiled (SAHI) inference config. See vision/sahi_inference.py.
+            _tiling_cfg = ccfg.get("tiling") or {}
+            self._tiling_enabled: bool = bool(_tiling_cfg.get("enabled", False))
+            self._tiling_grid: tuple[int, int] = tuple(
+                _tiling_cfg.get("grid", [2, 2])
+            )
+            self._tiling_overlap_frac: float = float(
+                _tiling_cfg.get("overlap_frac", 0.25)
+            )
+            self._tiling_merge_iou: float = float(
+                _tiling_cfg.get("merge_iou", 0.5)
+            )
             try:
                 self._classifier = EOClassifier(
                     fallback_model_path=str(ccfg.get("model", "models/yolov8n.pt")),
                     conf_threshold=self._conf_threshold,
                     imgsz=_imgsz,
+                    per_class_conf=_classes_conf if _classes_conf else None,
                 )
-                log.info("EO classifier loaded (active=%s, imgsz=%d, conf=%.2f)",
-                         self._classifier.active, _imgsz, self._conf_threshold)
+                log.info(
+                    "EO classifier loaded (active=%s, imgsz=%d, conf=%.2f, "
+                    "per_class_conf=%s)",
+                    self._classifier.active, _imgsz, self._conf_threshold,
+                    _classes_conf or "(none)",
+                )
             except Exception as e:
                 log.warning("EO classifier init failed: %s", e)
                 self._classifier = None
@@ -1192,7 +1216,40 @@ class EOManager:
             if self._classifier is None:
                 continue
             try:
-                raw = self._classifier.track(frame)
+                if self._tiling_enabled:
+                    # Tiled (SAHI) path: native frame in, per-tile
+                    # batched predict, global NMS, returned as plain
+                    # detections (no ByteTrack IDs — MOSSE pool below
+                    # owns continuity for tiled output).
+                    from vision.sahi_inference import tiled_predict
+                    raw = tiled_predict(
+                        self._classifier._hv._model,
+                        frame,
+                        grid=self._tiling_grid,
+                        overlap_frac=self._tiling_overlap_frac,
+                        imgsz=self._classifier._hv.imgsz,
+                        conf=self._classifier._hv.conf_threshold,
+                        merge_iou=self._tiling_merge_iou,
+                        per_class_conf=self._classifier._hv.per_class_conf
+                            or None,
+                    )
+                    # Tiled path doesn't carry ByteTrack IDs (the
+                    # tracker can't reason across tile-frames sensibly).
+                    # MOSSE pool uses track_id as a dict key, so we
+                    # synthesize unique monotonically-decreasing IDs.
+                    # Each tile-tick spawns fresh MOSSE trackers; old
+                    # ones decay via max_misses. Acceptable churn —
+                    # the alternative (per-frame IoU-keyed re-ID) is a
+                    # full mini-tracker that would replicate ByteTrack's
+                    # job. If this churn shows up as MOSSE-pool memory
+                    # growth, we add an LRU cap on the pool size.
+                    if not hasattr(self, "_tile_id_seq"):
+                        self._tile_id_seq = -100000
+                    for d in raw:
+                        self._tile_id_seq -= 1
+                        d.setdefault("track_id", self._tile_id_seq)
+                else:
+                    raw = self._classifier.track(frame)
             except Exception as e:
                 log.warning("EO async inference failed (fid=%d): %s", fid, e)
                 continue
@@ -1236,13 +1293,24 @@ class EOManager:
 
         # 0. IMX568 pipeline: downscale → AGC → profile switching.
         #
-        # Downscale FIRST. Every subsequent operation scales with pixel
-        # count; halving width quarters the per-frame cost of AGC, YOLO's
-        # internal letterbox, and the JPEG encode the GUI bridge runs.
-        # At ~1236 px wide the detail available at 250 m is still far more
-        # than thermal or radar can contribute, so we lose nothing useful.
+        # Downscale FIRST for display/JPEG-encode. Every subsequent
+        # operation scales with pixel count; halving width quarters
+        # the per-frame cost of AGC, JPEG encode, JSONL recording.
+        #
+        # 2026-05-08: when tiled inference is enabled, we keep the
+        # NATIVE frame around to feed the tiled classifier — that's
+        # the whole point of tiling (give YOLO native pixels for
+        # long-distance targets). Display path still uses 1236-wide.
+        # The native frame is NOT cached past _process_and_publish,
+        # so memory cost is one extra 2472×2064×3 ≈ 15 MB per tick.
+        native_frame: Optional[np.ndarray] = None
         if self._sensor_backend == "imx568":
             if self._display_max_width > 0 and frame.shape[1] > self._display_max_width:
+                if self._tiling_enabled:
+                    # Hold a reference to the native frame for the
+                    # classifier path — no copy, the downscale below
+                    # produces a NEW buffer so this stays valid.
+                    native_frame = frame
                 scale = self._display_max_width / float(frame.shape[1])
                 new_w = self._display_max_width
                 new_h = int(round(frame.shape[0] * scale))
@@ -1358,7 +1426,14 @@ class EOManager:
                 # Single-slot: if a frame is still pending, drop it.
                 # The newer one is fresher and ByteTrack persist=True
                 # handles the gap. Notify wakes the worker.
-                self._cls_in_pending = (self._frame_id, frame)
+                #
+                # When tiling is enabled, hand the classifier the
+                # NATIVE 2472×2064 frame so per-tile inference gets
+                # full sensor resolution. Otherwise hand it the
+                # already-downscaled 1236-wide display frame.
+                cls_input = native_frame if (self._tiling_enabled and
+                                              native_frame is not None) else frame
+                self._cls_in_pending = (self._frame_id, cls_input)
                 self._cls_in_cond.notify()
         # Publish the worker's latest result (or empty list before any
         # result has come back). Coasting between worker updates is

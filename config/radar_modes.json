@@ -14,8 +14,8 @@
     "range_min_m": 0,
     "cluster_eps_pos_m": 8,
     "cluster_min_samples": 4,
-    "pmm_band_low_hz": 50,
-    "pmm_band_high_hz": 500,
+    "pmm_band_low_hz": 100,
+    "pmm_band_high_hz": 2500,
     "pmm_threshold_db": 18,
     "pmm_slow_time_win": 256,
     "staggered_prf": false
